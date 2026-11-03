@@ -139,6 +139,18 @@ func nativeCallInclude(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCa
 		return false, nil, err
 	}
 
+	// Overlay queries must keep the lib sub-query on the dual-source view:
+	// fetchProgram unwraps a *ProgramOverLay to its top (diff) program, and
+	// binding the sub-query to that would hide every base-layer value.
+	var overlay *ProgramOverLay
+	_ = v.Recursive(func(operator sfvm.ValueOperator) error {
+		if o, ok := operator.(*ProgramOverLay); ok && o != nil {
+			overlay = o
+			return utils.Error("normal abort")
+		}
+		return nil
+	})
+
 	var inputs Values
 	v.Recursive(func(operator sfvm.ValueOperator) error {
 		val, ok := operator.(*Value)
@@ -172,12 +184,22 @@ func nativeCallInclude(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCa
 		cacheKey = cacheKey + ":struct:" + bound.key
 	}
 	hash, ret, shouldCache := GetIncludeCacheValue(parent, cacheKey, inputs)
+	if overlay != nil {
+		// The include cache is keyed by *Program; an overlay's value space is
+		// base+diff, so a top-program cache entry would be wrong. Skip caching.
+		shouldCache = false
+		ret = nil
+	}
 	if ret != nil {
 		return true, ret, nil
 	}
 	var queryValue sfvm.Values
 	if len(inputs) == 0 {
-		queryValue = sfvm.ValuesOf(parent)
+		if overlay != nil {
+			queryValue = sfvm.ValuesOf(overlay)
+		} else {
+			queryValue = sfvm.ValuesOf(parent)
+		}
 	} else {
 		queryValue = ToSFVMValues(inputs)
 	}
@@ -192,6 +214,11 @@ func nativeCallInclude(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCa
 	}
 	if bound != nil && rule.IsStructMode() {
 		opts = append(opts, QueryWithStruct(bound.compileUnit()))
+	} else if overlay != nil {
+		opts = append(opts,
+			QueryWithValue(overlay),
+			QueryWithSFOption(sfvm.WithRuntimeOption(WithProgramOverlay(overlay))),
+		)
 	} else {
 		opts = append(opts, QueryWithProgram(parent))
 	}

@@ -28,7 +28,12 @@ func writeReportSnapshot(w io.Writer, data []byte) error {
 	if named, ok := w.(interface{ Name() string }); ok {
 		if path := named.Name(); path != "" && path != "/dev/stdout" && path != "stdout" {
 			if _, err := os.Stat(filepath.Dir(path)); err == nil {
-				return writeFileSnapshot(path, data)
+				if err := writeFileSnapshot(path, data); err == nil {
+					return nil
+				}
+				// Windows cannot rename over a file the CLI itself holds
+				// open (os.Rename fails with Access is denied); fall back
+				// to writing through the already-open handle below.
 			}
 		}
 	}

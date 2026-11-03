@@ -2076,6 +2076,11 @@ Unlike code-scan, this command runs query-style output rather than batch report 
 		var sarifCallback func(result *ssaapi.SyntaxFlowResult)
 		if haveSarifRequired {
 			sarifCallback = func(result *ssaapi.SyntaxFlowResult) {
+				// SARIF conversion consumes built risk objects (YieldRisk);
+				// query-mode results only carry alert values until CreateRisk.
+				if result.RiskCount() == 0 {
+					_ = result.CreateRisk()
+				}
 				results = append(results, result)
 			}
 		} else {
@@ -2286,7 +2291,13 @@ func SyntaxFlowQuery(
 	if err != nil {
 		log.Errorf("load program [%v] from database failed: %v", programName, err)
 	}
-	if dbDebug {
+	// Overlay programs must be queried through their merged dual-source
+	// instance; the raw program only carries the diff layer's IR.
+	queryTarget, qtErr := ssaapi.NewProgramFromDB(programName)
+	if qtErr != nil || queryTarget == nil {
+		queryTarget = prog
+	}
+	if dbDebug && prog != nil {
 		prog.DBDebug()
 	}
 	opt := make([]ssaapi.QueryOption, 0)
@@ -2294,7 +2305,7 @@ func SyntaxFlowQuery(
 		opt = append(opt, ssaapi.QueryWithEnableDebug())
 	}
 	var execError error
-	result, err := prog.SyntaxFlowWithError(syntaxFlow, opt...)
+	result, err := queryTarget.SyntaxFlowWithError(syntaxFlow, opt...)
 	if err != nil {
 		var otherErrs []string
 		if result != nil && len(result.GetErrors()) > 0 {
