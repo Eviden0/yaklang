@@ -66,6 +66,8 @@ type Config struct {
 	// onRisk is called with each risk this compile's struct rules produce.
 	// Empty means the compile is outside a scan and keeps its previous behavior.
 	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
+	// onRiskValue is onRisk plus the live value that produced the finding.
+	onRiskValue []func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)
 	// file performance recorder
 	filePerformanceRecorder *diagnostics.Recorder
 

@@ -97,11 +97,17 @@ func setReportOutput(config *ssaCliConfig, outputFile string) error {
 		}
 	}
 
-	// Backup existing file
+	// Backup existing file. A failed rename (locked file, cross-device, an
+	// existing stale .bak) must not delete the previous report: fall through to
+	// O_TRUNC in place and let the scan overwrite it.
 	if utils.GetFirstExistedFile(outputFile) != "" {
 		backup := outputFile + ".bak"
-		os.Rename(outputFile, backup)
-		os.RemoveAll(outputFile)
+		if utils.GetFirstExistedFile(backup) != "" {
+			_ = os.Remove(backup)
+		}
+		if err := os.Rename(outputFile, backup); err != nil {
+			log.Warnf("backup previous output %s failed: %v; writing in place", outputFile, err)
+		}
 	}
 
 	file, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)

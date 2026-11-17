@@ -8,6 +8,7 @@ import (
 
 	"github.com/yaklang/yaklang/common/consts"
 	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/yak/ssaapi"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 )
 
@@ -209,7 +210,11 @@ func (r *Report) ApplyRiskUpdate(item schema.RiskUpdateItem) error {
 		if item.OldHash != "" && item.Risk != nil && item.OldHash != item.Risk.Hash {
 			r.dropRiskLocked(item.OldHash)
 		}
-		r.addSchemaRiskLocked(item.Risk)
+		var value *ssaapi.Value
+		if item.Payload != nil {
+			value, _ = item.Payload.(*ssaapi.Value)
+		}
+		r.addSchemaRiskLocked(item.Risk, value)
 	}
 	flush := r.shouldFlushLocked()
 	r.mu.Unlock()
@@ -223,9 +228,11 @@ func (r *Report) ApplyRiskUpdate(item schema.RiskUpdateItem) error {
 	return nil
 }
 
-// addSchemaRiskLocked records one risk from its own fields. The scan does not
-// hand over the syntaxflow result, so there is no value graph to walk here.
-func (r *Report) addSchemaRiskLocked(ssarisk *schema.SSARisk) {
+// addSchemaRiskLocked records one risk from its own fields. When the scan hands
+// over the live value that produced the finding, NewRisk can build the
+// data-flow graph directly; without it (or for a persisted result) it falls
+// back to reloading audit rows by ResultID.
+func (r *Report) addSchemaRiskLocked(ssarisk *schema.SSARisk, value *ssaapi.Value) {
 	if r == nil || ssarisk == nil {
 		return
 	}
@@ -235,7 +242,15 @@ func (r *Report) addSchemaRiskLocked(ssarisk *schema.SSARisk) {
 	if r.ProgramName == "" && ssarisk.ProgramName != "" {
 		r.ProgramName = ssarisk.ProgramName
 	}
-	risk, _ := NewRisk(ssarisk, r)
+	var risk *Risk
+	if value != nil {
+		risk, _ = NewRisk(ssarisk, r, value)
+	} else {
+		risk, _ = NewRisk(ssarisk, r)
+	}
+	if risk == nil {
+		return
+	}
 	r.Risks[risk.GetHash()] = risk
 	if file := r.firstOrCreateFileByPath(ssarisk.CodeSourceUrl); file != nil {
 		file.AddRisk(risk)

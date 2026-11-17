@@ -162,8 +162,8 @@ func MarshalMinimalDataFlowPath(p *DataFlowPath) ([]byte, error) {
 }
 
 func GenerateDataFlowAnalysis(risk *schema.SSARisk, minimal bool, values ...*ssaapi.Value) (*DataFlowPath, []string, error) {
-	if risk.ResultID == 0 || risk.Variable == "" {
-		return nil, nil, utils.Errorf("risk has no valid result ID or variable")
+	if risk.Variable == "" {
+		return nil, nil, utils.Errorf("risk has no valid alert variable")
 	}
 
 	var value *ssaapi.Value
@@ -171,7 +171,12 @@ func GenerateDataFlowAnalysis(risk *schema.SSARisk, minimal bool, values ...*ssa
 		value = values[0]
 	}
 
+	// A live value is sufficient: memory-only scans have no result row to
+	// reload from, and requiring one made data-flow paths silently disappear.
 	if utils.IsNil(value) {
+		if risk.ResultID == 0 {
+			return nil, nil, utils.Errorf("risk has no live value and no result ID")
+		}
 		var err error
 		value, err = GetValueByRisk(risk)
 		if err != nil {

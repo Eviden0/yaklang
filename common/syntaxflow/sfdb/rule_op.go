@@ -460,10 +460,29 @@ func RegisterValid(f func(rule *schema.SyntaxFlowRule) error) {
 	})
 }
 
+var embeddedLibraryLoader func(string) (*schema.SyntaxFlowRule, error)
+
+// RegisterEmbeddedLibraryLoader installs a database-free fallback for library
+// rules. It is set by the embedded-rule package and used when builtin rule
+// sync was skipped (YAK_SKIP_BUILTIN_SYNC), where <include('name')> would
+// otherwise fail on an empty profile database. The returned rule is not
+// persisted.
+func RegisterEmbeddedLibraryLoader(fn func(string) (*schema.SyntaxFlowRule, error)) {
+	if fn == nil {
+		return
+	}
+	embeddedLibraryLoader = fn
+}
+
 func GetLibrary(libname string) (*schema.SyntaxFlowRule, error) {
 	db := consts.GetGormProfileDatabase()
 	var rule schema.SyntaxFlowRule
 	if err := db.Where("(title = ?) or (included_name = ?)", libname, libname).First(&rule).Error; err != nil {
+		if embeddedLibraryLoader != nil {
+			if embedded, fallbackErr := embeddedLibraryLoader(libname); fallbackErr == nil && embedded != nil {
+				return embedded, nil
+			}
+		}
 		return nil, err
 	}
 	return &rule, nil

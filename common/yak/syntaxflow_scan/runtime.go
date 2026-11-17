@@ -269,8 +269,12 @@ func (m *scanManager) Query(rule *schema.SyntaxFlowRule, target ssaapi.SyntaxFlo
 		option = append(option, queryOptions...)
 		if m.Config != nil && m.Config.scanRuntime != nil {
 			rt := m.Config.scanRuntime
-			option = append(option, ssaapi.QueryWithOnRisk(func(risk *schema.SSARisk, audits ...func(*gorm.DB) error) {
-				rt.SubmitRisk(risk, audits...)
+			// Submit once, with the live value: report writers need it to render
+			// the data-flow graph (a memory-only result has no audit rows to
+			// reload it from). Registering the plain callback as well would
+			// publish every finding twice, the first copy without a graph.
+			option = append(option, ssaapi.QueryWithOnRiskValue(func(risk *schema.SSARisk, value *ssaapi.Value, audits ...func(*gorm.DB) error) {
+				rt.SubmitRiskWithValue(risk, value, audits...)
 			}))
 		}
 		if workBudget != nil {

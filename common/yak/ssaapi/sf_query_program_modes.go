@@ -63,6 +63,9 @@ func (p *Program) queryProgramStructRule(base *queryConfig, rule *schema.SyntaxF
 			for _, fn := range base.onRisk {
 				unitOpts = append(unitOpts, QueryWithOnRisk(fn))
 			}
+			for _, fn := range base.onRiskValue {
+				unitOpts = append(unitOpts, QueryWithOnRiskValue(fn))
+			}
 			for _, opt := range base.opts {
 				unitOpts = append(unitOpts, QueryWithSFOption(opt))
 			}
@@ -89,6 +92,7 @@ func (p *Program) queryProgramStructRule(base *queryConfig, rule *schema.SyntaxF
 	if base != nil {
 		merged.TaskID = base.taskID
 		merged.onRisk = base.onRisk
+		merged.onRiskValue = base.onRiskValue
 		merged.dbKind = base.kind
 		merged.Config = base.Config
 	}

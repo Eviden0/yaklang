@@ -243,7 +243,7 @@ func (r *SyntaxFlowResult) stageRisk(variable string, index int, value *Value) (
 	// uses the value text and is computed in the same pass.
 	ssaRisk.PrepareForSave(riskFeatureText(value))
 	r.riskMap[name] = ssaRisk
-	if len(r.onRisk) == 0 {
+	if len(r.onRisk) == 0 && len(r.onRiskValue) == 0 {
 		return ssaRisk.Hash, false
 	}
 	var audits []func(*gorm.DB) error
@@ -256,6 +256,9 @@ func (r *SyntaxFlowResult) stageRisk(variable string, index int, value *Value) (
 	}
 	for _, fn := range r.onRisk {
 		fn(ssaRisk, audits...)
+	}
+	for _, fn := range r.onRiskValue {
+		fn(ssaRisk, value, audits...)
 	}
 	_, owned := r.auditHanded[name]
 	return ssaRisk.Hash, owned

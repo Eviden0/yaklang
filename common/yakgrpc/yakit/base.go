@@ -423,6 +423,20 @@ func MockMITMSlowRuleHook(duration time.Duration, hookType string, ruleCount int
 	TriggerSlowRuleHookCallbackThrottled()
 }
 
+// skipPostInitSyncNote lists the post-init callbacks that import builtin
+// content (AI tools, AI forges, core plugins, AI skills). They are pure
+// startup cost for a CLI scan that only uses its own SyntaxFlow rules.
+func skipPostInitSyncNote(note string) bool {
+	switch note {
+	case "sync-ai-tool",
+		"sync-buildin-ai-forge",
+		"sync-core-plugin-for-yakit",
+		"sync-builtin-ai-skills":
+		return true
+	}
+	return false
+}
+
 func RegisterPostInitDatabaseFunction(f func() error, notes ...string) {
 	registerDatabaseInitializer(&__initializingDatabase, f, notes...)
 }
@@ -480,8 +494,16 @@ func CallPostInitDatabase() error {
 	callbacks := append([]*initializingCallback(nil), __initializingDatabase...)
 	callbacks = append(callbacks, __finalizingDatabase...)
 	__mutexForInit.Unlock()
+	skipBuiltinSync := consts.SkipBuiltinSync()
 	for idx, f := range callbacks {
 		if f == nil || f.Fn == nil {
+			continue
+		}
+		// CLI scans do not need the builtin AI tools / forges / plugins; their
+		// import is the bulk of the cold-start time. DB migrations and other
+		// post-init work still run.
+		if skipBuiltinSync && skipPostInitSyncNote(f.Note) {
+			log.Infof("skip post-init builtin sync: %s (%s=1)", f.Note, consts.ENV_SKIP_BUILTIN_SYNC)
 			continue
 		}
 		currentFuncStart := time.Now()

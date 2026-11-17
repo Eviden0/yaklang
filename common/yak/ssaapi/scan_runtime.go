@@ -46,6 +46,17 @@ func (r *ScanRuntime) RegisterRiskUpdateHandler(handler schema.RiskUpdateHandler
 // rules cannot deliver a cover before the decision it replaces. audits are
 // optional graph writers; they travel on the update item, never on the row.
 func (r *ScanRuntime) SubmitRisk(risk *schema.SSARisk, audits ...func(*gorm.DB) error) bool {
+	return r.submitRisk(risk, nil, audits...)
+}
+
+// SubmitRiskWithValue is SubmitRisk plus the live value that produced the
+// finding. Report handlers use the payload to generate the data-flow graph
+// without a database round trip.
+func (r *ScanRuntime) SubmitRiskWithValue(risk *schema.SSARisk, value *Value, audits ...func(*gorm.DB) error) bool {
+	return r.submitRisk(risk, value, audits...)
+}
+
+func (r *ScanRuntime) submitRisk(risk *schema.SSARisk, payload any, audits ...func(*gorm.DB) error) bool {
 	if r == nil || risk == nil || r.collect == nil {
 		return false
 	}
@@ -58,6 +69,7 @@ func (r *ScanRuntime) SubmitRisk(risk *schema.SSARisk, audits ...func(*gorm.DB) 
 	item, ok := r.collect.Submit(risk)
 	if ok {
 		item.Audit = audits
+		item.Payload = payload
 		for _, handler := range r.riskUpdateHandlers {
 			if err := handler.ApplyRiskUpdate(item); err != nil {
 				log.Errorf("apply risk update failed: %v", err)

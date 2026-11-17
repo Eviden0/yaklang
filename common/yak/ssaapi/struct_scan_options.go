@@ -84,6 +84,17 @@ func WithOnRisk(fn func(*schema.SSARisk, ...func(*gorm.DB) error)) ssaconfig.Opt
 	})(fn)
 }
 
+// WithOnRiskValue registers the live-value companion of WithOnRisk for struct
+// rules. Scans use it so report writers can build the data-flow graph.
+func WithOnRiskValue(fn func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)) ssaconfig.Option {
+	return ssaconfig.SetOption("ssa/on_risk_value", func(c *Config, v func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)) {
+		if v == nil {
+			return
+		}
+		c.onRiskValue = append(c.onRiskValue, v)
+	})(fn)
+}
+
 func WithStructRuleTimeout(d time.Duration) ssaconfig.Option {
 	return ssaconfig.SetOption("ssa_compile/struct_rule_timeout", func(c *Config, v time.Duration) {
 		c.ensureStructScan().timeout = v

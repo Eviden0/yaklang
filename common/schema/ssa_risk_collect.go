@@ -33,6 +33,11 @@ type RiskUpdateItem struct {
 	Risk    *SSARisk
 	OldHash string
 	Audit   []func(*gorm.DB) error
+	// Payload carries the live analysis context of this decision (in practice
+	// the *ssaapi.Value behind the risk). schema cannot name that type without
+	// importing ssaapi, so consumers type-assert it. It is never persisted and
+	// is nil for producers that only have a risk row.
+	Payload any
 }
 
 // RiskUpdateHandler consumes the decisions of one scan. A scan never writes a

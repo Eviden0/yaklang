@@ -305,6 +305,14 @@ func ruleTagsFromDir(dirName string) []string {
 }
 
 func SyncEmbedRule(notifies ...func(process float64, ruleName string)) (err error) {
+	// CI code-scan typically runs only its own --syntaxflow rules; importing
+	// the whole builtin snapshot on every cold start costs tens of seconds.
+	// Library rules used by <include(...)> still resolve from the embedded
+	// snapshot via sfdb's embedded loader, so skipping the import is safe.
+	if consts.SkipBuiltinSync() {
+		log.Infof("skip builtin SyntaxFlow rule sync: %s=1", consts.ENV_SKIP_BUILTIN_SYNC)
+		return nil
+	}
 	const key = consts.EmbedSfBuildInRuleKey
 	return resources_monitor.NewEmbedResourcesMonitor(key, consts.ExistedSyntaxFlowEmbedFSHash).MonitorModifiedWithAction(func() string {
 		hash, _ := SyntaxFlowRuleHash()

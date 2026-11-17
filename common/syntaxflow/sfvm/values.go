@@ -360,10 +360,25 @@ func (v Values) FileFilter(path string, mode string, rule1 map[string]string, ru
 //     ssaapi.Value implements ssa.GetIdIF). No string allocation.
 //   - kind == 2: a stable hash string (ValueOperators implementing Hash()).
 //   - kind == 3: type+pointer fallback (the rare nil-id case), string kept.
+//
+// str also carries the program name on the id path. Instruction IDs are
+// assigned per program (ProgramCache.nextID starts at 0), so an incremental
+// overlay query holds values from base and diff layers whose ids collide.
+// Keying on the id alone would silently merge two distinct findings and drop
+// one of them; the program name keeps them apart.
 type dedupKey struct {
 	kind byte
 	id   int64
 	str  string
+}
+
+// valueProgramName returns the SSA program that owns this value, when the
+// operator exposes one. Non-ssaapi operators return "" and keep the old key.
+func valueProgramName(value ValueOperator) string {
+	if named, ok := value.(interface{ GetProgramName() string }); ok {
+		return named.GetProgramName()
+	}
+	return ""
 }
 
 // valueDedupKey computes the dedup key for a value. It mirrors the old
@@ -374,7 +389,7 @@ func valueDedupKey(value ValueOperator) (dedupKey, bool) {
 		return dedupKey{}, false
 	}
 	if id, ok := fetchId(value); ok {
-		return dedupKey{kind: 1, id: id}, true
+		return dedupKey{kind: 1, id: id, str: valueProgramName(value)}, true
 	}
 	if hasher, ok := value.(interface{ Hash() (string, bool) }); ok {
 		if hash, ok := hasher.Hash(); ok {

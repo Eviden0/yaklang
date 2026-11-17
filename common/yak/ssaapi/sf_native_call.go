@@ -619,12 +619,24 @@ func init() {
 		if p == nil {
 			return false, nil, utils.Errorf("program is nil")
 		}
+		overlay := fetchProgramOverlay(v)
 		matchFilename := func(f func(filename string) bool) {
-			program.ForEachAllFile(func(s string, me *memedit.MemEditor) bool {
-				if !f(s) {
-					return true
+			appendMatch := func(owner *Program, s string, me *memedit.MemEditor) {
+				if owner == nil || !f(s) {
+					return
 				}
-				rs = append(rs, program.NewConstValue(s, me.GetFullRange()))
+				rs = append(rs, owner.NewConstValue(s, me.GetFullRange()))
+			}
+			if overlay != nil {
+				// Incremental scans resolve names against every visible layer.
+				overlay.forEachVisibleFile(true, false, func(entry overlayFileEntry) bool {
+					appendMatch(entry.Program, entry.Path, entry.Editor)
+					return true
+				})
+				return
+			}
+			program.ForEachAllFile(func(s string, me *memedit.MemEditor) bool {
+				appendMatch(program, s, me)
 				return true
 			})
 		}
@@ -651,11 +663,15 @@ func init() {
 			return false, nil, err
 		}
 		prog := program.Program
+		overlay := fetchProgramOverlay(v)
 		v.Recursive(func(operator sfvm.ValueOperator) error {
 			switch ret := operator.(type) {
 			case *Program:
 				return nil
 			case *Value:
+				if ret == nil || ret.getValue() == nil {
+					return nil
+				}
 				vr := ret.getValue().GetRange()
 				if vr == nil {
 					log.Errorf("node range is nil")
@@ -664,13 +680,25 @@ func init() {
 				editor := vr.GetEditor()
 				if editor == nil {
 					log.Errorf("node editor is nil")
+					return nil
 				}
-				_, exist := prog.FileList[editor.GetUrl()]
-				if exist {
-					rs = append(rs, program.NewConstValue(editor.GetFilename(), editor.GetFullRange()))
-				} else {
+				// A base-layer value is not in the top program's FileList, so an
+				// incremental scan must check the overlay's visible file set.
+				visible := false
+				if overlay != nil {
+					visible = overlay.isVisibleFile(editor.GetUrl(), ret.GetProgramName())
+				} else if prog != nil {
+					_, visible = prog.FileList[editor.GetUrl()]
+				}
+				if !visible {
 					log.Errorf("program filelist not found this file")
+					return nil
 				}
+				owner := ret.ParentProgram
+				if owner == nil {
+					owner = program
+				}
+				rs = append(rs, owner.NewConstValue(editor.GetFilename(), editor.GetFullRange()))
 			}
 			return nil
 		})

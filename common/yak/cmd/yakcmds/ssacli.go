@@ -2073,19 +2073,28 @@ Unlike code-scan, this command runs query-style output rather than batch report 
 			haveSarifRequired = true
 		}
 		var results []*ssaapi.SyntaxFlowResult
-		var sarifCallback func(result *ssaapi.SyntaxFlowResult)
-		if haveSarifRequired {
-			sarifCallback = func(result *ssaapi.SyntaxFlowResult) {
+		// one callback serves both query output and SARIF export. It used to be
+		// assigned again further down (for positional rules / directories),
+		// which silently dropped every collected result and produced an empty
+		// SARIF file.
+		sarifCallback := func(result *ssaapi.SyntaxFlowResult) {
+			if result == nil || result.IsLib() {
+				return
+			}
+			values := result.GetAlertValues()
+			if values.Len() != 0 {
+				result.Show()
+				if saverisk {
+					result.Save(schema.SFResultKindQuery)
+				}
+			}
+			if haveSarifRequired {
 				// SARIF conversion consumes built risk objects (YieldRisk);
 				// query-mode results only carry alert values until CreateRisk.
 				if result.RiskCount() == 0 {
 					_ = result.CreateRisk()
 				}
 				results = append(results, result)
-			}
-		} else {
-			sarifCallback = func(result *ssaapi.SyntaxFlowResult) {
-
 			}
 		}
 
@@ -2097,13 +2106,9 @@ Unlike code-scan, this command runs query-style output rather than batch report 
 					log.Errorf("convert SARIF failed: %v", err)
 					return
 				}
-				if utils.GetFirstExistedFile(sarifFile) != "" {
-					backup := sarifFile + ".bak"
-					os.Rename(sarifFile, backup)
-					os.RemoveAll(sarifFile)
-				}
-				err = sarifReport.WriteFile(sarifFile)
-				if err != nil {
+				if err := publishReportFile(sarifFile, func(path string) error {
+					return sarifReport.WriteFile(path)
+				}); err != nil {
 					log.Errorf("write SARIF failed: %v", err)
 				}
 			}
@@ -2145,19 +2150,6 @@ Unlike code-scan, this command runs query-style output rather than batch report 
 				return utils.Wrapf(err, "read %v failed", filename)
 			}
 			return handleBySyntaxFlowContent(string(raw))
-		}
-
-		sarifCallback = func(result *ssaapi.SyntaxFlowResult) {
-			if result.IsLib() {
-				return
-			}
-			values := result.GetAlertValues()
-			if values.Len() != 0 {
-				result.Show()
-				if saverisk {
-					result.Save(schema.SFResultKindQuery)
-				}
-			}
 		}
 
 		var errs []error

@@ -844,8 +844,9 @@ func structCompileOptions(cfg *Config) []ssaconfig.Option {
 	// not receive the runtime; the callback submits into its collect.
 	if cfg != nil && cfg.scanRuntime != nil {
 		rt := cfg.scanRuntime
-		opts = append(opts, ssaapi.WithOnRisk(func(risk *schema.SSARisk, audits ...func(*gorm.DB) error) {
-			rt.SubmitRisk(risk, audits...)
+		// One submission per finding, carrying the live value (see runtime.go).
+		opts = append(opts, ssaapi.WithOnRiskValue(func(risk *schema.SSARisk, value *ssaapi.Value, audits ...func(*gorm.DB) error) {
+			rt.SubmitRiskWithValue(risk, value, audits...)
 		}))
 	}
 	// Struct rules use the same final SyntaxFlow result-save guard as SSA rules.

@@ -130,6 +130,133 @@ func (m *mybatisXMLQuery) runRuleAndFixRng(token string, rule string, rng *memed
 	return results
 }
 
+// processMybatisXMLFile parses one MyBatis mapper XML and appends the sink
+// values it produces. prog is the layer that owns the file: the resulting
+// values must stay bound to that layer so base-layer XML keeps resolving
+// against base IR in an incremental (overlay) scan.
+func processMybatisXMLFile(prog *Program, frame *sfvm.SFFrame, me *memedit.MemEditor, res *[]sfvm.ValueOperator) {
+	if prog == nil || me == nil || res == nil {
+		return
+	}
+	name := me.GetFilename()
+	content := me.GetSourceCode()
+	// log.Debugf("start to handling: %v len: %v", name, len(content))
+	if !strings.HasSuffix(name, ".xml") {
+		return
+	}
+
+	mapperStack := utils.NewStack[*mybatisXMLMapper]()
+	mapper := newMybatisXMLMapper(prog, frame)
+	mapperStack.Push(mapper)
+
+	runeOffsetMap := me.GetRuneOffsetMap()
+	offset := 0
+	onDirective := xml2.WithDirectiveHandler(func(directive xml.Directive) bool {
+		offset += len(directive)
+		if utils.MatchAnyOfSubString(string(directive), "ibatis", "mybatis") {
+			return true
+		}
+		return false
+	})
+	onStartElement := xml2.WithStartElementHandler(func(element xml.StartElement) {
+		if element.Name.Local == "mapper" {
+			mapperStack.Push(newMybatisXMLMapper(prog, frame))
+			mapper := mapperStack.Peek()
+			for _, attr := range element.Attr {
+				if attr.Name.Local == "namespace" {
+					mapper.Namespace = attr.Value
+					mapper.FullClassName = attr.Value
+					idx := strings.LastIndex(attr.Value, ".")
+					if idx > 0 {
+						mapper.ClassName = attr.Value[idx+1:]
+					} else {
+						mapper.ClassName = attr.Value
+					}
+				}
+			}
+			return
+		}
+		if element.Name.Local == "resultMap" {
+			return
+		}
+		i := mapperStack.Peek()
+		if utils.IsNil(i) {
+			return
+		}
+
+		var id string
+		last := i.entityStack.Peek()
+		if last != nil {
+			id = last.Id
+		}
+		query := newMybatisXMLQuery(i, id)
+		for _, attr := range element.Attr {
+			if attr.Name.Local == "id" {
+				query.Id = attr.Value
+			}
+		}
+		i.entityStack.Push(query)
+	})
+	onEndElement := xml2.WithEndElementHandler(func(element xml.EndElement) {
+		if element.Name.Local == "mapper" {
+			mapper := mapperStack.Pop()
+			if mapper != nil {
+				log.Debugf("mapper: %v", mapper)
+			}
+		}
+		if element.Name.Local == "resultMap" {
+			return
+		}
+		i := mapperStack.Peek()
+		if utils.IsNil(i) {
+			return
+		}
+		i.entityStack.Pop()
+	})
+	onCharData := xml2.WithCharDataHandler(func(data xml.CharData, offset int64) {
+		i := mapperStack.Peek()
+		if utils.IsNil(i) {
+			return
+		}
+		query := i.entityStack.Peek()
+		if query == nil {
+			return
+		}
+		safeStr := memedit.NewSafeString(string(data))
+		match, err := mybatisVarExtractor.FindRunesMatch(safeStr.Runes())
+		if err != nil {
+			return
+		}
+		runeIndex, ok := runeOffsetMap.ByteOffsetToRuneIndex(int(offset))
+		if !ok {
+			log.Warnf("mybatis-${...}: byteOffsetToRuneIndex error: %v", err)
+			return
+		}
+
+		for match != nil {
+			matchStart := match.Index + runeIndex
+			matchEnd := matchStart + match.Length
+			param := match.String()
+			startPos := me.GetPositionByOffset(matchStart)
+			endPos := me.GetPositionByOffset(matchEnd)
+			rng := me.GetRangeByPosition(startPos, endPos)
+			query.AddCheckParam(param, rng)
+			match, err = mybatisVarExtractor.FindNextMatch(match)
+			if err != nil {
+				log.Warnf("mybatis-${...}: regex error: %v", err)
+				break
+			}
+		}
+		lo.ForEach(query.Check(), func(item sfvm.ValueOperator, index int) {
+			if utils.IsNil(item) {
+				return
+			}
+			*res = append(*res, item)
+		})
+	})
+	xml2.Handle(content, onDirective, onStartElement, onEndElement, onCharData)
+}
+
 var nativeCallMybatisXML = func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
 	prog, err := fetchProgram(v)
 	if err != nil {
@@ -137,127 +264,19 @@ var nativeCallMybatisXML = func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm
 	}
 
 	var res []sfvm.ValueOperator
-
-	offset := 0
-	prog.ForEachExtraFile(func(s string, me *memedit.MemEditor) bool {
-		name := me.GetFilename()
-		content := me.GetSourceCode()
-		// log.Debugf("start to handling: %v len: %v", name, len(content))
-		if !strings.HasSuffix(name, ".xml") {
+	// Incremental scans query the overlay view: walk every visible layer's
+	// mapper XML, not just the top diff program's extra files.
+	if overlay := fetchProgramOverlay(v); overlay != nil {
+		overlay.forEachVisibleFile(false, true, func(entry overlayFileEntry) bool {
+			processMybatisXMLFile(entry.Program, frame, entry.Editor, &res)
 			return true
-		}
-
-		mapperStack := utils.NewStack[*mybatisXMLMapper]()
-		mapper := newMybatisXMLMapper(prog, frame)
-		mapperStack.Push(mapper)
-
-		runeOffsetMap := me.GetRuneOffsetMap()
-		onDirective := xml2.WithDirectiveHandler(func(directive xml.Directive) bool {
-			offset += len(directive)
-			if utils.MatchAnyOfSubString(string(directive), "ibatis", "mybatis") {
-				return true
-			}
-			return false
 		})
-		onStartElement := xml2.WithStartElementHandler(func(element xml.StartElement) {
-			if element.Name.Local == "mapper" {
-				mapperStack.Push(newMybatisXMLMapper(prog, frame))
-				mapper := mapperStack.Peek()
-				for _, attr := range element.Attr {
-					if attr.Name.Local == "namespace" {
-						mapper.Namespace = attr.Value
-						mapper.FullClassName = attr.Value
-						idx := strings.LastIndex(attr.Value, ".")
-						if idx > 0 {
-							mapper.ClassName = attr.Value[idx+1:]
-						} else {
-							mapper.ClassName = attr.Value
-						}
-					}
-				}
-				return
-			}
-			if element.Name.Local == "resultMap" {
-				return
-			}
-			i := mapperStack.Peek()
-			if utils.IsNil(i) {
-				return
-			}
-
-			var id string
-			last := i.entityStack.Peek()
-			if last != nil {
-				id = last.Id
-			}
-			query := newMybatisXMLQuery(i, id)
-			for _, attr := range element.Attr {
-				if attr.Name.Local == "id" {
-					query.Id = attr.Value
-				}
-			}
-			i.entityStack.Push(query)
+	} else {
+		prog.ForEachExtraFile(func(s string, me *memedit.MemEditor) bool {
+			processMybatisXMLFile(prog, frame, me, &res)
+			return true
 		})
-		onEndElement := xml2.WithEndElementHandler(func(element xml.EndElement) {
-			if element.Name.Local == "mapper" {
-				mapper := mapperStack.Pop()
-				if mapper != nil {
-					log.Debugf("mapper: %v", mapper)
-				}
-			}
-			if element.Name.Local == "resultMap" {
-				return
-			}
-			i := mapperStack.Peek()
-			if utils.IsNil(i) {
-				return
-			}
-			i.entityStack.Pop()
-		})
-		onCharData := xml2.WithCharDataHandler(func(data xml.CharData, offset int64) {
-			i := mapperStack.Peek()
-			if utils.IsNil(i) {
-				return
-			}
-			query := i.entityStack.Peek()
-			if query == nil {
-				return
-			}
-			safeStr := memedit.NewSafeString(string(data))
-			match, err := mybatisVarExtractor.FindRunesMatch(safeStr.Runes())
-			if err != nil {
-				return
-			}
-			runeIndex, ok := runeOffsetMap.ByteOffsetToRuneIndex(int(offset))
-			if !ok {
-				log.Warnf("mybatis-${...}: byteOffsetToRuneIndex error: %v", err)
-				return
-			}
-
-			for match != nil {
-				matchStart := match.Index + runeIndex
-				matchEnd := matchStart + match.Length
-				param := match.String()
-				startPos := me.GetPositionByOffset(matchStart)
-				endPos := me.GetPositionByOffset(matchEnd)
-				rng := me.GetRangeByPosition(startPos, endPos)
-				query.AddCheckParam(param, rng)
-				match, err = mybatisVarExtractor.FindNextMatch(match)
-				if err != nil {
-					log.Warnf("mybatis-${...}: regex error: %v", err)
-					break
-				}
-			}
-			lo.ForEach(query.Check(), func(item sfvm.ValueOperator, index int) {
-				if utils.IsNil(item) {
-					return
-				}
-				res = append(res, item)
-			})
-		})
-		xml2.Handle(content, onDirective, onStartElement, onEndElement, onCharData)
-		return true
-	})
+	}
 
 	if len(res) > 0 {
 		return true, sfvm.NewValues(res), nil

@@ -35,20 +35,22 @@ type structScanState struct {
 	riskCB     func(*schema.SSARisk)
 	// onRisk is the scan's callbacks. When set, each finding is handed to them
 	// and this compile does not write the risk row.
-	onRisk     []func(*schema.SSARisk, ...func(*gorm.DB) error)
-	taskID     string
-	timeout    time.Duration
-	workLimit  int64
-	errs       []error
-	mu         sync.Mutex
-	results    []*SyntaxFlowResult
-	saveReady  bool
-	saveToDB   bool
-	saves      sync.WaitGroup
-	ranHashes  []string
-	ruleStats  map[string]*structRuleStat
-	skipped    bool
-	skipReason string
+	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
+	// onRiskValue is the live-value companion used by report writers.
+	onRiskValue []func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)
+	taskID      string
+	timeout     time.Duration
+	workLimit   int64
+	errs        []error
+	mu          sync.Mutex
+	results     []*SyntaxFlowResult
+	saveReady   bool
+	saveToDB    bool
+	saves       sync.WaitGroup
+	ranHashes   []string
+	ruleStats   map[string]*structRuleStat
+	skipped     bool
+	skipReason  string
 }
 
 // structRuleStat aggregates one struct-mode rule across compile units so
@@ -107,6 +109,9 @@ func (c *Config) prepareStructScan(plan *UnitPlan) error {
 	s := c.structScan
 	if len(s.onRisk) == 0 {
 		s.onRisk = c.onRisk
+	}
+	if len(s.onRiskValue) == 0 {
+		s.onRiskValue = c.onRiskValue
 	}
 	if s.riskCB != nil && !s.wantsScan() {
 		return utils.Errorf("withStructRuleCallback requires withStructRule(true|rule) or withStructRuleDir/Raw")
@@ -379,6 +384,12 @@ func (s *structScanState) publish(res *SyntaxFlowResult) {
 		return
 	}
 	res.onRisk = s.onRisk
+	res.onRiskValue = s.onRiskValue
+	// A scan registers the live-value callback only; skip a value-less copy of
+	// the same callback so one finding is not published twice.
+	if len(res.onRiskValue) > 0 {
+		res.onRisk = nil
+	}
 	_ = res.CreateRisk()
 	if s.riskCB != nil {
 		for _, risk := range res.GetRisks() {
@@ -430,7 +441,7 @@ func (s *structScanState) keepResults(found []*SyntaxFlowResult) {
 	if s == nil || len(found) == 0 {
 		return
 	}
-	if len(s.onRisk) > 0 || !s.saveToDB {
+	if len(s.onRisk) > 0 || len(s.onRiskValue) > 0 || !s.saveToDB {
 		s.mu.Lock()
 		s.results = append(s.results, found...)
 		s.mu.Unlock()

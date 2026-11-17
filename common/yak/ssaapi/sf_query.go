@@ -80,6 +80,10 @@ type queryConfig struct {
 	// writers for that finding. When it is set the query does not write the
 	// risk row itself.
 	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
+	// onRiskValue receives the same decisions with the live value that produced
+	// the risk. Report consumers need it to rebuild the data-flow graph: a
+	// memory-only result has no audit rows to reload it from.
+	onRiskValue []func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)
 
 	// noFinalize leaves the finished result to the caller: no risk is built
 	// and no consumer is notified. A rule that runs once per unit merges the
@@ -165,6 +169,7 @@ func QuerySyntaxflow(opt ...QueryOption) (*SyntaxFlowResult, error) {
 	// come first so a caller can also drive a standalone program through one scan.
 	if config.program != nil && config.program.config != nil {
 		config.onRisk = append(config.program.config.onRisk, config.onRisk...)
+		config.onRiskValue = append(config.program.config.onRiskValue, config.onRiskValue...)
 	}
 	process := func(f float64, msg string) {
 		if callBack := config.GetSyntaxFlowProcessCallback(); callBack != nil {
@@ -321,6 +326,7 @@ func QuerySyntaxflow(opt ...QueryOption) (*SyntaxFlowResult, error) {
 	var ret *SyntaxFlowResult
 	ret = CreateResultFromQuery(res, config.Config)
 	ret.onRisk = config.onRisk
+	ret.onRiskValue = config.onRiskValue
 	ret.dbKind = config.kind
 
 	defer process(1, "end query syntaxflow")
@@ -358,6 +364,7 @@ func executeSourceFrameBatches(
 			result.program = config.program
 			result.TaskID = config.taskID
 			result.onRisk = config.onRisk
+			result.onRiskValue = config.onRiskValue
 			result.dbKind = config.kind
 			_ = result.CreateRisk()
 			config.sourceResultCallback(result)
@@ -532,6 +539,18 @@ func QueryWithOnRisk(fn func(*schema.SSARisk, ...func(*gorm.DB) error)) QueryOpt
 			return
 		}
 		c.onRisk = append(c.onRisk, fn)
+	}
+}
+
+// QueryWithOnRiskValue registers a callback that receives each risk together
+// with the live value that produced it. Report writers use it to generate the
+// data-flow graph without reloading audit rows from the database.
+func QueryWithOnRiskValue(fn func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)) QueryOption {
+	return func(c *queryConfig) {
+		if c == nil || fn == nil {
+			return
+		}
+		c.onRiskValue = append(c.onRiskValue, fn)
 	}
 }
 

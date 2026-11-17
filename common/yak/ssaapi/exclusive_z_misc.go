@@ -163,8 +163,21 @@ func (i *Value) RemoveEffectOn(vs ...*Value) {
 	return
 }
 
+// valueMergeKey scopes an instruction id to its owning program. Instruction
+// ids are assigned per program, so base-layer and diff-layer values in an
+// incremental overlay query collide on the bare id; merging them would drop
+// one finding and make results depend on traversal order.
+type valueMergeKey struct {
+	Program string
+	ID      int64
+}
+
+func valueMergeKeyOf(v *Value) valueMergeKey {
+	return valueMergeKey{Program: v.GetProgramName(), ID: v.GetId()}
+}
+
 func MergeValues(allVs ...Values) Values {
-	tmp := omap.NewEmptyOrderedMap[int64, *Value]()
+	tmp := omap.NewEmptyOrderedMap[valueMergeKey, *Value]()
 	templateValue := make(Values, 0)
 	checkAndMerge := func(v *Value) {
 		if utils.IsNil(v) {
@@ -175,7 +188,8 @@ func MergeValues(allVs ...Values) Values {
 			templateValue = append(templateValue, v)
 			return
 		}
-		if existValue, exist := tmp.Get(v.GetId()); exist {
+		key := valueMergeKeyOf(v)
+		if existValue, exist := tmp.Get(key); exist {
 			sfvm.MergeAnchor(v, existValue)
 
 			// merge v to exist value
@@ -200,7 +214,7 @@ func MergeValues(allVs ...Values) Values {
 			return
 		}
 		// set v is exist
-		tmp.Set(v.GetId(), v)
+		tmp.Set(key, v)
 	}
 
 	for _, vs := range allVs {

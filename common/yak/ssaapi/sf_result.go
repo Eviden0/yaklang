@@ -30,6 +30,9 @@ type SyntaxFlowResult struct {
 	// onRisk receives each risk this result builds. When it is set the result
 	// does not write the risk row itself.
 	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
+	// onRiskValue receives each risk with its live value, for consumers that
+	// need the data-flow graph.
+	onRiskValue []func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)
 	// auditHanded records alert slots whose graph was given to onRisk. A later
 	// save of the same result must not write that graph again.
 	auditHanded map[string]struct{}

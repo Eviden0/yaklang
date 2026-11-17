@@ -176,6 +176,18 @@ func GetProfileDatabaseNameFromEnv() string {
 	return os.Getenv(CONST_YAK_DEFAULT_PROFILE_DATABASE_NAME)
 }
 
+// ENV_SKIP_BUILTIN_SYNC disables the per-startup import of builtin AI tools,
+// AI forges, core plugins and SyntaxFlow rules. CI scans that only run their
+// own --syntaxflow rules should set it to 1: the profile database then stays
+// untouched, and library rules referenced by <include(...)> are resolved from
+// the embedded snapshot instead of the database.
+const ENV_SKIP_BUILTIN_SYNC = "YAK_SKIP_BUILTIN_SYNC"
+
+// SkipBuiltinSync reports whether builtin content sync is disabled by env.
+func SkipBuiltinSync() bool {
+	return utils.InterfaceToBoolean(os.Getenv(ENV_SKIP_BUILTIN_SYNC))
+}
+
 func GetExtraDNSServers() []string {
 	return utils.RemoveRepeatStringSlice(utils.PrettifyListFromStringSplited(os.Getenv(CONST_YAK_EXTRA_DNS_SERVERS), ","))
 }
