@@ -9,13 +9,10 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 
-	"github.com/samber/lo"
 	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/yak/ssa"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 type CodeRange struct {
@@ -310,22 +307,14 @@ func (r *SyntaxFlowResult) auditSaver(value *Value, variable string, index int, 
 	}
 }
 
-func (r *SyntaxFlowResult) GetGRPCModelRisk() []*ypb.SSARisk {
-	if r == nil {
-		return nil
+// getSSARiskByHash loads one risk row from the SSA database. Keeping the query
+// here avoids importing the yakgrpc/yakit facade into the SSA core.
+func getSSARiskByHash(hash string) (*schema.SSARisk, error) {
+	var r schema.SSARisk
+	if db := ssadb.GetDB().Model(&schema.SSARisk{}).Where("hash = ?", hash).First(&r); db.Error != nil {
+		return nil, utils.Errorf("get Risk failed: %s", db.Error)
 	}
-
-	// load risk from database
-	if r.dbResult != nil && len(r.riskMap) != len(r.dbResult.RiskHashs) {
-		for name := range r.dbResult.RiskHashs {
-			r.getRisk(name)
-		}
-	}
-	// Binding an audit row changes metadata but not the number of risks.
-	// Do not cache by map length: it would return stale ids and timestamps.
-	return lo.MapToSlice(r.riskMap, func(name string, risk *schema.SSARisk) *ypb.SSARisk {
-		return risk.ToGRPCModel()
-	})
+	return &r, nil
 }
 
 func (r *SyntaxFlowResult) GetRiskByValue(variable string, i int) *schema.SSARisk {
@@ -339,7 +328,7 @@ func (r *SyntaxFlowResult) GetRiskByValue(variable string, i int) *schema.SSARis
 	// from db
 	if r.dbResult != nil {
 		if hash, ok := r.dbResult.RiskHashs[name]; ok {
-			risk, err := yakit.GetSSARiskByHash(ssadb.GetDB(), hash)
+			risk, err := getSSARiskByHash(hash)
 			if err != nil {
 				log.Errorf("get risk by hash failed: %s", err)
 				return nil
@@ -377,7 +366,7 @@ func (r *SyntaxFlowResult) getRisk(name string) *schema.SSARisk {
 	// from db
 	if r.dbResult != nil {
 		if hash, ok := r.dbResult.RiskHashs[name]; ok {
-			risk, err := yakit.GetSSARiskByHash(ssadb.GetDB(), hash)
+			risk, err := getSSARiskByHash(hash)
 			if err != nil {
 				log.Errorf("get risk by hash failed: %s", err)
 				return nil

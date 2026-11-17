@@ -15,7 +15,6 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/yak/ssaapi"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 
 	"io"
 )
@@ -71,7 +70,7 @@ func (r *Report) snapshotJSON() ([]byte, error) {
 func (r *Report) SaveForIRify() error {
 	ssaReport := r.ToSSAProjectReport()
 	// 创建yakit报告实例
-	reportInstance := yakit.NewReport()
+	reportInstance := &schema.Report{}
 	reportInstance.From("ssa-scan")
 	reportInstance.Title(fmt.Sprintf("%s-%s", ssaReport.ProgramName, uuid.NewString()))
 
@@ -548,7 +547,7 @@ func GenerateSSAReportMarkdownForTask(taskID, reportName string) (int, string, e
 	if err != nil {
 		return 0, "", utils.Wrapf(err, "generate ssa project report failed")
 	}
-	reportInstance := yakit.NewReport()
+	reportInstance := &schema.Report{}
 	reportInstance.From("ssa-scan")
 	reportInstance.Title(strings.TrimSpace(reportName))
 	if err := GenerateYakitReportContent(reportInstance, ssaReport); err != nil {

@@ -23,7 +23,6 @@ import (
 	"github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	regexp_utils "github.com/yaklang/yaklang/common/utils/regexp-utils"
 	"github.com/yaklang/yaklang/common/utils/resources_monitor"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
 
 var ruleFSWithHash resources_monitor.ResourceMonitor
@@ -378,11 +377,11 @@ func SyntaxFlowRuleHash() (string, error) {
 }
 
 func NeedSyncEmbedRule() bool {
-	diffHash := yakit.Get(consts.EmbedSfBuildInRuleKey) != consts.ExistedSyntaxFlowEmbedFSHash
+	diffHash := getEmbedRuleHash() != consts.ExistedSyntaxFlowEmbedFSHash
 	return diffHash
 }
 
 func DoneEmbedRule() {
 	log.Infof("done sync embed rule with hash: %s", consts.ExistedSyntaxFlowEmbedFSHash)
-	yakit.Set(consts.EmbedSfBuildInRuleKey, consts.ExistedSyntaxFlowEmbedFSHash)
+	setEmbedRuleHash(consts.ExistedSyntaxFlowEmbedFSHash)
 }

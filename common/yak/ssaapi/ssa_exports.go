@@ -7,10 +7,10 @@ import (
 
 	"github.com/yaklang/javajive/classparser"
 	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
 	"github.com/yaklang/yaklang/common/yak/ssaproject"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 
 	"github.com/yaklang/yaklang/common/utils/memedit"
 
@@ -164,21 +164,21 @@ var Exports = map[string]any{
 
 	"withProjectName": ssaconfig.WithProjectName,
 
-	"withConcurrency":                   WithConcurrency,
-	"withLanguage":                      WithRawLanguage,
-	"withConfigInfo":                    ssaconfig.WithCodeSourceMap,
-	"withExternLib":                     WithExternLib,
-	"withExternValue":                   WithExternValue,
-	"withProgramName":                   WithProgramName,
-	"withSetProgramName":                WithSetProgramName,
-	"withDescription":                   WithProgramDescription,
-	"withProcess":                       WithProcess,
-	"withEntryFile":                     WithFileSystemEntry,
-	"withReCompile":                     WithReCompile,
-	"withStrictMode":                    WithStrictMode,
-	"withContext":                       WithContext,
-	"withPeepholeSize":                  WithPeepholeSize,
-	"withExcludeFile":                   WithUserExcludePatterns,
+	"withConcurrency":    WithConcurrency,
+	"withLanguage":       WithRawLanguage,
+	"withConfigInfo":     ssaconfig.WithCodeSourceMap,
+	"withExternLib":      WithExternLib,
+	"withExternValue":    WithExternValue,
+	"withProgramName":    WithProgramName,
+	"withSetProgramName": WithSetProgramName,
+	"withDescription":    WithProgramDescription,
+	"withProcess":        WithProcess,
+	"withEntryFile":      WithFileSystemEntry,
+	"withReCompile":      WithReCompile,
+	"withStrictMode":     WithStrictMode,
+	"withContext":        WithContext,
+	"withPeepholeSize":   WithPeepholeSize,
+	"withExcludeFile":    WithUserExcludePatterns,
 	// withDefaultExcludeFunc is deprecated, use withExcludeFile instead.
 	// Note the misleading name: it sets USER exclude patterns, not the built-in
 	// default excludes (which are controlled by withDisableDefaultCompileExcludes).
@@ -240,5 +240,23 @@ func getLatestProgramNameByProjectName(projectName string) (string, error) {
 		return "", utils.Errorf("project name is empty")
 	}
 	db := consts.GetGormProfileDatabase()
-	return yakit.QueryLatestSSAProgramNameByProjectName(db, projectName)
+	if db == nil {
+		return "", utils.Errorf("profile database is not initialized")
+	}
+	var project schema.SSAProject
+	if err := db.Model(&schema.SSAProject{}).Where("project_name = ?", projectName).First(&project).Error; err != nil {
+		return "", utils.Errorf("find project by name %s failed: %s", projectName, err)
+	}
+	var names []string
+	if err := ssadb.GetDB().Model(&ssadb.IrProgram{}).
+		Where("project_id = ?", project.ID).
+		Order("updated_at desc").
+		Limit(1).
+		Pluck("program_name", &names).Error; err != nil {
+		return "", err
+	}
+	if len(names) == 0 {
+		return "", nil
+	}
+	return names[0], nil
 }

@@ -11,7 +11,6 @@ import (
 	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 func LoadResultByRuleContent(programName, ruleContent string, kind schema.SyntaxflowResultKind) (*SyntaxFlowResult, error) {
@@ -296,23 +295,4 @@ func (r *SyntaxFlowResult) saveValue(ctx context.Context, result *ssadb.AuditRes
 	})
 	saveVariable("_", r.GetUnNameValues())
 	return err
-}
-
-func (r *SyntaxFlowResult) GetGRPCModelResult() *ypb.SyntaxFlowResult {
-	if r == nil {
-		return nil
-	}
-	var ret *ypb.SyntaxFlowResult
-	if r.dbResult != nil {
-		ret = r.dbResult.ToGRPCModel()
-	}
-	if r.memResult != nil {
-		ret = r.memResult.ToGRPCModel()
-	}
-	if ret != nil {
-		ret.ResultID = uint64(r.id)
-		ret.TaskID = r.TaskID
-		ret.SaveKind = string(r.GetResultSaveKind())
-	}
-	return ret
 }

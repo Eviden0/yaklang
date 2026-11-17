@@ -12,7 +12,6 @@ import (
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
@@ -1305,7 +1304,7 @@ func getRisks(filter *ypb.SSARisksFilter) ([]*schema.SSARisk, error) {
 
 	// 直接使用FilterSSARisk进行查询，避免分页限制
 	db = db.Model(&schema.SSARisk{})
-	db = yakit.FilterSSARisk(db, filter)
+	db = filterSSARiskLocal(db, filter)
 	// 使用多字段排序确保结果一致性：先按创建时间降序，再按ID升序
 	db = db.Order("created_at DESC, id ASC")
 
@@ -1358,7 +1357,7 @@ func processRisksAndStats(report *SSAProjectReport, risks []*schema.SSARisk) err
 		disposalComment := ""
 
 		// 通过 GetSSARiskDisposalsWithInheritance 获取完整的处置记录
-		disposals, err := yakit.GetSSARiskDisposalsWithInheritance(db, int64(risk.ID))
+		disposals, err := getSSARiskDisposalsWithInheritanceLocal(db, int64(risk.ID))
 		if err == nil && len(disposals) > 0 {
 			// 取第一个（最新的）处置记录
 			latestDisposal := disposals[0]

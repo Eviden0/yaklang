@@ -1,3 +1,5 @@
+//go:build !ssa_only
+
 package ssa_compile
 
 import (

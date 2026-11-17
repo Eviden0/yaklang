@@ -16,9 +16,9 @@ import (
 	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
 	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
 	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/bizhelper"
 	"github.com/yaklang/yaklang/common/yak/ssa"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
 
 // structScanState holds compile-unit rule frames, budgets and timing. It is
@@ -227,9 +227,28 @@ func loadBuiltinStructRules() []*schema.SyntaxFlowRule {
 		return nil
 	}
 	var rules []*schema.SyntaxFlowRule
-	_ = yakit.ApplySyntaxFlowRuleModeFilter(db.Model(&schema.SyntaxFlowRule{}), []string{string(schema.SFR_MODE_STRUCT)}).
+	_ = applySyntaxFlowRuleModeFilter(db.Model(&schema.SyntaxFlowRule{}), []string{string(schema.SFR_MODE_STRUCT)}).
 		Find(&rules).Error
 	return rules
+}
+
+// applySyntaxFlowRuleModeFilter restricts rules by persisted execution mode
+// (source | ssa | struct). It mirrors the yakit helper without importing the
+// gRPC/DB facade into the SSA core.
+func applySyntaxFlowRuleModeFilter(db *gorm.DB, modes []string) *gorm.DB {
+	if db == nil || len(modes) == 0 {
+		return db
+	}
+	normalized := make([]string, 0, len(modes))
+	for _, mode := range modes {
+		if trimmed := strings.TrimSpace(mode); trimmed != "" {
+			normalized = append(normalized, string(schema.ValidRuleMode(trimmed)))
+		}
+	}
+	if len(normalized) == 0 {
+		return db
+	}
+	return bizhelper.ExactOrQueryStringArrayOr(db, "mode", normalized)
 }
 
 func loadStructRulesFromDir(dir string) ([]*schema.SyntaxFlowRule, error) {

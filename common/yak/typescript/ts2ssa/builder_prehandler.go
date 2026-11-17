@@ -6,8 +6,6 @@ import (
 	"strings"
 
 	"github.com/yaklang/yaklang/common/log"
-	"github.com/yaklang/yaklang/common/sca"
-	"github.com/yaklang/yaklang/common/utils/filesys"
 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
 	"github.com/yaklang/yaklang/common/utils/memedit"
 	"github.com/yaklang/yaklang/common/yak/ssa"
@@ -56,18 +54,7 @@ func (s *SSABuilder) PreHandlerProject(fileSystem fi.FileSystem, ast ssa.FrontAS
 	}
 
 	filename := editor.GetFilename()
-	// pom.xml
-	if strings.TrimLeft(filename, string(fileSystem.GetSeparators())) == "package.json" {
-		fb.SetEditor(editor)
-		vfs := filesys.NewVirtualFs()
-		vfs.AddFile(filename, editor.GetSourceCode())
-		pkgs, err := sca.ScanFilesystem(vfs)
-		if err != nil {
-			log.Warnf("scan package.json error: %v", err)
-		}
-		prog.SCAPackages = append(prog.SCAPackages, pkgs...)
-		fb.GenerateDependence(pkgs, filename)
-	}
+	handlePackageDependencies(prog, fb, filename, editor, fileSystem)
 
 	saveExtraFile := func(path string) {
 		if prog.GetProgramName() == "" {

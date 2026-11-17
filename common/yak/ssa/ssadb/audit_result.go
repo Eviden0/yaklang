@@ -6,7 +6,6 @@ import (
 	"github.com/yaklang/gorm"
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils/bizhelper"
-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
 const (
@@ -130,25 +129,6 @@ func CountAuditResults(DB *gorm.DB) (int, error) {
 
 func YieldAuditResults(db *gorm.DB, ctx context.Context) chan *AuditResult {
 	return bizhelper.YieldModel[*AuditResult](ctx, db)
-}
-
-func (r *AuditResult) ToGRPCModel() *ypb.SyntaxFlowResult {
-	res := &ypb.SyntaxFlowResult{
-		ResultID:    uint64(r.ID),
-		TaskID:      r.TaskID,
-		RuleName:    r.RuleName,
-		Title:       r.RuleTitle,
-		TitleZh:     r.RuleTitleZh,
-		Description: r.RuleDesc,
-		Severity:    r.RuleSeverity,
-		Purpose:     r.RulePurpose,
-		ProgramName: r.ProgramName,
-		Language:    r.Language,
-		RiskCount:   r.RiskCount,
-		RuleContent: r.RuleContent,
-		Kind:        string(r.Kind),
-	}
-	return res
 }
 
 func (r *AuditResult) AfterUpdate(tx *gorm.DB) (err error) {

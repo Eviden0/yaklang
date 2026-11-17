@@ -7,12 +7,54 @@ import (
 
 	"github.com/samber/lo"
 	"github.com/yaklang/yaklang/common/utils"
-	"github.com/yaklang/yaklang/common/yak/yakdoc"
 )
 
 const (
 	MAXTYPELEVEL = 15
 )
+
+// getTypeNameWithPkgPath is kept in the SSA core so it does not need to import
+// the higher-level yakdoc package just for a reflect type-name format.
+func getTypeNameWithPkgPath(typ reflect.Type) (pkgPath string, pkgPathName string) {
+	rawName := typ.Name()
+	if rawName == "" {
+		rawName = typ.String()
+	}
+
+	typKind := typ.Kind()
+	pkgPath = typ.PkgPath()
+
+	if pkgPath == "" {
+		innerTyp := typ
+		if typKind == reflect.Slice || typKind == reflect.Array || typKind == reflect.Chan {
+			innerTyp = typ.Elem()
+			typKind = innerTyp.Kind()
+		}
+		if typKind == reflect.Ptr {
+			innerTyp = innerTyp.Elem()
+		}
+		pkgPath = innerTyp.PkgPath()
+	}
+
+	if strings.HasPrefix(rawName, "*") {
+		rawName = rawName[1:]
+	}
+
+	if pkgPath != "" {
+		if strings.Contains(rawName, ".") {
+			fixedPkgPath := pkgPath
+			index := strings.LastIndex(fixedPkgPath, "/")
+			if index == -1 {
+				fixedPkgPath = ""
+			} else {
+				fixedPkgPath = fixedPkgPath[:index+1]
+			}
+			return pkgPath, fmt.Sprintf("%s%s", fixedPkgPath, rawName)
+		}
+		return pkgPath, fmt.Sprintf("%s.%s", pkgPath, rawName)
+	}
+	return pkgPath, rawName
+}
 
 func (b *FunctionBuilder) WithExternSideEffect(es map[string][]uint) {
 	m := make(map[string]func(b *FunctionBuilder, id string, v any) (value Value))
@@ -330,7 +372,7 @@ func (prog *Program) handlerType(typ reflect.Type, level int) Type {
 		return t
 	}
 
-	_, pkgPathName := yakdoc.GetTypeNameWithPkgPath(typ)
+	_, pkgPathName := getTypeNameWithPkgPath(typ)
 
 	if hijackType, ok := prog.externType[Name]; ok {
 		return hijackType

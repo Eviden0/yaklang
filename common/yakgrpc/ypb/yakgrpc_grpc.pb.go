@@ -4,6 +4,8 @@
 // - protoc             v5.29.4
 // source: yakgrpc.proto
 
+//go:build !ssa_only
+
 package ypb
 
 import (

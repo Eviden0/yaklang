@@ -7,7 +7,6 @@ import (
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
 
 // rulePreparation belongs to one product scan, not to the process/profile DB.
@@ -48,7 +47,7 @@ func (c *Config) preparedRuleInputs() ([]*schema.SyntaxFlowRule, map[string]*sch
 				log.Warnf("compile scan rule input %d: %v", i, errs[i])
 				continue
 			}
-			rule, err := yakit.ApplySyntaxFlowRuleInput(input, compiled[i])
+			rule, err := applySyntaxFlowRuleInput(input, compiled[i])
 			if err != nil {
 				log.Warnf("prepare scan rule input %d: %v", i, err)
 				continue

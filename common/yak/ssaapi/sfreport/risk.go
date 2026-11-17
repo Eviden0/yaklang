@@ -8,7 +8,6 @@ import (
 	"github.com/yaklang/yaklang/common/schema"
 	"github.com/yaklang/yaklang/common/utils"
 	"github.com/yaklang/yaklang/common/yak/ssaapi"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
 
 type Risk struct {
@@ -143,8 +142,10 @@ func (r *Risk) SaveToDB(db *gorm.DB) (string, error) {
 
 	// CreateSSARisk会在BeforeCreate修正Hash
 	// Todo:Hash是否应该被修正呢？因为Risk计算hash有ResultID，但是导出后ResultId就没有了
-	err := yakit.CreateSSARisk(db, ssaRisk)
-	if err != nil {
+	if ssaRisk.TitleVerbose == "" {
+		ssaRisk.TitleVerbose = ssaRisk.Title
+	}
+	if err := db.Create(ssaRisk).Error; err != nil {
 		return "", utils.Wrapf(err, "Save Risk to DB failed")
 	}
 

@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/yaklang/antlr/v4"
-	"github.com/yaklang/yaklang/common/sca"
-	"github.com/yaklang/yaklang/common/utils/filesys"
 	"go.uber.org/atomic"
 
 	"github.com/yaklang/yaklang/common/log"
@@ -90,15 +88,7 @@ func (s *SSABuilder) PreHandlerProject(fileSystem fi.FileSystem, ast ssa.FrontAS
 	}
 	filename := editor.GetFilename()
 	if filepath.Ext(filename) == ".lock" && filename == "composer.lock" {
-		builder.SetEditor(editor)
-		vfs := filesys.NewVirtualFs()
-		vfs.AddFile(filename, editor.GetSourceCode())
-		pkgs, err := sca.ScanFilesystem(vfs)
-		if err != nil {
-			log.Warnf("scan pom.xml error: %v", err)
-		}
-		prog.SCAPackages = append(prog.SCAPackages, pkgs...)
-		builder.GenerateDependence(pkgs, filename)
+		handleComposerDependencies(prog, builder, filename, editor)
 	} else {
 		prog.Build(ast, editor, builder)
 	}

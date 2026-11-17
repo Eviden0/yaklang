@@ -2,7 +2,6 @@ package resources_monitor
 
 import (
 	"github.com/yaklang/yaklang/common/consts"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 )
 
 type EmbedResourcesMonitor struct {
@@ -27,12 +26,12 @@ func (m *EmbedResourcesMonitor) getCurrentHash(currentHashGetter func() string) 
 
 func (m *EmbedResourcesMonitor) MonitorModifiedWithAction(currentHashGetter func() string, callBack func() error) error {
 	resourceHash := m.getCurrentHash(currentHashGetter)
-	if resourceHash != yakit.Get(m.resourceID) {
+	if resourceHash != getResourceHash(m.resourceID) {
 		err := callBack()
 		if err != nil {
 			return err
 		} else {
-			yakit.Set(m.resourceID, resourceHash)
+			setResourceHash(m.resourceID, resourceHash)
 		}
 	}
 	return nil

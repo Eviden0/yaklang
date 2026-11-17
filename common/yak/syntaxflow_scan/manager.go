@@ -15,7 +15,6 @@ import (
 	"github.com/yaklang/yaklang/common/utils/diagnostics"
 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
 	"github.com/yaklang/yaklang/common/yak/ssaapi"
-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
 )
 
@@ -158,7 +157,7 @@ func (m *scanManager) setScanBatch() {
 		m.taskRecorder = &schema.SyntaxFlowScanTask{}
 	}
 
-	maxBatch, err := yakit.GetMaxScanBatch(ssadb.GetDB(), m.Config.GetProgramNames())
+	maxBatch, err := getMaxScanBatch(ssadb.GetDB(), m.Config.GetProgramNames())
 	if err != nil {
 		m.taskRecorder.ScanBatch = 1
 	} else {
@@ -218,7 +217,7 @@ func (m *scanManager) captureTaskSnapshot(withLevelCounts bool) *schema.SyntaxFl
 	m.taskRecorder.Config, _ = json.Marshal(m.Config)
 	m.taskRecorder.ProjectId = m.Config.GetProjectID()
 	if withLevelCounts && (m.status == schema.SYNTAXFLOWSCAN_DONE || m.status == schema.SYNTAXFLOWSCAN_PAUSED) {
-		levelCounts, errLC := yakit.GetSSARiskLevelCount(ssadb.GetDB(), &ypb.SSARisksFilter{
+		levelCounts, errLC := getSSARiskLevelCount(ssadb.GetDB(), &ypb.SSARisksFilter{
 			RuntimeID: []string{m.TaskId()},
 		})
 		if errLC == nil {
@@ -317,7 +316,7 @@ func (m *scanManager) initByConfig() error {
 		}
 	} else if config.GetProjectID() != 0 {
 		// 前端如果没传programName扫描功能默认选择最新的programName进行扫描
-		name, err := yakit.QueryLatestSSAProgramNameByProjectId(consts.GetGormSSAProjectDataBase(), config.GetProjectID())
+		name, err := queryLatestSSAProgramNameByProjectId(consts.GetGormSSAProjectDataBase(), config.GetProjectID())
 		if err != nil {
 			return utils.Errorf("SyntaxFlow Scan Failed: query latest SSA Program Name by Project ID failed: %s", err)
 		}
@@ -361,8 +360,8 @@ func (m *scanManager) initByConfig() error {
 
 	setRuleChan := func(filter *ypb.SyntaxFlowRuleFilter) error {
 		db := consts.GetGormProfileDatabase()
-		db = yakit.FilterSyntaxFlowRule(db, filter)
-		db = yakit.ApplySyntaxFlowRuleModeFilter(db, ruleFilterModes(config))
+		db = filterSyntaxFlowRule(db, filter)
+		db = applySyntaxFlowRuleModeFilter(db, ruleFilterModes(config))
 		// get all rule name
 		var ruleNames []string
 		err := db.Pluck("rule_name", &ruleNames).Error
