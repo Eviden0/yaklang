@@ -1,0 +1,2790 @@
+From b7206a7c1ceee05f0afff67ad93775643ee37dfe Mon Sep 17 00:00:00 2001
+From: Eviden0 <Eviden0@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 17:54:32 +0800
+Subject: [PATCH 3/3] feat(ssa): add ssa_only slim engine profile
+
+- add cmd/yak-ssa and a non-AI slim command list under the ssa_only tag
+- move ypb/yakit conversions behind !ssa_only so the slim engine links no gRPC server or yakit facade
+- make SCA dependency extraction (Java/PHP/TS) and official C header installation optional
+- add slim KV/filter/DB helpers for syntaxflow_scan, sfreport, sfbuildin and resources_monitor
+- exclude AI completion commands and the generated gRPC service stubs from the slim build
+
+Slim build: go build -tags ssa_only -trimpath -ldflags="-s -w" ./cmd/yak-ssa
+Measured: 824 deps and ~115MB stripped, vs 1461 deps / ~197MB for the default ssa-scan build.
+---
+ cmd/yak-ssa/main.go                           |  52 +++
+ common/syntaxflow/sfbuildin/rules.go          |   5 +-
+ common/syntaxflow/sfbuildin/rules_kv_grpc.go  |  16 +
+ common/syntaxflow/sfbuildin/rules_kv_slim.go  |  42 ++
+ common/syntaxflow/sfvm/result.go              |  22 -
+ common/syntaxflow/sfvm/result_grpc.go         |  26 ++
+ common/utils/resources_monitor/kv_grpc.go     |  13 +
+ common/utils/resources_monitor/kv_slim.go     |  40 ++
+ .../resources_monitor/resources_monitor.go    |   5 +-
+ .../c2ssa/preprocess/official_c_headers.go    |   2 +
+ .../preprocess/official_c_headers_slim.go     |  42 ++
+ common/yak/cmd/ssacmds/ssacli.go              | 421 +-----------------
+ common/yak/cmd/ssacmds/ssacli_ai.go           | 406 +++++++++++++++++
+ common/yak/cmd/ssacmds/ssacli_slim.go         |  12 +
+ common/yak/java/java2ssa/builder_pom_grpc.go  |  29 ++
+ common/yak/java/java2ssa/builder_pom_slim.go  |  14 +
+ .../yak/java/java2ssa/builder_prehandler.go   |  15 +-
+ common/yak/php/php2ssa/builder.go             |  12 +-
+ .../yak/php/php2ssa/builder_composer_grpc.go  |  23 +
+ .../yak/php/php2ssa/builder_composer_slim.go  |  13 +
+ common/yak/ssa/extern_instance.go             |  46 +-
+ common/yak/ssa/ssadb/audit_result.go          |  20 -
+ common/yak/ssa/ssadb/audit_result_grpc.go     |  24 +
+ common/yak/ssa_compile/runner.go              |   2 +
+ common/yak/ssa_compile/runner_ssa_only.go     | 113 +++++
+ common/yak/ssaapi/sf_result_risk.go           |  31 +-
+ common/yak/ssaapi/sf_result_risk_grpc.go      |  27 ++
+ common/yak/ssaapi/sf_result_save.go           |  20 -
+ common/yak/ssaapi/sf_result_save_grpc.go      |  24 +
+ common/yak/ssaapi/sfreport/convert_json.go    |   5 +-
+ common/yak/ssaapi/sfreport/risk.go            |   7 +-
+ common/yak/ssaapi/sfreport/sf_report.go       |   5 +-
+ .../ssaapi/sfreport/sf_report_filter_grpc.go  |  18 +
+ .../ssaapi/sfreport/sf_report_filter_slim.go  | 159 +++++++
+ common/yak/ssaapi/ssa_exports.go              |  52 ++-
+ common/yak/ssaapi/struct_scan_state.go        |  23 +-
+ common/yak/syntaxflow_scan/manager.go         |  11 +-
+ .../yak/syntaxflow_scan/rule_preparation.go   |   3 +-
+ .../yak/syntaxflow_scan/yakit_compat_grpc.go  |  47 ++
+ .../yak/syntaxflow_scan/yakit_compat_slim.go  | 196 ++++++++
+ .../ts2ssa/builder_dependency_grpc.go         |  29 ++
+ .../ts2ssa/builder_dependency_slim.go         |  14 +
+ .../typescript/ts2ssa/builder_prehandler.go   |  15 +-
+ common/yakgrpc/ypb/yakgrpc_grpc.pb.go         |   2 +
+ 44 files changed, 1539 insertions(+), 564 deletions(-)
+ create mode 100644 cmd/yak-ssa/main.go
+ create mode 100644 common/syntaxflow/sfbuildin/rules_kv_grpc.go
+ create mode 100644 common/syntaxflow/sfbuildin/rules_kv_slim.go
+ create mode 100644 common/syntaxflow/sfvm/result_grpc.go
+ create mode 100644 common/utils/resources_monitor/kv_grpc.go
+ create mode 100644 common/utils/resources_monitor/kv_slim.go
+ create mode 100644 common/yak/c2ssa/preprocess/official_c_headers_slim.go
+ create mode 100644 common/yak/cmd/ssacmds/ssacli_ai.go
+ create mode 100644 common/yak/cmd/ssacmds/ssacli_slim.go
+ create mode 100644 common/yak/java/java2ssa/builder_pom_grpc.go
+ create mode 100644 common/yak/java/java2ssa/builder_pom_slim.go
+ create mode 100644 common/yak/php/php2ssa/builder_composer_grpc.go
+ create mode 100644 common/yak/php/php2ssa/builder_composer_slim.go
+ create mode 100644 common/yak/ssa/ssadb/audit_result_grpc.go
+ create mode 100644 common/yak/ssa_compile/runner_ssa_only.go
+ create mode 100644 common/yak/ssaapi/sf_result_risk_grpc.go
+ create mode 100644 common/yak/ssaapi/sf_result_save_grpc.go
+ create mode 100644 common/yak/ssaapi/sfreport/sf_report_filter_grpc.go
+ create mode 100644 common/yak/ssaapi/sfreport/sf_report_filter_slim.go
+ create mode 100644 common/yak/syntaxflow_scan/yakit_compat_grpc.go
+ create mode 100644 common/yak/syntaxflow_scan/yakit_compat_slim.go
+ create mode 100644 common/yak/typescript/ts2ssa/builder_dependency_grpc.go
+ create mode 100644 common/yak/typescript/ts2ssa/builder_dependency_slim.go
+
+diff --git a/cmd/yak-ssa/main.go b/cmd/yak-ssa/main.go
+new file mode 100644
+index 0000000..a63acd9
+--- /dev/null
++++ b/cmd/yak-ssa/main.go
+@@ -0,0 +1,52 @@
++//go:build ssa_only
++
++// Command yak-ssa is the slim SSA engine: compile / SyntaxFlow / code-scan
++// without the AI, MITM, crawler, plugin or gRPC server trees.
++package main
++
++import (
++	"fmt"
++	"os"
++
++	"github.com/yaklang/yaklang/common/consts"
++	"github.com/yaklang/yaklang/common/log"
++	cli "github.com/yaklang/yaklang/common/urfavecli"
++	"github.com/yaklang/yaklang/common/yak/cmd/ssacmds"
++)
++
++func main() {
++	app := cli.NewApp()
++	app.Name = "yak-ssa"
++	app.Usage = "Yak SSA compiler and SyntaxFlow code scanner (slim)"
++	app.Version = consts.GetYakVersion()
++
++	commands := make([]cli.Command, 0, len(ssacmds.SSASlimCommands))
++	for _, command := range ssacmds.SSASlimCommands {
++		if command != nil {
++			commands = append(commands, *command)
++		}
++	}
++	app.Commands = commands
++	app.Before = func(c *cli.Context) error {
++		if !needsDatabase(os.Args) {
++			return nil
++		}
++		return consts.InitializeYakitDatabase("", "", "")
++	}
++	if err := app.Run(os.Args); err != nil {
++		log.Errorf("%v", err)
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++}
++
++func needsDatabase(args []string) bool {
++	if len(args) <= 1 {
++		return false
++	}
++	switch args[1] {
++	case "-v", "--version", "-version", "version", "help", "-h", "--help":
++		return false
++	}
++	return true
++}
+diff --git a/common/syntaxflow/sfbuildin/rules.go b/common/syntaxflow/sfbuildin/rules.go
+index f717e59..1dbe016 100644
+--- a/common/syntaxflow/sfbuildin/rules.go
++++ b/common/syntaxflow/sfbuildin/rules.go
+@@ -23,7 +23,6 @@ import (
+ 	"github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+ 	regexp_utils "github.com/yaklang/yaklang/common/utils/regexp-utils"
+ 	"github.com/yaklang/yaklang/common/utils/resources_monitor"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ )
+ 
+ var ruleFSWithHash resources_monitor.ResourceMonitor
+@@ -378,11 +377,11 @@ func SyntaxFlowRuleHash() (string, error) {
+ }
+ 
+ func NeedSyncEmbedRule() bool {
+-	diffHash := yakit.Get(consts.EmbedSfBuildInRuleKey) != consts.ExistedSyntaxFlowEmbedFSHash
++	diffHash := getEmbedRuleHash() != consts.ExistedSyntaxFlowEmbedFSHash
+ 	return diffHash
+ }
+ 
+ func DoneEmbedRule() {
+ 	log.Infof("done sync embed rule with hash: %s", consts.ExistedSyntaxFlowEmbedFSHash)
+-	yakit.Set(consts.EmbedSfBuildInRuleKey, consts.ExistedSyntaxFlowEmbedFSHash)
++	setEmbedRuleHash(consts.ExistedSyntaxFlowEmbedFSHash)
+ }
+diff --git a/common/syntaxflow/sfbuildin/rules_kv_grpc.go b/common/syntaxflow/sfbuildin/rules_kv_grpc.go
+new file mode 100644
+index 0000000..e1d2f76
+--- /dev/null
++++ b/common/syntaxflow/sfbuildin/rules_kv_grpc.go
+@@ -0,0 +1,16 @@
++//go:build !irify_exclude && !ssa_only
++
++package sfbuildin
++
++import (
++	"github.com/yaklang/yaklang/common/consts"
++	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
++)
++
++func getEmbedRuleHash() string {
++	return yakit.Get(consts.EmbedSfBuildInRuleKey)
++}
++
++func setEmbedRuleHash(value string) {
++	yakit.Set(consts.EmbedSfBuildInRuleKey, value)
++}
+diff --git a/common/syntaxflow/sfbuildin/rules_kv_slim.go b/common/syntaxflow/sfbuildin/rules_kv_slim.go
+new file mode 100644
+index 0000000..dfaad24
+--- /dev/null
++++ b/common/syntaxflow/sfbuildin/rules_kv_slim.go
+@@ -0,0 +1,42 @@
++//go:build !irify_exclude && ssa_only
++
++package sfbuildin
++
++import (
++	"strconv"
++
++	"github.com/yaklang/yaklang/common/consts"
++	"github.com/yaklang/yaklang/common/schema"
++)
++
++// The embed-rule hash key is a small KV entry. The slim engine reads and
++// writes it directly so it does not link the yakgrpc/yakit facade.
++func getEmbedRuleHash() string {
++	db := consts.GetGormProfileDatabase()
++	if db == nil {
++		return ""
++	}
++	key := strconv.Quote(consts.EmbedSfBuildInRuleKey)
++	var kv schema.GeneralStorage
++	if err := db.Where("key = ?", key).First(&kv).Error; err != nil || kv.Value == "" {
++		return ""
++	}
++	value, err := strconv.Unquote(kv.Value)
++	if err != nil {
++		return kv.Value
++	}
++	return value
++}
++
++func setEmbedRuleHash(value string) {
++	db := consts.GetGormProfileDatabase()
++	if db == nil {
++		return
++	}
++	key := strconv.Quote(consts.EmbedSfBuildInRuleKey)
++	valueStr := strconv.Quote(value)
++	_ = db.Model(&schema.GeneralStorage{}).
++		Where("key = ?", key).
++		Assign(map[string]interface{}{"key": key, "value": valueStr}).
++		FirstOrCreate(&schema.GeneralStorage{}).Error
++}
+diff --git a/common/syntaxflow/sfvm/result.go b/common/syntaxflow/sfvm/result.go
+index 91d879f..f0b83dd 100644
+--- a/common/syntaxflow/sfvm/result.go
++++ b/common/syntaxflow/sfvm/result.go
+@@ -6,7 +6,6 @@ import (
+ 	"strings"
+ 
+ 	"github.com/yaklang/yaklang/common/schema"
+-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+ 
+ 	"github.com/yaklang/yaklang/common/yak/yaklib/codec"
+ 
+@@ -302,24 +301,3 @@ func (s *SFFrameResult) GetDescription() string {
+ 		return codec.AnyToString(info)
+ 	}
+ }
+-
+-func (s *SFFrameResult) ToGRPCModel() *ypb.SyntaxFlowResult {
+-	if s == nil {
+-		return nil
+-	}
+-	return &ypb.SyntaxFlowResult{
+-		ResultID:    0,
+-		TaskID:      "", // TODO: TaskID
+-		Kind:        "", // TODO: Kind
+-		ProgramName: "", // TODO: ProgramName
+-
+-		RuleName:    s.rule.RuleName,
+-		Title:       s.rule.Title,
+-		TitleZh:     s.rule.TitleZh,
+-		Description: s.GetDescription(),
+-		Severity:    string(s.rule.Severity),
+-		Purpose:     string(s.rule.Purpose),
+-		Language:    string(s.rule.Language),
+-		RuleContent: s.rule.Content,
+-	}
+-}
+diff --git a/common/syntaxflow/sfvm/result_grpc.go b/common/syntaxflow/sfvm/result_grpc.go
+new file mode 100644
+index 0000000..006a27c
+--- /dev/null
++++ b/common/syntaxflow/sfvm/result_grpc.go
+@@ -0,0 +1,26 @@
++//go:build !ssa_only
++
++package sfvm
++
++import "github.com/yaklang/yaklang/common/yakgrpc/ypb"
++
++func (s *SFFrameResult) ToGRPCModel() *ypb.SyntaxFlowResult {
++	if s == nil {
++		return nil
++	}
++	return &ypb.SyntaxFlowResult{
++		ResultID:    0,
++		TaskID:      "", // TODO: TaskID
++		Kind:        "", // TODO: Kind
++		ProgramName: "", // TODO: ProgramName
++
++		RuleName:    s.rule.RuleName,
++		Title:       s.rule.Title,
++		TitleZh:     s.rule.TitleZh,
++		Description: s.GetDescription(),
++		Severity:    string(s.rule.Severity),
++		Purpose:     string(s.rule.Purpose),
++		Language:    string(s.rule.Language),
++		RuleContent: s.rule.Content,
++	}
++}
+diff --git a/common/utils/resources_monitor/kv_grpc.go b/common/utils/resources_monitor/kv_grpc.go
+new file mode 100644
+index 0000000..e27419e
+--- /dev/null
++++ b/common/utils/resources_monitor/kv_grpc.go
+@@ -0,0 +1,13 @@
++//go:build !ssa_only
++
++package resources_monitor
++
++import "github.com/yaklang/yaklang/common/yakgrpc/yakit"
++
++func getResourceHash(resourceID string) string {
++	return yakit.Get(resourceID)
++}
++
++func setResourceHash(resourceID, hash string) {
++	yakit.Set(resourceID, hash)
++}
+diff --git a/common/utils/resources_monitor/kv_slim.go b/common/utils/resources_monitor/kv_slim.go
+new file mode 100644
+index 0000000..5f1c9e6
+--- /dev/null
++++ b/common/utils/resources_monitor/kv_slim.go
+@@ -0,0 +1,40 @@
++//go:build ssa_only
++
++package resources_monitor
++
++import (
++	"strconv"
++
++	"github.com/yaklang/yaklang/common/consts"
++	"github.com/yaklang/yaklang/common/schema"
++)
++
++func getResourceHash(resourceID string) string {
++	db := consts.GetGormProfileDatabase()
++	if db == nil {
++		return ""
++	}
++	key := strconv.Quote(resourceID)
++	var kv schema.GeneralStorage
++	if err := db.Where("key = ?", key).First(&kv).Error; err != nil || kv.Value == "" {
++		return ""
++	}
++	value, err := strconv.Unquote(kv.Value)
++	if err != nil {
++		return kv.Value
++	}
++	return value
++}
++
++func setResourceHash(resourceID, hash string) {
++	db := consts.GetGormProfileDatabase()
++	if db == nil {
++		return
++	}
++	key := strconv.Quote(resourceID)
++	valueStr := strconv.Quote(hash)
++	_ = db.Model(&schema.GeneralStorage{}).
++		Where("key = ?", key).
++		Assign(map[string]interface{}{"key": key, "value": valueStr}).
++		FirstOrCreate(&schema.GeneralStorage{}).Error
++}
+diff --git a/common/utils/resources_monitor/resources_monitor.go b/common/utils/resources_monitor/resources_monitor.go
+index e76d747..ec6d4ce 100644
+--- a/common/utils/resources_monitor/resources_monitor.go
++++ b/common/utils/resources_monitor/resources_monitor.go
+@@ -2,7 +2,6 @@ package resources_monitor
+ 
+ import (
+ 	"github.com/yaklang/yaklang/common/consts"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ )
+ 
+ type EmbedResourcesMonitor struct {
+@@ -27,12 +26,12 @@ func (m *EmbedResourcesMonitor) getCurrentHash(currentHashGetter func() string)
+ 
+ func (m *EmbedResourcesMonitor) MonitorModifiedWithAction(currentHashGetter func() string, callBack func() error) error {
+ 	resourceHash := m.getCurrentHash(currentHashGetter)
+-	if resourceHash != yakit.Get(m.resourceID) {
++	if resourceHash != getResourceHash(m.resourceID) {
+ 		err := callBack()
+ 		if err != nil {
+ 			return err
+ 		} else {
+-			yakit.Set(m.resourceID, resourceHash)
++			setResourceHash(m.resourceID, resourceHash)
+ 		}
+ 	}
+ 	return nil
+diff --git a/common/yak/c2ssa/preprocess/official_c_headers.go b/common/yak/c2ssa/preprocess/official_c_headers.go
+index a7dfbb7..a91f0f8 100644
+--- a/common/yak/c2ssa/preprocess/official_c_headers.go
++++ b/common/yak/c2ssa/preprocess/official_c_headers.go
+@@ -1,3 +1,5 @@
++//go:build !ssa_only
++
+ package preprocess
+ 
+ import (
+diff --git a/common/yak/c2ssa/preprocess/official_c_headers_slim.go b/common/yak/c2ssa/preprocess/official_c_headers_slim.go
+new file mode 100644
+index 0000000..b6e2487
+--- /dev/null
++++ b/common/yak/c2ssa/preprocess/official_c_headers_slim.go
+@@ -0,0 +1,42 @@
++//go:build ssa_only
++
++package preprocess
++
++import (
++	"context"
++
++	"github.com/yaklang/yaklang/common/utils"
++)
++
++const (
++	OfficialCHeadersName    = "c-std-headers"
++	OfficialCHeadersZipName = "c-std-headers.zip"
++)
++
++func OfficialCHeadersAutoDownloadDisabled() bool {
++	return true
++}
++
++func OfficialCHeadersPackPath() (string, error) {
++	return "", utils.Errorf("official C headers are not bundled in the slim engine")
++}
++
++func HasOfficialCHeadersLibrary() bool {
++	return false
++}
++
++func EnsureOfficialCHeaders(ctx context.Context, force bool) (packPath string, version string, err error) {
++	return "", "", utils.Errorf("official C headers are not bundled in the slim engine")
++}
++
++func EnsureExternalIncludeDirs() []string {
++	return nil
++}
++
++func LastOfficialCHeadersAutoDownloadError() error {
++	return nil
++}
++
++func FetchOfficialCHeadersVersion(ctx context.Context) string {
++	return ""
++}
+diff --git a/common/yak/cmd/ssacmds/ssacli.go b/common/yak/cmd/ssacmds/ssacli.go
+index 176d13e..6155f56 100644
+--- a/common/yak/cmd/ssacmds/ssacli.go
++++ b/common/yak/cmd/ssacmds/ssacli.go
+@@ -12,23 +12,17 @@ import (
+ 	"github.com/yaklang/yaklang/common/yak/syntaxflow_scan"
+ 
+ 	"github.com/yaklang/gorm"
+-	"github.com/yaklang/yaklang/common/ai/aispec"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+ 
+ 	"io"
+ 	"io/fs"
+-	"math/rand"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+-	"sync"
+-	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/yaklang/yaklang/common/schema"
+ 	"github.com/yaklang/yaklang/common/syntaxflow/sfbuildin"
+-	"github.com/yaklang/yaklang/common/syntaxflow/sfcompletion"
+ 	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
+ 	"github.com/yaklang/yaklang/common/syntaxflow/sfrisk"
+ 	"github.com/yaklang/yaklang/common/utils/bizhelper"
+@@ -798,386 +792,6 @@ var syntaxflowFormat = &cli.Command{
+ 	},
+ }
+ 
+-var syntaxflowCompletion = &cli.Command{
+-	Name:    "syntaxflowCompletion",
+-	Aliases: []string{"sf-complete", "sf-completions"},
+-	Usage:   "SyntaxFlow Rule Description Completion By AI",
+-	Flags: []cli.Flag{
+-		cli.StringFlag{
+-			Name:  "ai-type,type",
+-			Usage: "type of AI type",
+-		},
+-		cli.StringFlag{
+-			Name:  "target,t",
+-			Usage: "the file or directory to process, if it is a directory, all .sf files will be processed",
+-		},
+-		cli.StringFlag{
+-			Name:  "api-key,key,k",
+-			Usage: "api key of AI",
+-		},
+-		cli.StringFlag{
+-			Name:  "ai-model,model,m",
+-			Usage: "model of AI",
+-		},
+-		cli.StringFlag{
+-			Name:  "proxy,p",
+-			Usage: "proxy of AI",
+-		},
+-		cli.StringFlag{
+-			Name:  "domain,ai-domain",
+-			Usage: "domain of ai",
+-		},
+-		cli.StringFlag{
+-			Name:  "baseUrl,url",
+-			Usage: "baseUrl of ai",
+-		},
+-		cli.StringSliceFlag{
+-			Name:  "files,fs",
+-			Usage: "files to process, if it is a directory, all .sf files will be processed",
+-		},
+-		cli.IntFlag{
+-			Name:  "concurrency,c",
+-			Usage: "concurrency of AI completion, default is 5",
+-		},
+-		cli.DurationFlag{
+-			Name:  "skip-recent,recent",
+-			Usage: "skip files modified within this duration (e.g., 30m, 1h, 2h30m), default is 0 (no skip)",
+-		},
+-	},
+-	Action: func(c *cli.Context) error {
+-		target := c.String("target")
+-		typ := c.String("ai-type")
+-		key := c.String("api-key")
+-		model := c.String("ai-model")
+-		proxy := c.String("proxy")
+-		concurrency := c.Int("concurrency")
+-		domain := c.String("domain")
+-		baseUrl := c.String("url")
+-		files := c.StringSlice("fs")
+-		skipRecent := c.Duration("skip-recent")
+-		if concurrency == 0 {
+-			concurrency = 5 // default concurrency
+-		}
+-
+-		var aiOpts []aispec.AIConfigOption
+-		if model != "" {
+-			aiOpts = append(aiOpts, aispec.WithModel(model))
+-		}
+-		if domain != "" {
+-			aiOpts = append(aiOpts, aispec.WithDomain(domain))
+-		}
+-		if typ != "" {
+-			aiOpts = append(aiOpts, aispec.WithType(typ))
+-		}
+-		if key != "" {
+-			aiOpts = append(aiOpts, aispec.WithAPIKey(key))
+-		}
+-		if proxy != "" {
+-			aiOpts = append(aiOpts, aispec.WithProxy(proxy))
+-		}
+-		if baseUrl != "" {
+-			aiOpts = append(aiOpts, aispec.WithBaseURL(baseUrl))
+-		}
+-
+-		swg := new(sync.WaitGroup)
+-		errChan := make(chan error, 1)
+-		taskChannel := make(chan string, 1)
+-		var errors error
+-		errorDone := make(chan struct{}, 1)
+-		go func() {
+-			for err := range errChan {
+-				errors = utils.JoinErrors(errors, err)
+-			}
+-			errorDone <- struct{}{}
+-			close(errorDone)
+-		}()
+-		var taskCount atomic.Int64
+-		var processedCount atomic.Int64 // 成功处理的文件数
+-		var skippedCount atomic.Int64   // 跳过的文件数
+-		var errorCount atomic.Int64     // 处理失败的文件数
+-		for i := 0; i < concurrency; i++ {
+-			swg.Add(1)
+-			go func() {
+-				defer swg.Done()
+-				for fileName := range taskChannel {
+-					if !strings.HasSuffix(fileName, ".sf") {
+-						log.Infof("syntaxflow-completion: skipping file %s (not a .sf file)", fileName)
+-						continue
+-					}
+-					raw, err := os.ReadFile(fileName)
+-					if err != nil {
+-						errorCount.Add(1)
+-						log.Errorf("failed to read file %s: %v", fileName, err)
+-						continue
+-					}
+-					rule, err := sfcompletion.CompleteRule(fileName, string(raw), aiOpts...)
+-					if err != nil {
+-						errorCount.Add(1)
+-						err = utils.Errorf("failed parse complete file %s: %v", fileName, err)
+-						errChan <- utils.JoinErrors(err, err)
+-						log.Errorf("%v", err)
+-						continue
+-					}
+-					// check format rule
+-					if _, err := sfvm.CompileRule(rule); err != nil {
+-						errorCount.Add(1)
+-						err = utils.Errorf("failed completion sf rule %s: %v\nsf rule: \n%s", fileName, err, rule)
+-						errChan <- utils.JoinErrors(err, err)
+-						log.Errorf("%v", err)
+-						continue
+-					}
+-					err = os.WriteFile(fileName, []byte(rule), 0o666)
+-					if err != nil {
+-						errorCount.Add(1)
+-						log.Errorf("failed to write file %s: %v", fileName, err)
+-						errChan <- utils.Errorf("failed to write file %s: %v", fileName, err)
+-						continue
+-					}
+-					processedCount.Add(1)
+-					sleepTime := rand.Intn(5)
+-					log.Infof("syntaxflow-completion: completed file %s, sleep for %d seconds", fileName, sleepTime)
+-					time.Sleep(time.Second * time.Duration(sleepTime))
+-				}
+-			}()
+-		}
+-		// 检查文件是否应该被跳过（最近修改过）
+-		shouldSkipFile := func(filePath string) bool {
+-			if skipRecent == 0 {
+-				return false // 如果没有设置跳过时间，不跳过任何文件
+-			}
+-
+-			fileInfo, err := os.Stat(filePath)
+-			if err != nil {
+-				log.Errorf("syntaxflow-completion: failed to get file info for %s: %v", filePath, err)
+-				return false // 如果无法获取文件信息，不跳过
+-			}
+-
+-			modTime := fileInfo.ModTime()
+-			timeSinceModification := time.Since(modTime)
+-
+-			if timeSinceModification < skipRecent {
+-				skippedCount.Add(1)
+-				log.Infof("syntaxflow-completion: skipping file %s (modified %v ago, within %v threshold)",
+-					filePath, timeSinceModification.Round(time.Second), skipRecent)
+-				return true
+-			}
+-
+-			return false
+-		}
+-
+-		addTask := func(target string) {
+-			if utils.IsFile(target) {
+-				if shouldSkipFile(target) {
+-					return
+-				}
+-				log.Infof("syntaxflow-completion: processing file %s", target)
+-				taskChannel <- target
+-				taskCount.Add(1)
+-			} else if utils.IsDir(target) {
+-				log.Infof("syntaxflow-completion: processing directory %s", target)
+-				filesys.Recursive(target, filesys.WithFileSystem(filesys.NewLocalFs()), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+-					if shouldSkipFile(s) {
+-						return nil
+-					}
+-					log.Infof("syntaxflow-completion: processing file %s", s)
+-					taskChannel <- s
+-					taskCount.Add(1)
+-					return nil
+-				}))
+-			} else {
+-				log.Errorf("syntaxflow-completion: file %s not found", target)
+-			}
+-		}
+-
+-		if target != "" {
+-			addTask(target)
+-		}
+-		for _, f := range files {
+-			addTask(f)
+-		}
+-		close(taskChannel)
+-		swg.Wait()
+-		close(errChan)
+-		<-errorDone
+-
+-		// 打印统计报告
+-		totalFiles := processedCount.Load() + skippedCount.Load() + errorCount.Load()
+-		log.Infof("==================== SyntaxFlow Completion Report ====================")
+-		log.Infof("Total files found: %d", totalFiles)
+-		log.Infof("Successfully processed: %d", processedCount.Load())
+-		log.Infof("Skipped (recently modified): %d", skippedCount.Load())
+-		log.Infof("Failed with errors: %d", errorCount.Load())
+-		if skipRecent > 0 {
+-			log.Infof("Skip threshold: files modified within %v", skipRecent)
+-		}
+-		log.Infof("=====================================================================")
+-
+-		return errors
+-	},
+-}
+-
+-var syntaxflowTestCasesCompletion = &cli.Command{
+-	Name:    "syntaxflow-test-cases-completion",
+-	Aliases: []string{"sf-test-cases", "sf-tc"},
+-	Usage:   "SyntaxFlow Rule Test Cases Completion By AI (Both Positive and Negative)",
+-	Flags: []cli.Flag{
+-		cli.StringFlag{
+-			Name:  "ai-type,type",
+-			Usage: "type of AI type",
+-		},
+-		cli.StringFlag{
+-			Name:  "target,t",
+-			Usage: "the file or directory to process, if it is a directory, all .sf files will be processed",
+-		},
+-		cli.StringFlag{
+-			Name:  "api-key,key,k",
+-			Usage: "api key of AI",
+-		},
+-		cli.StringFlag{
+-			Name:  "ai-model,model,m",
+-			Usage: "model of AI",
+-		},
+-		cli.StringFlag{
+-			Name:  "proxy,p",
+-			Usage: "proxy of AI",
+-		},
+-		cli.StringFlag{
+-			Name:  "domain,ai-domain",
+-			Usage: "domain of ai",
+-		},
+-		cli.StringFlag{
+-			Name:  "baseUrl,url",
+-			Usage: "baseUrl of ai",
+-		},
+-		cli.StringSliceFlag{
+-			Name:  "files,fs",
+-			Usage: "files to process, if it is a directory, all .sf files will be processed",
+-		},
+-		cli.IntFlag{
+-			Name:  "concurrency,c",
+-			Usage: "concurrency of AI completion, default is 3",
+-		},
+-	},
+-	Action: func(c *cli.Context) error {
+-		target := c.String("target")
+-		typ := c.String("ai-type")
+-		key := c.String("api-key")
+-		model := c.String("ai-model")
+-		proxy := c.String("proxy")
+-		concurrency := c.Int("concurrency")
+-		domain := c.String("domain")
+-		baseUrl := c.String("url")
+-		files := c.StringSlice("fs")
+-		if concurrency == 0 {
+-			concurrency = 1 // default concurrency, lower than desc completion
+-		}
+-
+-		var aiOpts []aispec.AIConfigOption
+-		if model != "" {
+-			aiOpts = append(aiOpts, aispec.WithModel(model))
+-		}
+-		if domain != "" {
+-			aiOpts = append(aiOpts, aispec.WithDomain(domain))
+-		}
+-		if typ != "" {
+-			aiOpts = append(aiOpts, aispec.WithType(typ))
+-		}
+-		if key != "" {
+-			aiOpts = append(aiOpts, aispec.WithAPIKey(key))
+-		}
+-		if proxy != "" {
+-			aiOpts = append(aiOpts, aispec.WithProxy(proxy))
+-		}
+-		if baseUrl != "" {
+-			aiOpts = append(aiOpts, aispec.WithBaseURL(baseUrl))
+-		}
+-
+-		swg := new(sync.WaitGroup)
+-		errChan := make(chan error, 1)
+-		taskChannel := make(chan string, 1)
+-		var errors error
+-		errorDone := make(chan struct{}, 1)
+-		go func() {
+-			for err := range errChan {
+-				errors = utils.JoinErrors(errors, err)
+-			}
+-			errorDone <- struct{}{}
+-			close(errorDone)
+-		}()
+-		var taskCount atomic.Int64
+-		for i := 0; i < concurrency; i++ {
+-			swg.Add(1)
+-			go func() {
+-				defer swg.Done()
+-				for fileName := range taskChannel {
+-					if !strings.HasSuffix(fileName, ".sf") {
+-						log.Infof("syntaxflow-test-cases-completion: skipping file %s (not a .sf file)", fileName)
+-						continue
+-					}
+-					raw, err := os.ReadFile(fileName)
+-					if err != nil {
+-						log.Errorf("failed to read file %s: %v", fileName, err)
+-						continue
+-					}
+-					rule, err := sfcompletion.CompleteTestCases(fileName, string(raw), aiOpts...)
+-					if err != nil {
+-						err = utils.Errorf("failed to complete test cases for file %s: %v", fileName, err)
+-						errChan <- err
+-						log.Errorf("%v", err)
+-						continue
+-					}
+-					// check format rule
+-					if _, err := sfvm.CompileRule(rule); err != nil {
+-						err = utils.Errorf("failed to validate completed rule for file %s: %v\nrule content: \n%s", fileName, err, rule)
+-						errChan <- err
+-						log.Errorf("%v", err)
+-						continue
+-					}
+-
+-					err = os.WriteFile(fileName, []byte(rule), 0o666)
+-					if err != nil {
+-						log.Errorf("failed to write file %s: %v", fileName, err)
+-						errChan <- utils.Errorf("failed to write file %s: %v", fileName, err)
+-						continue
+-					}
+-					sleepTime := rand.Intn(3) + 2 // 2-4 seconds sleep
+-					log.Infof("syntaxflow-test-cases-completion: completed file %s, sleep for %d seconds", fileName, sleepTime)
+-					time.Sleep(time.Second * time.Duration(sleepTime))
+-				}
+-			}()
+-		}
+-		addTask := func(target string) {
+-			if utils.IsFile(target) {
+-				log.Infof("syntaxflow-test-cases-completion: processing file %s", target)
+-				taskChannel <- target
+-				taskCount.Add(1)
+-			} else if utils.IsDir(target) {
+-				log.Infof("syntaxflow-test-cases-completion: processing directory %s", target)
+-				filesys.Recursive(target, filesys.WithFileSystem(filesys.NewLocalFs()), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+-					log.Infof("syntaxflow-test-cases-completion: processing file %s", s)
+-					taskChannel <- s
+-					taskCount.Add(1)
+-					return nil
+-				}))
+-			} else {
+-				log.Errorf("syntaxflow-test-cases-completion: file %s not found", target)
+-			}
+-		}
+-
+-		if target != "" {
+-			addTask(target)
+-		}
+-		for _, f := range files {
+-			addTask(f)
+-		}
+-		close(taskChannel)
+-		swg.Wait()
+-		close(errChan)
+-		<-errorDone
+-		return errors
+-	},
+-}
+-
+ var syntaxFlowSave = &cli.Command{
+ 	Name:    "syntaxflow-save",
+ 	Aliases: []string{"save-syntaxflow", "ssf", "sfs"},
+@@ -1670,7 +1284,7 @@ Exports structured report (sarif/irify).`,
+ 			// 普通模式：使用命令行参数的规则过滤
+ 			ruleFilter := &ypb.SyntaxFlowRuleFilter{
+ 				Keyword:           c.String("rule-keyword"),
+-				FilterLibRuleKind: yakit.FilterLibRuleFalse,
++				FilterLibRuleKind: filterLibRuleFalse,
+ 			}
+ 			// Handle rule group filtering
+ 			if groupNames := c.StringSlice("rule-group"); len(groupNames) > 0 {
+@@ -2233,23 +1847,25 @@ Unlike code-scan, this command runs query-style output rather than batch report
+ 	},
+ }
+ 
+-var SSACompilerCommands = []*cli.Command{
++// filterLibRuleFalse mirrors yakit.FilterLibRuleFalse without importing the
++// gRPC/DB facade into the slim SSA CLI.
++const filterLibRuleFalse = "noLib"
++
++var ssacBaseCommands = []*cli.Command{
+ 	// program manage
+ 	ssaRemove,  // remove program from database
+ 	ssaCompile, // compile program
+ 	ssaProgram,
+ 
+ 	// rule manage
+-	syntaxFlowCreate,              // create rule template
+-	syntaxflowFormat,              //  format syntaxflow rule
+-	syntaxflowCompletion,          // complete syntaxflow rule with AI
+-	syntaxflowTestCasesCompletion, // complete test cases with AI
+-	syntaxFlowSave,                // save rule to database
+-	syntaxFlowEvaluate,            // evaluate rule quality
+-	syntaxFlowExport,              // export rule to file
+-	syntaxFlowImport,              // import rule from file
+-	syncRule,                      // sync rule from embed to database
+-	verifyBuiltinRisk,             // verify builtin rule risk types from local files
++	syntaxFlowCreate,   // create rule template
++	syntaxflowFormat,   //  format syntaxflow rule
++	syntaxFlowSave,     // save rule to database
++	syntaxFlowEvaluate, // evaluate rule quality
++	syntaxFlowExport,   // export rule to file
++	syntaxFlowImport,   // import rule from file
++	syncRule,           // sync rule from embed to database
++	verifyBuiltinRisk,  // verify builtin rule risk types from local files
+ 	// risk manage
+ 	ssaRisk, // export risk report
+ 
+@@ -2260,6 +1876,15 @@ var SSACompilerCommands = []*cli.Command{
+ 	ssaCodeScan, // compile and scan and export report (CLI args or config file)
+ }
+ 
++// SSACompilerCommands is the full SSA CLI command set. AI-dependent commands
++// are appended by ssacli_ai.go in the default build; the ssa_only profile
++// leaves extraSSACommands empty so the slim binary never imports the AI tree.
++var SSACompilerCommands = append([]*cli.Command{}, ssacBaseCommands...)
++
++func init() {
++	SSACompilerCommands = append(SSACompilerCommands, extraSSACommands...)
++}
++
+ // SyntaxFlowQuery 函数用于执行语法流查询
+ func SyntaxFlowQuery(
+ 	programName string, // 程序名称
+diff --git a/common/yak/cmd/ssacmds/ssacli_ai.go b/common/yak/cmd/ssacmds/ssacli_ai.go
+new file mode 100644
+index 0000000..c7dddc5
+--- /dev/null
++++ b/common/yak/cmd/ssacmds/ssacli_ai.go
+@@ -0,0 +1,406 @@
++//go:build !irify_exclude && !ssa_only
++
++package ssacmds
++
++import (
++	"io/fs"
++	"math/rand"
++	"os"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/yaklang/yaklang/common/ai/aispec"
++	"github.com/yaklang/yaklang/common/log"
++	"github.com/yaklang/yaklang/common/syntaxflow/sfcompletion"
++	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
++	cli "github.com/yaklang/yaklang/common/urfavecli"
++	"github.com/yaklang/yaklang/common/utils"
++	"github.com/yaklang/yaklang/common/utils/filesys"
++)
++
++var extraSSACommands = []*cli.Command{
++	syntaxflowCompletion,
++	syntaxflowTestCasesCompletion,
++}
++
++var syntaxflowCompletion = &cli.Command{
++	Name:    "syntaxflowCompletion",
++	Aliases: []string{"sf-complete", "sf-completions"},
++	Usage:   "SyntaxFlow Rule Description Completion By AI",
++	Flags: []cli.Flag{
++		cli.StringFlag{
++			Name:  "ai-type,type",
++			Usage: "type of AI type",
++		},
++		cli.StringFlag{
++			Name:  "target,t",
++			Usage: "the file or directory to process, if it is a directory, all .sf files will be processed",
++		},
++		cli.StringFlag{
++			Name:  "api-key,key,k",
++			Usage: "api key of AI",
++		},
++		cli.StringFlag{
++			Name:  "ai-model,model,m",
++			Usage: "model of AI",
++		},
++		cli.StringFlag{
++			Name:  "proxy,p",
++			Usage: "proxy of AI",
++		},
++		cli.StringFlag{
++			Name:  "domain,ai-domain",
++			Usage: "domain of ai",
++		},
++		cli.StringFlag{
++			Name:  "baseUrl,url",
++			Usage: "baseUrl of ai",
++		},
++		cli.StringSliceFlag{
++			Name:  "files,fs",
++			Usage: "files to process, if it is a directory, all .sf files will be processed",
++		},
++		cli.IntFlag{
++			Name:  "concurrency,c",
++			Usage: "concurrency of AI completion, default is 5",
++		},
++		cli.DurationFlag{
++			Name:  "skip-recent,recent",
++			Usage: "skip files modified within this duration (e.g., 30m, 1h, 2h30m), default is 0 (no skip)",
++		},
++	},
++	Action: func(c *cli.Context) error {
++		target := c.String("target")
++		typ := c.String("ai-type")
++		key := c.String("api-key")
++		model := c.String("ai-model")
++		proxy := c.String("proxy")
++		concurrency := c.Int("concurrency")
++		domain := c.String("domain")
++		baseUrl := c.String("url")
++		files := c.StringSlice("fs")
++		skipRecent := c.Duration("skip-recent")
++		if concurrency == 0 {
++			concurrency = 5 // default concurrency
++		}
++
++		var aiOpts []aispec.AIConfigOption
++		if model != "" {
++			aiOpts = append(aiOpts, aispec.WithModel(model))
++		}
++		if domain != "" {
++			aiOpts = append(aiOpts, aispec.WithDomain(domain))
++		}
++		if typ != "" {
++			aiOpts = append(aiOpts, aispec.WithType(typ))
++		}
++		if key != "" {
++			aiOpts = append(aiOpts, aispec.WithAPIKey(key))
++		}
++		if proxy != "" {
++			aiOpts = append(aiOpts, aispec.WithProxy(proxy))
++		}
++		if baseUrl != "" {
++			aiOpts = append(aiOpts, aispec.WithBaseURL(baseUrl))
++		}
++
++		swg := new(sync.WaitGroup)
++		errChan := make(chan error, 1)
++		taskChannel := make(chan string, 1)
++		var errors error
++		errorDone := make(chan struct{}, 1)
++		go func() {
++			for err := range errChan {
++				errors = utils.JoinErrors(errors, err)
++			}
++			errorDone <- struct{}{}
++			close(errorDone)
++		}()
++		var taskCount atomic.Int64
++		var processedCount atomic.Int64 // 成功处理的文件数
++		var skippedCount atomic.Int64   // 跳过的文件数
++		var errorCount atomic.Int64     // 处理失败的文件数
++		for i := 0; i < concurrency; i++ {
++			swg.Add(1)
++			go func() {
++				defer swg.Done()
++				for fileName := range taskChannel {
++					if !strings.HasSuffix(fileName, ".sf") {
++						log.Infof("syntaxflow-completion: skipping file %s (not a .sf file)", fileName)
++						continue
++					}
++					raw, err := os.ReadFile(fileName)
++					if err != nil {
++						errorCount.Add(1)
++						log.Errorf("failed to read file %s: %v", fileName, err)
++						continue
++					}
++					rule, err := sfcompletion.CompleteRule(fileName, string(raw), aiOpts...)
++					if err != nil {
++						errorCount.Add(1)
++						err = utils.Errorf("failed parse complete file %s: %v", fileName, err)
++						errChan <- utils.JoinErrors(err, err)
++						log.Errorf("%v", err)
++						continue
++					}
++					// check format rule
++					if _, err := sfvm.CompileRule(rule); err != nil {
++						errorCount.Add(1)
++						err = utils.Errorf("failed completion sf rule %s: %v\nsf rule: \n%s", fileName, err, rule)
++						errChan <- utils.JoinErrors(err, err)
++						log.Errorf("%v", err)
++						continue
++					}
++					err = os.WriteFile(fileName, []byte(rule), 0o666)
++					if err != nil {
++						errorCount.Add(1)
++						log.Errorf("failed to write file %s: %v", fileName, err)
++						errChan <- utils.Errorf("failed to write file %s: %v", fileName, err)
++						continue
++					}
++					processedCount.Add(1)
++					sleepTime := rand.Intn(5)
++					log.Infof("syntaxflow-completion: completed file %s, sleep for %d seconds", fileName, sleepTime)
++					time.Sleep(time.Second * time.Duration(sleepTime))
++				}
++			}()
++		}
++		// 检查文件是否应该被跳过（最近修改过）
++		shouldSkipFile := func(filePath string) bool {
++			if skipRecent == 0 {
++				return false // 如果没有设置跳过时间，不跳过任何文件
++			}
++
++			fileInfo, err := os.Stat(filePath)
++			if err != nil {
++				log.Errorf("syntaxflow-completion: failed to get file info for %s: %v", filePath, err)
++				return false // 如果无法获取文件信息，不跳过
++			}
++
++			modTime := fileInfo.ModTime()
++			timeSinceModification := time.Since(modTime)
++
++			if timeSinceModification < skipRecent {
++				skippedCount.Add(1)
++				log.Infof("syntaxflow-completion: skipping file %s (modified %v ago, within %v threshold)",
++					filePath, timeSinceModification.Round(time.Second), skipRecent)
++				return true
++			}
++
++			return false
++		}
++
++		addTask := func(target string) {
++			if utils.IsFile(target) {
++				if shouldSkipFile(target) {
++					return
++				}
++				log.Infof("syntaxflow-completion: processing file %s", target)
++				taskChannel <- target
++				taskCount.Add(1)
++			} else if utils.IsDir(target) {
++				log.Infof("syntaxflow-completion: processing directory %s", target)
++				filesys.Recursive(target, filesys.WithFileSystem(filesys.NewLocalFs()), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
++					if shouldSkipFile(s) {
++						return nil
++					}
++					log.Infof("syntaxflow-completion: processing file %s", s)
++					taskChannel <- s
++					taskCount.Add(1)
++					return nil
++				}))
++			} else {
++				log.Errorf("syntaxflow-completion: file %s not found", target)
++			}
++		}
++
++		if target != "" {
++			addTask(target)
++		}
++		for _, f := range files {
++			addTask(f)
++		}
++		close(taskChannel)
++		swg.Wait()
++		close(errChan)
++		<-errorDone
++
++		// 打印统计报告
++		totalFiles := processedCount.Load() + skippedCount.Load() + errorCount.Load()
++		log.Infof("==================== SyntaxFlow Completion Report ====================")
++		log.Infof("Total files found: %d", totalFiles)
++		log.Infof("Successfully processed: %d", processedCount.Load())
++		log.Infof("Skipped (recently modified): %d", skippedCount.Load())
++		log.Infof("Failed with errors: %d", errorCount.Load())
++		if skipRecent > 0 {
++			log.Infof("Skip threshold: files modified within %v", skipRecent)
++		}
++		log.Infof("=====================================================================")
++
++		return errors
++	},
++}
++
++var syntaxflowTestCasesCompletion = &cli.Command{
++	Name:    "syntaxflow-test-cases-completion",
++	Aliases: []string{"sf-test-cases", "sf-tc"},
++	Usage:   "SyntaxFlow Rule Test Cases Completion By AI (Both Positive and Negative)",
++	Flags: []cli.Flag{
++		cli.StringFlag{
++			Name:  "ai-type,type",
++			Usage: "type of AI type",
++		},
++		cli.StringFlag{
++			Name:  "target,t",
++			Usage: "the file or directory to process, if it is a directory, all .sf files will be processed",
++		},
++		cli.StringFlag{
++			Name:  "api-key,key,k",
++			Usage: "api key of AI",
++		},
++		cli.StringFlag{
++			Name:  "ai-model,model,m",
++			Usage: "model of AI",
++		},
++		cli.StringFlag{
++			Name:  "proxy,p",
++			Usage: "proxy of AI",
++		},
++		cli.StringFlag{
++			Name:  "domain,ai-domain",
++			Usage: "domain of ai",
++		},
++		cli.StringFlag{
++			Name:  "baseUrl,url",
++			Usage: "baseUrl of ai",
++		},
++		cli.StringSliceFlag{
++			Name:  "files,fs",
++			Usage: "files to process, if it is a directory, all .sf files will be processed",
++		},
++		cli.IntFlag{
++			Name:  "concurrency,c",
++			Usage: "concurrency of AI completion, default is 3",
++		},
++	},
++	Action: func(c *cli.Context) error {
++		target := c.String("target")
++		typ := c.String("ai-type")
++		key := c.String("api-key")
++		model := c.String("ai-model")
++		proxy := c.String("proxy")
++		concurrency := c.Int("concurrency")
++		domain := c.String("domain")
++		baseUrl := c.String("url")
++		files := c.StringSlice("fs")
++		if concurrency == 0 {
++			concurrency = 1 // default concurrency, lower than desc completion
++		}
++
++		var aiOpts []aispec.AIConfigOption
++		if model != "" {
++			aiOpts = append(aiOpts, aispec.WithModel(model))
++		}
++		if domain != "" {
++			aiOpts = append(aiOpts, aispec.WithDomain(domain))
++		}
++		if typ != "" {
++			aiOpts = append(aiOpts, aispec.WithType(typ))
++		}
++		if key != "" {
++			aiOpts = append(aiOpts, aispec.WithAPIKey(key))
++		}
++		if proxy != "" {
++			aiOpts = append(aiOpts, aispec.WithProxy(proxy))
++		}
++		if baseUrl != "" {
++			aiOpts = append(aiOpts, aispec.WithBaseURL(baseUrl))
++		}
++
++		swg := new(sync.WaitGroup)
++		errChan := make(chan error, 1)
++		taskChannel := make(chan string, 1)
++		var errors error
++		errorDone := make(chan struct{}, 1)
++		go func() {
++			for err := range errChan {
++				errors = utils.JoinErrors(errors, err)
++			}
++			errorDone <- struct{}{}
++			close(errorDone)
++		}()
++		var taskCount atomic.Int64
++		for i := 0; i < concurrency; i++ {
++			swg.Add(1)
++			go func() {
++				defer swg.Done()
++				for fileName := range taskChannel {
++					if !strings.HasSuffix(fileName, ".sf") {
++						log.Infof("syntaxflow-test-cases-completion: skipping file %s (not a .sf file)", fileName)
++						continue
++					}
++					raw, err := os.ReadFile(fileName)
++					if err != nil {
++						log.Errorf("failed to read file %s: %v", fileName, err)
++						continue
++					}
++					rule, err := sfcompletion.CompleteTestCases(fileName, string(raw), aiOpts...)
++					if err != nil {
++						err = utils.Errorf("failed to complete test cases for file %s: %v", fileName, err)
++						errChan <- err
++						log.Errorf("%v", err)
++						continue
++					}
++					// check format rule
++					if _, err := sfvm.CompileRule(rule); err != nil {
++						err = utils.Errorf("failed to validate completed rule for file %s: %v\nrule content: \n%s", fileName, err, rule)
++						errChan <- err
++						log.Errorf("%v", err)
++						continue
++					}
++
++					err = os.WriteFile(fileName, []byte(rule), 0o666)
++					if err != nil {
++						log.Errorf("failed to write file %s: %v", fileName, err)
++						errChan <- utils.Errorf("failed to write file %s: %v", fileName, err)
++						continue
++					}
++					sleepTime := rand.Intn(3) + 2 // 2-4 seconds sleep
++					log.Infof("syntaxflow-test-cases-completion: completed file %s, sleep for %d seconds", fileName, sleepTime)
++					time.Sleep(time.Second * time.Duration(sleepTime))
++				}
++			}()
++		}
++		addTask := func(target string) {
++			if utils.IsFile(target) {
++				log.Infof("syntaxflow-test-cases-completion: processing file %s", target)
++				taskChannel <- target
++				taskCount.Add(1)
++			} else if utils.IsDir(target) {
++				log.Infof("syntaxflow-test-cases-completion: processing directory %s", target)
++				filesys.Recursive(target, filesys.WithFileSystem(filesys.NewLocalFs()), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
++					log.Infof("syntaxflow-test-cases-completion: processing file %s", s)
++					taskChannel <- s
++					taskCount.Add(1)
++					return nil
++				}))
++			} else {
++				log.Errorf("syntaxflow-test-cases-completion: file %s not found", target)
++			}
++		}
++
++		if target != "" {
++			addTask(target)
++		}
++		for _, f := range files {
++			addTask(f)
++		}
++		close(taskChannel)
++		swg.Wait()
++		close(errChan)
++		<-errorDone
++		return errors
++	},
++}
+diff --git a/common/yak/cmd/ssacmds/ssacli_slim.go b/common/yak/cmd/ssacmds/ssacli_slim.go
+new file mode 100644
+index 0000000..f9465e8
+--- /dev/null
++++ b/common/yak/cmd/ssacmds/ssacli_slim.go
+@@ -0,0 +1,12 @@
++//go:build !irify_exclude && ssa_only
++
++package ssacmds
++
++import cli "github.com/yaklang/yaklang/common/urfavecli"
++
++// extraSSACommands is empty in the ssa_only profile: the AI completion
++// commands are deliberately not linked into the slim engine.
++var extraSSACommands []*cli.Command
++
++// SSASlimCommands is the non-AI SSA CLI surface used by cmd/yak-ssa.
++var SSASlimCommands = append([]*cli.Command{}, ssacBaseCommands...)
+diff --git a/common/yak/java/java2ssa/builder_pom_grpc.go b/common/yak/java/java2ssa/builder_pom_grpc.go
+new file mode 100644
+index 0000000..f90867e
+--- /dev/null
++++ b/common/yak/java/java2ssa/builder_pom_grpc.go
+@@ -0,0 +1,29 @@
++//go:build !ssa_only
++
++package java2ssa
++
++import (
++	"strings"
++
++	"github.com/yaklang/yaklang/common/log"
++	"github.com/yaklang/yaklang/common/sca"
++	"github.com/yaklang/yaklang/common/utils/filesys"
++	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
++	"github.com/yaklang/yaklang/common/utils/memedit"
++	"github.com/yaklang/yaklang/common/yak/ssa"
++)
++
++func handlePomDependencies(prog *ssa.Program, fb *ssa.FunctionBuilder, filename string, editor *memedit.MemEditor, fileSystem fi.FileSystem) {
++	if strings.TrimLeft(filename, string(fileSystem.GetSeparators())) != "pom.xml" {
++		return
++	}
++	fb.SetEditor(editor)
++	vfs := filesys.NewVirtualFs()
++	vfs.AddFile(filename, editor.GetSourceCode())
++	pkgs, err := sca.ScanFilesystem(vfs)
++	if err != nil {
++		log.Warnf("scan pom.xml error: %v", err)
++	}
++	prog.AppendSCAPackages(pkgs...)
++	fb.GenerateDependence(pkgs, filename)
++}
+diff --git a/common/yak/java/java2ssa/builder_pom_slim.go b/common/yak/java/java2ssa/builder_pom_slim.go
+new file mode 100644
+index 0000000..09a5364
+--- /dev/null
++++ b/common/yak/java/java2ssa/builder_pom_slim.go
+@@ -0,0 +1,14 @@
++//go:build ssa_only
++
++package java2ssa
++
++import (
++	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
++	"github.com/yaklang/yaklang/common/utils/memedit"
++	"github.com/yaklang/yaklang/common/yak/ssa"
++)
++
++// handlePomDependencies is a no-op in the slim engine: SCA dependency
++// extraction is an optional add-on, not part of SSA compilation.
++func handlePomDependencies(prog *ssa.Program, fb *ssa.FunctionBuilder, filename string, editor *memedit.MemEditor, fileSystem fi.FileSystem) {
++}
+diff --git a/common/yak/java/java2ssa/builder_prehandler.go b/common/yak/java/java2ssa/builder_prehandler.go
+index 2ecda66..90ff306 100644
+--- a/common/yak/java/java2ssa/builder_prehandler.go
++++ b/common/yak/java/java2ssa/builder_prehandler.go
+@@ -9,8 +9,6 @@ import (
+ 	tl "github.com/yaklang/yaklang/common/yak/templateLanguage"
+ 
+ 	"github.com/yaklang/yaklang/common/log"
+-	"github.com/yaklang/yaklang/common/sca"
+-	"github.com/yaklang/yaklang/common/utils/filesys"
+ 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+ 	"github.com/yaklang/yaklang/common/yak/ssa"
+ )
+@@ -28,18 +26,7 @@ func (s *SSABuilder) PreHandlerProject(fileSystem fi.FileSystem, ast ssa.FrontAS
+ 		return nil
+ 	}
+ 	filename := editor.GetFilename()
+-	// pom.xml
+-	if strings.TrimLeft(filename, string(fileSystem.GetSeparators())) == "pom.xml" {
+-		fb.SetEditor(editor)
+-		vfs := filesys.NewVirtualFs()
+-		vfs.AddFile(filename, editor.GetSourceCode())
+-		pkgs, err := sca.ScanFilesystem(vfs)
+-		if err != nil {
+-			log.Warnf("scan pom.xml error: %v", err)
+-		}
+-		prog.AppendSCAPackages(pkgs...)
+-		fb.GenerateDependence(pkgs, filename)
+-	}
++	handlePomDependencies(prog, fb, filename, editor, fileSystem)
+ 
+ 	saveExtraFile := func(path string) {
+ 		prog.SetExtraFile(path, editor.GetIrSourceHash())
+diff --git a/common/yak/php/php2ssa/builder.go b/common/yak/php/php2ssa/builder.go
+index 433ff3f..dceb716 100644
+--- a/common/yak/php/php2ssa/builder.go
++++ b/common/yak/php/php2ssa/builder.go
+@@ -6,8 +6,6 @@ import (
+ 	"path/filepath"
+ 
+ 	"github.com/yaklang/antlr/v4"
+-	"github.com/yaklang/yaklang/common/sca"
+-	"github.com/yaklang/yaklang/common/utils/filesys"
+ 	"go.uber.org/atomic"
+ 
+ 	"github.com/yaklang/yaklang/common/log"
+@@ -90,15 +88,7 @@ func (s *SSABuilder) PreHandlerProject(fileSystem fi.FileSystem, ast ssa.FrontAS
+ 	}
+ 	filename := editor.GetFilename()
+ 	if filepath.Ext(filename) == ".lock" && filename == "composer.lock" {
+-		builder.SetEditor(editor)
+-		vfs := filesys.NewVirtualFs()
+-		vfs.AddFile(filename, editor.GetSourceCode())
+-		pkgs, err := sca.ScanFilesystem(vfs)
+-		if err != nil {
+-			log.Warnf("scan pom.xml error: %v", err)
+-		}
+-		prog.SCAPackages = append(prog.SCAPackages, pkgs...)
+-		builder.GenerateDependence(pkgs, filename)
++		handleComposerDependencies(prog, builder, filename, editor)
+ 	} else {
+ 		prog.Build(ast, editor, builder)
+ 	}
+diff --git a/common/yak/php/php2ssa/builder_composer_grpc.go b/common/yak/php/php2ssa/builder_composer_grpc.go
+new file mode 100644
+index 0000000..8adf265
+--- /dev/null
++++ b/common/yak/php/php2ssa/builder_composer_grpc.go
+@@ -0,0 +1,23 @@
++//go:build !ssa_only
++
++package php2ssa
++
++import (
++	"github.com/yaklang/yaklang/common/log"
++	"github.com/yaklang/yaklang/common/sca"
++	"github.com/yaklang/yaklang/common/utils/filesys"
++	"github.com/yaklang/yaklang/common/utils/memedit"
++	"github.com/yaklang/yaklang/common/yak/ssa"
++)
++
++func handleComposerDependencies(prog *ssa.Program, builder *ssa.FunctionBuilder, filename string, editor *memedit.MemEditor) {
++	builder.SetEditor(editor)
++	vfs := filesys.NewVirtualFs()
++	vfs.AddFile(filename, editor.GetSourceCode())
++	pkgs, err := sca.ScanFilesystem(vfs)
++	if err != nil {
++		log.Warnf("scan composer.lock error: %v", err)
++	}
++	prog.SCAPackages = append(prog.SCAPackages, pkgs...)
++	builder.GenerateDependence(pkgs, filename)
++}
+diff --git a/common/yak/php/php2ssa/builder_composer_slim.go b/common/yak/php/php2ssa/builder_composer_slim.go
+new file mode 100644
+index 0000000..f43982e
+--- /dev/null
++++ b/common/yak/php/php2ssa/builder_composer_slim.go
+@@ -0,0 +1,13 @@
++//go:build ssa_only
++
++package php2ssa
++
++import (
++	"github.com/yaklang/yaklang/common/utils/memedit"
++	"github.com/yaklang/yaklang/common/yak/ssa"
++)
++
++// handleComposerDependencies is a no-op in the slim engine: SCA dependency
++// extraction is optional and not part of SSA compilation.
++func handleComposerDependencies(prog *ssa.Program, builder *ssa.FunctionBuilder, filename string, editor *memedit.MemEditor) {
++}
+diff --git a/common/yak/ssa/extern_instance.go b/common/yak/ssa/extern_instance.go
+index 8d1fab8..73b6cb3 100644
+--- a/common/yak/ssa/extern_instance.go
++++ b/common/yak/ssa/extern_instance.go
+@@ -7,13 +7,55 @@ import (
+ 
+ 	"github.com/samber/lo"
+ 	"github.com/yaklang/yaklang/common/utils"
+-	"github.com/yaklang/yaklang/common/yak/yakdoc"
+ )
+ 
+ const (
+ 	MAXTYPELEVEL = 15
+ )
+ 
++// getTypeNameWithPkgPath is kept in the SSA core so it does not need to import
++// the higher-level yakdoc package just for a reflect type-name format.
++func getTypeNameWithPkgPath(typ reflect.Type) (pkgPath string, pkgPathName string) {
++	rawName := typ.Name()
++	if rawName == "" {
++		rawName = typ.String()
++	}
++
++	typKind := typ.Kind()
++	pkgPath = typ.PkgPath()
++
++	if pkgPath == "" {
++		innerTyp := typ
++		if typKind == reflect.Slice || typKind == reflect.Array || typKind == reflect.Chan {
++			innerTyp = typ.Elem()
++			typKind = innerTyp.Kind()
++		}
++		if typKind == reflect.Ptr {
++			innerTyp = innerTyp.Elem()
++		}
++		pkgPath = innerTyp.PkgPath()
++	}
++
++	if strings.HasPrefix(rawName, "*") {
++		rawName = rawName[1:]
++	}
++
++	if pkgPath != "" {
++		if strings.Contains(rawName, ".") {
++			fixedPkgPath := pkgPath
++			index := strings.LastIndex(fixedPkgPath, "/")
++			if index == -1 {
++				fixedPkgPath = ""
++			} else {
++				fixedPkgPath = fixedPkgPath[:index+1]
++			}
++			return pkgPath, fmt.Sprintf("%s%s", fixedPkgPath, rawName)
++		}
++		return pkgPath, fmt.Sprintf("%s.%s", pkgPath, rawName)
++	}
++	return pkgPath, rawName
++}
++
+ func (b *FunctionBuilder) WithExternSideEffect(es map[string][]uint) {
+ 	m := make(map[string]func(b *FunctionBuilder, id string, v any) (value Value))
+ 
+@@ -330,7 +372,7 @@ func (prog *Program) handlerType(typ reflect.Type, level int) Type {
+ 		return t
+ 	}
+ 
+-	_, pkgPathName := yakdoc.GetTypeNameWithPkgPath(typ)
++	_, pkgPathName := getTypeNameWithPkgPath(typ)
+ 
+ 	if hijackType, ok := prog.externType[Name]; ok {
+ 		return hijackType
+diff --git a/common/yak/ssa/ssadb/audit_result.go b/common/yak/ssa/ssadb/audit_result.go
+index 2820a32..97b5b3f 100644
+--- a/common/yak/ssa/ssadb/audit_result.go
++++ b/common/yak/ssa/ssadb/audit_result.go
+@@ -6,7 +6,6 @@ import (
+ 	"github.com/yaklang/gorm"
+ 	"github.com/yaklang/yaklang/common/schema"
+ 	"github.com/yaklang/yaklang/common/utils/bizhelper"
+-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+ )
+ 
+ const (
+@@ -132,25 +131,6 @@ func YieldAuditResults(db *gorm.DB, ctx context.Context) chan *AuditResult {
+ 	return bizhelper.YieldModel[*AuditResult](ctx, db)
+ }
+ 
+-func (r *AuditResult) ToGRPCModel() *ypb.SyntaxFlowResult {
+-	res := &ypb.SyntaxFlowResult{
+-		ResultID:    uint64(r.ID),
+-		TaskID:      r.TaskID,
+-		RuleName:    r.RuleName,
+-		Title:       r.RuleTitle,
+-		TitleZh:     r.RuleTitleZh,
+-		Description: r.RuleDesc,
+-		Severity:    r.RuleSeverity,
+-		Purpose:     r.RulePurpose,
+-		ProgramName: r.ProgramName,
+-		Language:    r.Language,
+-		RiskCount:   r.RiskCount,
+-		RuleContent: r.RuleContent,
+-		Kind:        string(r.Kind),
+-	}
+-	return res
+-}
+-
+ func (r *AuditResult) AfterUpdate(tx *gorm.DB) (err error) {
+ 	schema.GetBroadCast_Data().Call(ServerPushType_SyntaxflowResult, map[string]string{
+ 		"task_id": r.TaskID,
+diff --git a/common/yak/ssa/ssadb/audit_result_grpc.go b/common/yak/ssa/ssadb/audit_result_grpc.go
+new file mode 100644
+index 0000000..40c7a14
+--- /dev/null
++++ b/common/yak/ssa/ssadb/audit_result_grpc.go
+@@ -0,0 +1,24 @@
++//go:build !ssa_only
++
++package ssadb
++
++import "github.com/yaklang/yaklang/common/yakgrpc/ypb"
++
++func (r *AuditResult) ToGRPCModel() *ypb.SyntaxFlowResult {
++	res := &ypb.SyntaxFlowResult{
++		ResultID:    uint64(r.ID),
++		TaskID:      r.TaskID,
++		RuleName:    r.RuleName,
++		Title:       r.RuleTitle,
++		TitleZh:     r.RuleTitleZh,
++		Description: r.RuleDesc,
++		Severity:    r.RuleSeverity,
++		Purpose:     r.RulePurpose,
++		ProgramName: r.ProgramName,
++		Language:    r.Language,
++		RiskCount:   r.RiskCount,
++		RuleContent: r.RuleContent,
++		Kind:        string(r.Kind),
++	}
++	return res
++}
+diff --git a/common/yak/ssa_compile/runner.go b/common/yak/ssa_compile/runner.go
+index e709c1a..da7b60d 100644
+--- a/common/yak/ssa_compile/runner.go
++++ b/common/yak/ssa_compile/runner.go
+@@ -1,3 +1,5 @@
++//go:build !ssa_only
++
+ package ssa_compile
+ 
+ import (
+diff --git a/common/yak/ssa_compile/runner_ssa_only.go b/common/yak/ssa_compile/runner_ssa_only.go
+new file mode 100644
+index 0000000..5d31098
+--- /dev/null
++++ b/common/yak/ssa_compile/runner_ssa_only.go
+@@ -0,0 +1,113 @@
++//go:build ssa_only
++
++package ssa_compile
++
++import (
++	"context"
++	"strings"
++
++	"github.com/yaklang/yaklang/common/utils"
++	"github.com/yaklang/yaklang/common/utils/filesys"
++	"github.com/yaklang/yaklang/common/yak/ssaapi"
++	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
++)
++
++// ParseProjectWithAutoDetective is the slim runner: it compiles the project
++// in-process from an explicit config (or target + language) and deliberately
++// skips the Yak plugin-based auto-detect step, which would pull the script
++// engine and gRPC tree into the SSA engine.
++func ParseProjectWithAutoDetective(ctx context.Context, conf *SSADetectConfig) (*SSADetectResult, error) {
++	if conf == nil {
++		conf = &SSADetectConfig{}
++	}
++
++	info, compileConfig, err := resolveCompileConfig(ctx, conf)
++	if err != nil {
++		return nil, err
++	}
++	if !conf.CompileImmediately {
++		return &SSADetectResult{Info: info}, nil
++	}
++
++	prog, err := compileProject(ctx, compileConfig)
++	if err != nil {
++		return &SSADetectResult{Info: info}, err
++	}
++	return &SSADetectResult{Info: info, Program: prog}, nil
++}
++
++func resolveCompileConfig(ctx context.Context, conf *SSADetectConfig) (*AutoDetectInfo, *ssaconfig.Config, error) {
++	if conf.Config != nil {
++		cfg, err := cloneConfigWithOptions(conf.Config, append(conf.Options, ssaconfig.WithContext(ctx))...)
++		if err != nil {
++			return nil, nil, err
++		}
++		if err := ensureLocalFileSystem(cfg); err != nil {
++			return nil, nil, err
++		}
++		return &AutoDetectInfo{
++			Config:             cfg,
++			CompileImmediately: conf.CompileImmediately,
++		}, cfg, nil
++	}
++
++	if strings.TrimSpace(conf.Target) == "" {
++		return nil, nil, utils.Errorf("target is required when config is empty")
++	}
++
++	opts := []ssaconfig.Option{
++		ssaconfig.WithContext(ctx),
++		ssaconfig.WithCodeSourceKind(ssaconfig.CodeSourceLocal),
++		ssaconfig.WithCodeSourceLocalFile(conf.Target),
++		ssaapi.WithFileSystem(filesys.NewRelLocalFs(conf.Target)),
++	}
++	if language := strings.TrimSpace(conf.Language); language != "" {
++		opts = append(opts, ssaconfig.WithProjectRawLanguage(language))
++	}
++	opts = append(opts, conf.Options...)
++
++	cfg, err := ssaconfig.NewCLIScanConfig(opts...)
++	if err != nil {
++		return nil, nil, err
++	}
++	info := &AutoDetectInfo{
++		Config:             cfg,
++		CompileImmediately: conf.CompileImmediately,
++	}
++	return info, cfg, nil
++}
++
++func cloneConfigWithOptions(base *ssaconfig.Config, options ...ssaconfig.Option) (*ssaconfig.Config, error) {
++	if base == nil {
++		return nil, utils.Errorf("base config is nil")
++	}
++	raw, err := base.ToJSONRaw()
++	if err != nil {
++		return nil, utils.Errorf("marshal config failed: %s", err)
++	}
++	cfg, err := ssaconfig.NewCLIScanConfig(ssaconfig.WithJsonRawConfig(raw))
++	if err != nil {
++		return nil, utils.Errorf("clone config failed: %s", err)
++	}
++	if err := cfg.Update(options...); err != nil {
++		return nil, utils.Errorf("apply config options failed: %s", err)
++	}
++	return cfg, nil
++}
++
++func compileProject(ctx context.Context, config *ssaconfig.Config) (*ssaapi.Program, error) {
++	if config == nil {
++		return nil, utils.Errorf("config is nil")
++	}
++	return CompileWithConfig(ctx, config)
++}
++
++// ensureLocalFileSystem fills the compile FS for a pre-resolved config. The
++// full engine's auto-detect plugin does this implicitly; the slim runner has
++// to make it explicit.
++func ensureLocalFileSystem(cfg *ssaconfig.Config) error {
++	if cfg == nil || strings.TrimSpace(cfg.GetCodeSourceLocalFile()) == "" {
++		return nil
++	}
++	return cfg.Update(ssaapi.WithFileSystem(filesys.NewRelLocalFs(cfg.GetCodeSourceLocalFile())))
++}
+diff --git a/common/yak/ssaapi/sf_result_risk.go b/common/yak/ssaapi/sf_result_risk.go
+index f51dd81..ff098d7 100644
+--- a/common/yak/ssaapi/sf_result_risk.go
++++ b/common/yak/ssaapi/sf_result_risk.go
+@@ -9,13 +9,10 @@ import (
+ 	"github.com/yaklang/yaklang/common/utils"
+ 	"github.com/yaklang/yaklang/common/utils/memedit"
+ 
+-	"github.com/samber/lo"
+ 	"github.com/yaklang/gorm"
+ 	"github.com/yaklang/yaklang/common/schema"
+ 	"github.com/yaklang/yaklang/common/yak/ssa"
+ 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+ )
+ 
+ type CodeRange struct {
+@@ -310,22 +307,14 @@ func (r *SyntaxFlowResult) auditSaver(value *Value, variable string, index int,
+ 	}
+ }
+ 
+-func (r *SyntaxFlowResult) GetGRPCModelRisk() []*ypb.SSARisk {
+-	if r == nil {
+-		return nil
+-	}
+-
+-	// load risk from database
+-	if r.dbResult != nil && len(r.riskMap) != len(r.dbResult.RiskHashs) {
+-		for name := range r.dbResult.RiskHashs {
+-			r.getRisk(name)
+-		}
+-	}
+-	// Binding an audit row changes metadata but not the number of risks.
+-	// Do not cache by map length: it would return stale ids and timestamps.
+-	return lo.MapToSlice(r.riskMap, func(name string, risk *schema.SSARisk) *ypb.SSARisk {
+-		return risk.ToGRPCModel()
+-	})
++// getSSARiskByHash loads one risk row from the SSA database. Keeping the query
++// here avoids importing the yakgrpc/yakit facade into the SSA core.
++func getSSARiskByHash(hash string) (*schema.SSARisk, error) {
++	var r schema.SSARisk
++	if db := ssadb.GetDB().Model(&schema.SSARisk{}).Where("hash = ?", hash).First(&r); db.Error != nil {
++		return nil, utils.Errorf("get Risk failed: %s", db.Error)
++	}
++	return &r, nil
+ }
+ 
+ func (r *SyntaxFlowResult) GetRiskByValue(variable string, i int) *schema.SSARisk {
+@@ -339,7 +328,7 @@ func (r *SyntaxFlowResult) GetRiskByValue(variable string, i int) *schema.SSARis
+ 	// from db
+ 	if r.dbResult != nil {
+ 		if hash, ok := r.dbResult.RiskHashs[name]; ok {
+-			risk, err := yakit.GetSSARiskByHash(ssadb.GetDB(), hash)
++			risk, err := getSSARiskByHash(hash)
+ 			if err != nil {
+ 				log.Errorf("get risk by hash failed: %s", err)
+ 				return nil
+@@ -377,7 +366,7 @@ func (r *SyntaxFlowResult) getRisk(name string) *schema.SSARisk {
+ 	// from db
+ 	if r.dbResult != nil {
+ 		if hash, ok := r.dbResult.RiskHashs[name]; ok {
+-			risk, err := yakit.GetSSARiskByHash(ssadb.GetDB(), hash)
++			risk, err := getSSARiskByHash(hash)
+ 			if err != nil {
+ 				log.Errorf("get risk by hash failed: %s", err)
+ 				return nil
+diff --git a/common/yak/ssaapi/sf_result_risk_grpc.go b/common/yak/ssaapi/sf_result_risk_grpc.go
+new file mode 100644
+index 0000000..beae10c
+--- /dev/null
++++ b/common/yak/ssaapi/sf_result_risk_grpc.go
+@@ -0,0 +1,27 @@
++//go:build !ssa_only
++
++package ssaapi
++
++import (
++	"github.com/samber/lo"
++	"github.com/yaklang/yaklang/common/schema"
++	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
++)
++
++func (r *SyntaxFlowResult) GetGRPCModelRisk() []*ypb.SSARisk {
++	if r == nil {
++		return nil
++	}
++
++	// load risk from database
++	if r.dbResult != nil && len(r.riskMap) != len(r.dbResult.RiskHashs) {
++		for name := range r.dbResult.RiskHashs {
++			r.getRisk(name)
++		}
++	}
++	// Binding an audit row changes metadata but not the number of risks.
++	// Do not cache by map length: it would return stale ids and timestamps.
++	return lo.MapToSlice(r.riskMap, func(name string, risk *schema.SSARisk) *ypb.SSARisk {
++		return risk.ToGRPCModel()
++	})
++}
+diff --git a/common/yak/ssaapi/sf_result_save.go b/common/yak/ssaapi/sf_result_save.go
+index d8fe770..4dd373e 100644
+--- a/common/yak/ssaapi/sf_result_save.go
++++ b/common/yak/ssaapi/sf_result_save.go
+@@ -11,7 +11,6 @@ import (
+ 	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
+ 	"github.com/yaklang/yaklang/common/utils"
+ 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+-	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+ )
+ 
+ func LoadResultByRuleContent(programName, ruleContent string, kind schema.SyntaxflowResultKind) (*SyntaxFlowResult, error) {
+@@ -297,22 +296,3 @@ func (r *SyntaxFlowResult) saveValue(ctx context.Context, result *ssadb.AuditRes
+ 	saveVariable("_", r.GetUnNameValues())
+ 	return err
+ }
+-
+-func (r *SyntaxFlowResult) GetGRPCModelResult() *ypb.SyntaxFlowResult {
+-	if r == nil {
+-		return nil
+-	}
+-	var ret *ypb.SyntaxFlowResult
+-	if r.dbResult != nil {
+-		ret = r.dbResult.ToGRPCModel()
+-	}
+-	if r.memResult != nil {
+-		ret = r.memResult.ToGRPCModel()
+-	}
+-	if ret != nil {
+-		ret.ResultID = uint64(r.id)
+-		ret.TaskID = r.TaskID
+-		ret.SaveKind = string(r.GetResultSaveKind())
+-	}
+-	return ret
+-}
+diff --git a/common/yak/ssaapi/sf_result_save_grpc.go b/common/yak/ssaapi/sf_result_save_grpc.go
+new file mode 100644
+index 0000000..c556ca0
+--- /dev/null
++++ b/common/yak/ssaapi/sf_result_save_grpc.go
+@@ -0,0 +1,24 @@
++//go:build !ssa_only
++
++package ssaapi
++
++import "github.com/yaklang/yaklang/common/yakgrpc/ypb"
++
++func (r *SyntaxFlowResult) GetGRPCModelResult() *ypb.SyntaxFlowResult {
++	if r == nil {
++		return nil
++	}
++	var ret *ypb.SyntaxFlowResult
++	if r.dbResult != nil {
++		ret = r.dbResult.ToGRPCModel()
++	}
++	if r.memResult != nil {
++		ret = r.memResult.ToGRPCModel()
++	}
++	if ret != nil {
++		ret.ResultID = uint64(r.id)
++		ret.TaskID = r.TaskID
++		ret.SaveKind = string(r.GetResultSaveKind())
++	}
++	return ret
++}
+diff --git a/common/yak/ssaapi/sfreport/convert_json.go b/common/yak/ssaapi/sfreport/convert_json.go
+index 334ee78..a264d67 100644
+--- a/common/yak/ssaapi/sfreport/convert_json.go
++++ b/common/yak/ssaapi/sfreport/convert_json.go
+@@ -15,7 +15,6 @@ import (
+ 	"github.com/yaklang/yaklang/common/utils"
+ 	"github.com/yaklang/yaklang/common/utils/memedit"
+ 	"github.com/yaklang/yaklang/common/yak/ssaapi"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ 
+ 	"io"
+ )
+@@ -71,7 +70,7 @@ func (r *Report) snapshotJSON() ([]byte, error) {
+ func (r *Report) SaveForIRify() error {
+ 	ssaReport := r.ToSSAProjectReport()
+ 	// 创建yakit报告实例
+-	reportInstance := yakit.NewReport()
++	reportInstance := &schema.Report{}
+ 	reportInstance.From("ssa-scan")
+ 	reportInstance.Title(fmt.Sprintf("%s-%s", ssaReport.ProgramName, uuid.NewString()))
+ 
+@@ -548,7 +547,7 @@ func GenerateSSAReportMarkdownForTask(taskID, reportName string) (int, string, e
+ 	if err != nil {
+ 		return 0, "", utils.Wrapf(err, "generate ssa project report failed")
+ 	}
+-	reportInstance := yakit.NewReport()
++	reportInstance := &schema.Report{}
+ 	reportInstance.From("ssa-scan")
+ 	reportInstance.Title(strings.TrimSpace(reportName))
+ 	if err := GenerateYakitReportContent(reportInstance, ssaReport); err != nil {
+diff --git a/common/yak/ssaapi/sfreport/risk.go b/common/yak/ssaapi/sfreport/risk.go
+index e18fbf3..76d9e24 100644
+--- a/common/yak/ssaapi/sfreport/risk.go
++++ b/common/yak/ssaapi/sfreport/risk.go
+@@ -8,7 +8,6 @@ import (
+ 	"github.com/yaklang/yaklang/common/schema"
+ 	"github.com/yaklang/yaklang/common/utils"
+ 	"github.com/yaklang/yaklang/common/yak/ssaapi"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ )
+ 
+ type Risk struct {
+@@ -143,8 +142,10 @@ func (r *Risk) SaveToDB(db *gorm.DB) (string, error) {
+ 
+ 	// CreateSSARisk会在BeforeCreate修正Hash
+ 	// Todo:Hash是否应该被修正呢？因为Risk计算hash有ResultID，但是导出后ResultId就没有了
+-	err := yakit.CreateSSARisk(db, ssaRisk)
+-	if err != nil {
++	if ssaRisk.TitleVerbose == "" {
++		ssaRisk.TitleVerbose = ssaRisk.Title
++	}
++	if err := db.Create(ssaRisk).Error; err != nil {
+ 		return "", utils.Wrapf(err, "Save Risk to DB failed")
+ 	}
+ 
+diff --git a/common/yak/ssaapi/sfreport/sf_report.go b/common/yak/ssaapi/sfreport/sf_report.go
+index 579927c..07df9ee 100644
+--- a/common/yak/ssaapi/sfreport/sf_report.go
++++ b/common/yak/ssaapi/sfreport/sf_report.go
+@@ -12,7 +12,6 @@ import (
+ 	"github.com/yaklang/yaklang/common/utils"
+ 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+ 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+ )
+ 
+@@ -1305,7 +1304,7 @@ func getRisks(filter *ypb.SSARisksFilter) ([]*schema.SSARisk, error) {
+ 
+ 	// 直接使用FilterSSARisk进行查询，避免分页限制
+ 	db = db.Model(&schema.SSARisk{})
+-	db = yakit.FilterSSARisk(db, filter)
++	db = filterSSARiskLocal(db, filter)
+ 	// 使用多字段排序确保结果一致性：先按创建时间降序，再按ID升序
+ 	db = db.Order("created_at DESC, id ASC")
+ 
+@@ -1358,7 +1357,7 @@ func processRisksAndStats(report *SSAProjectReport, risks []*schema.SSARisk) err
+ 		disposalComment := ""
+ 
+ 		// 通过 GetSSARiskDisposalsWithInheritance 获取完整的处置记录
+-		disposals, err := yakit.GetSSARiskDisposalsWithInheritance(db, int64(risk.ID))
++		disposals, err := getSSARiskDisposalsWithInheritanceLocal(db, int64(risk.ID))
+ 		if err == nil && len(disposals) > 0 {
+ 			// 取第一个（最新的）处置记录
+ 			latestDisposal := disposals[0]
+diff --git a/common/yak/ssaapi/sfreport/sf_report_filter_grpc.go b/common/yak/ssaapi/sfreport/sf_report_filter_grpc.go
+new file mode 100644
+index 0000000..a49e00b
+--- /dev/null
++++ b/common/yak/ssaapi/sfreport/sf_report_filter_grpc.go
+@@ -0,0 +1,18 @@
++//go:build !ssa_only
++
++package sfreport
++
++import (
++	"github.com/yaklang/gorm"
++	"github.com/yaklang/yaklang/common/schema"
++	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
++	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
++)
++
++func filterSSARiskLocal(db *gorm.DB, filter *ypb.SSARisksFilter) *gorm.DB {
++	return yakit.FilterSSARisk(db, filter)
++}
++
++func getSSARiskDisposalsWithInheritanceLocal(db *gorm.DB, riskID int64) ([]schema.SSARiskDisposals, error) {
++	return yakit.GetSSARiskDisposalsWithInheritance(db, riskID)
++}
+diff --git a/common/yak/ssaapi/sfreport/sf_report_filter_slim.go b/common/yak/ssaapi/sfreport/sf_report_filter_slim.go
+new file mode 100644
+index 0000000..84f64c9
+--- /dev/null
++++ b/common/yak/ssaapi/sfreport/sf_report_filter_slim.go
+@@ -0,0 +1,159 @@
++//go:build ssa_only
++
++package sfreport
++
++import (
++	"time"
++
++	"github.com/yaklang/gorm"
++	sflog "github.com/yaklang/yaklang/common/log"
++	"github.com/yaklang/yaklang/common/schema"
++	"github.com/yaklang/yaklang/common/utils"
++	"github.com/yaklang/yaklang/common/utils/bizhelper"
++	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
++)
++
++// filterSSARiskLocal mirrors yakit.FilterSSARisk so the slim engine keeps the
++// report filters without linking the gRPC/DB facade.
++func filterSSARiskLocal(db *gorm.DB, filter *ypb.SSARisksFilter) *gorm.DB {
++	if filter == nil {
++		return db
++	}
++
++	db = bizhelper.ExactQueryInt64ArrayOr(db, "id", filter.GetID())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "program_name", filter.GetProgramName())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "function_name", filter.GetFunctionName())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "code_source_url", filter.GetCodeSourceUrl())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "risk_type", filter.GetRiskType())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "severity", filter.GetSeverity())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "from_rule", filter.GetFromRule())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "runtime_id", filter.GetRuntimeID())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "hash", filter.GetHash())
++	db = bizhelper.ExactQueryUint64ArrayOr(db, "result_id", filter.GetResultID())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "result_uuid", filter.GetResultUUID())
++	db = bizhelper.FuzzSearchWithStringArrayOrEx(db, []string{"tags"}, filter.GetTags(), false)
++	db = bizhelper.FuzzSearchEx(db, []string{"title", "title_verbose"}, filter.GetTitle(), false)
++	db = bizhelper.FuzzSearchEx(db, []string{
++		"id", "hash",
++		"program_name", "code_source_url", "function_name",
++		"risk_type", "severity", "from_rule", "tags",
++		"title", "title_verbose",
++	}, filter.GetSearch(), false)
++	if filter.GetIsRead() != 0 {
++		db = bizhelper.QueryByBool(db, "is_read", filter.GetIsRead() > 0)
++	}
++	if filter.GetAfterCreatedAt() > 0 {
++		db = bizhelper.QueryByTimeRangeWithTimestamp(db, "created_at", filter.GetAfterCreatedAt(), time.Now().Add(10*time.Minute).Unix())
++	}
++	if filter.GetBeforeCreatedAt() > 0 {
++		db = bizhelper.QueryByTimeRangeWithTimestamp(db, "created_at", 0, filter.GetBeforeCreatedAt())
++	}
++	if disposalStatuses := filter.GetLatestDisposalStatus(); len(disposalStatuses) > 0 {
++		db = bizhelper.ExactOrQueryStringArrayOr(db, "latest_disposal_status", disposalStatuses)
++	}
++	if dr := filter.GetSSARiskDiffRequest(); dr != nil {
++		baselineTaskID := dr.GetBaseLine().GetRiskRuntimeId()
++		compareTaskID := dr.GetCompare().GetRiskRuntimeId()
++		db = filterSSARiskByCompare(db, baselineTaskID, compareTaskID)
++	}
++	if filter.GetIncremental() {
++		runtimeIDs := filter.GetRuntimeID()
++		db = filterSSARiskByIncremental(db, runtimeIDs...)
++	}
++	return db
++}
++
++func filterSSARiskByIncremental(db *gorm.DB, runtimeId ...string) *gorm.DB {
++	riskTable := schema.TableSSARisks
++	disposalTable := schema.TableSSARiskDisposals
++	taskTable := schema.TableSyntaxFlowScanTask
++	if len(runtimeId) == 0 {
++		var disposedFeatureHashes []string
++		err := db.New().Model(&schema.SSARiskDisposals{}).
++			Pluck("DISTINCT risk_feature_hash", &disposedFeatureHashes).Error
++		if err != nil {
++			sflog.Errorf("Failed to query disposed feature hashes: %v", err)
++			return db
++		}
++		db = db.Where("risk_feature_hash NOT IN (?)", disposedFeatureHashes)
++		return db
++	} else if len(runtimeId) == 1 {
++		var baseTask schema.SyntaxFlowScanTask
++		if err := db.New().Where("task_id = ?", runtimeId).First(&baseTask).Error; err != nil {
++			return db
++		}
++		var validFeatureHashes []string
++		subWhere := `
++		NOT EXISTS (
++			SELECT 1
++			FROM ` + disposalTable + `
++			JOIN ` + taskTable + ` base_task ON ` + disposalTable + `.task_id = base_task.task_id
++			WHERE ` + disposalTable + `.risk_feature_hash = ` + riskTable + `.risk_feature_hash
++			  AND base_task.scan_batch <= ?
++		)
++	`
++		err := db.New().
++			Model(&schema.SSARisk{}).
++			Where(riskTable+".runtime_id = ? AND "+riskTable+".risk_feature_hash != ''", runtimeId).
++			Where(subWhere, baseTask.ScanBatch).
++			Pluck("DISTINCT "+riskTable+".risk_feature_hash", &validFeatureHashes).Error
++		if err != nil {
++			sflog.Errorf("Failed to query valid feature hashes: %v", err)
++			return db
++		}
++		return db.Where("risk_feature_hash IN (?)", validFeatureHashes)
++	}
++	return db
++}
++
++func filterSSARiskByCompare(db *gorm.DB, baselineTaskID, compareTaskID string) *gorm.DB {
++	if baselineTaskID == "" || compareTaskID == "" {
++		return db
++	}
++	var compareHash []string
++	db.New().Model(&schema.SSARisk{}).
++		Where("runtime_id = ?", compareTaskID).
++		Where("risk_feature_hash != ''").
++		Pluck("risk_feature_hash", &compareHash)
++	if len(compareHash) > 0 {
++		db = db.Where("risk_feature_hash NOT IN (?)", compareHash)
++	}
++	return db
++}
++
++func getSSARiskDisposalsOnlyLocal(db *gorm.DB, riskID int64) ([]schema.SSARiskDisposals, error) {
++	db = db.Model(&schema.SSARiskDisposals{})
++	var disposals []schema.SSARiskDisposals
++	if err := db.Where("ssa_risk_id = ?", riskID).
++		Order("updated_at DESC").
++		Find(&disposals).Error; err != nil {
++		return nil, utils.Errorf("GetSSARiskDisposalsOnly failed: %v", err)
++	}
++	return disposals, nil
++}
++
++func getSSARiskDisposalsWithInheritanceLocal(db *gorm.DB, riskID int64) ([]schema.SSARiskDisposals, error) {
++	disposalTable := schema.TableSSARiskDisposals
++	taskTable := schema.TableSyntaxFlowScanTask
++	var risk schema.SSARisk
++	if err := db.Where("id = ?", riskID).First(&risk).Error; err != nil {
++		return nil, utils.Errorf("GetSSARiskDisposalsWithInheritance failed to query risk: %v", err)
++	}
++	if risk.RiskFeatureHash == "" {
++		return getSSARiskDisposalsOnlyLocal(db, riskID)
++	}
++	var currentTask schema.SyntaxFlowScanTask
++	if err := db.Where("task_id = ?", risk.RuntimeId).First(&currentTask).Error; err != nil {
++		return getSSARiskDisposalsOnlyLocal(db, riskID)
++	}
++	var disposals []schema.SSARiskDisposals
++	if err := db.Model(&schema.SSARiskDisposals{}).
++		Joins("JOIN "+taskTable+" ON "+disposalTable+".task_id = "+taskTable+".task_id").
++		Where(disposalTable+".risk_feature_hash = ? AND "+taskTable+".scan_batch <= ?",
++			risk.RiskFeatureHash, currentTask.ScanBatch).
++		Order(taskTable + ".scan_batch DESC, " + disposalTable + ".updated_at DESC").
++		Find(&disposals).Error; err != nil {
++		return nil, utils.Errorf("GetSSARiskDisposalsWithInheritance failed: %v", err)
++	}
++	return disposals, nil
++}
+diff --git a/common/yak/ssaapi/ssa_exports.go b/common/yak/ssaapi/ssa_exports.go
+index 4b6271a..ef8f53a 100644
+--- a/common/yak/ssaapi/ssa_exports.go
++++ b/common/yak/ssaapi/ssa_exports.go
+@@ -7,10 +7,10 @@ import (
+ 
+ 	"github.com/yaklang/javajive/classparser"
+ 	"github.com/yaklang/yaklang/common/consts"
++	"github.com/yaklang/yaklang/common/schema"
+ 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+ 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+ 	"github.com/yaklang/yaklang/common/yak/ssaproject"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ 
+ 	"github.com/yaklang/yaklang/common/utils/memedit"
+ 
+@@ -164,21 +164,21 @@ var Exports = map[string]any{
+ 
+ 	"withProjectName": ssaconfig.WithProjectName,
+ 
+-	"withConcurrency":                   WithConcurrency,
+-	"withLanguage":                      WithRawLanguage,
+-	"withConfigInfo":                    ssaconfig.WithCodeSourceMap,
+-	"withExternLib":                     WithExternLib,
+-	"withExternValue":                   WithExternValue,
+-	"withProgramName":                   WithProgramName,
+-	"withSetProgramName":                WithSetProgramName,
+-	"withDescription":                   WithProgramDescription,
+-	"withProcess":                       WithProcess,
+-	"withEntryFile":                     WithFileSystemEntry,
+-	"withReCompile":                     WithReCompile,
+-	"withStrictMode":                    WithStrictMode,
+-	"withContext":                       WithContext,
+-	"withPeepholeSize":                  WithPeepholeSize,
+-	"withExcludeFile":                   WithUserExcludePatterns,
++	"withConcurrency":    WithConcurrency,
++	"withLanguage":       WithRawLanguage,
++	"withConfigInfo":     ssaconfig.WithCodeSourceMap,
++	"withExternLib":      WithExternLib,
++	"withExternValue":    WithExternValue,
++	"withProgramName":    WithProgramName,
++	"withSetProgramName": WithSetProgramName,
++	"withDescription":    WithProgramDescription,
++	"withProcess":        WithProcess,
++	"withEntryFile":      WithFileSystemEntry,
++	"withReCompile":      WithReCompile,
++	"withStrictMode":     WithStrictMode,
++	"withContext":        WithContext,
++	"withPeepholeSize":   WithPeepholeSize,
++	"withExcludeFile":    WithUserExcludePatterns,
+ 	// withDefaultExcludeFunc is deprecated, use withExcludeFile instead.
+ 	// Note the misleading name: it sets USER exclude patterns, not the built-in
+ 	// default excludes (which are controlled by withDisableDefaultCompileExcludes).
+@@ -240,5 +240,23 @@ func getLatestProgramNameByProjectName(projectName string) (string, error) {
+ 		return "", utils.Errorf("project name is empty")
+ 	}
+ 	db := consts.GetGormProfileDatabase()
+-	return yakit.QueryLatestSSAProgramNameByProjectName(db, projectName)
++	if db == nil {
++		return "", utils.Errorf("profile database is not initialized")
++	}
++	var project schema.SSAProject
++	if err := db.Model(&schema.SSAProject{}).Where("project_name = ?", projectName).First(&project).Error; err != nil {
++		return "", utils.Errorf("find project by name %s failed: %s", projectName, err)
++	}
++	var names []string
++	if err := ssadb.GetDB().Model(&ssadb.IrProgram{}).
++		Where("project_id = ?", project.ID).
++		Order("updated_at desc").
++		Limit(1).
++		Pluck("program_name", &names).Error; err != nil {
++		return "", err
++	}
++	if len(names) == 0 {
++		return "", nil
++	}
++	return names[0], nil
+ }
+diff --git a/common/yak/ssaapi/struct_scan_state.go b/common/yak/ssaapi/struct_scan_state.go
+index 959de66..dee0066 100644
+--- a/common/yak/ssaapi/struct_scan_state.go
++++ b/common/yak/ssaapi/struct_scan_state.go
+@@ -16,9 +16,9 @@ import (
+ 	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
+ 	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+ 	"github.com/yaklang/yaklang/common/utils"
++	"github.com/yaklang/yaklang/common/utils/bizhelper"
+ 	"github.com/yaklang/yaklang/common/yak/ssa"
+ 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ )
+ 
+ // structScanState holds compile-unit rule frames, budgets and timing. It is
+@@ -227,11 +227,30 @@ func loadBuiltinStructRules() []*schema.SyntaxFlowRule {
+ 		return nil
+ 	}
+ 	var rules []*schema.SyntaxFlowRule
+-	_ = yakit.ApplySyntaxFlowRuleModeFilter(db.Model(&schema.SyntaxFlowRule{}), []string{string(schema.SFR_MODE_STRUCT)}).
++	_ = applySyntaxFlowRuleModeFilter(db.Model(&schema.SyntaxFlowRule{}), []string{string(schema.SFR_MODE_STRUCT)}).
+ 		Find(&rules).Error
+ 	return rules
+ }
+ 
++// applySyntaxFlowRuleModeFilter restricts rules by persisted execution mode
++// (source | ssa | struct). It mirrors the yakit helper without importing the
++// gRPC/DB facade into the SSA core.
++func applySyntaxFlowRuleModeFilter(db *gorm.DB, modes []string) *gorm.DB {
++	if db == nil || len(modes) == 0 {
++		return db
++	}
++	normalized := make([]string, 0, len(modes))
++	for _, mode := range modes {
++		if trimmed := strings.TrimSpace(mode); trimmed != "" {
++			normalized = append(normalized, string(schema.ValidRuleMode(trimmed)))
++		}
++	}
++	if len(normalized) == 0 {
++		return db
++	}
++	return bizhelper.ExactOrQueryStringArrayOr(db, "mode", normalized)
++}
++
+ func loadStructRulesFromDir(dir string) ([]*schema.SyntaxFlowRule, error) {
+ 	var paths, texts []string
+ 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+diff --git a/common/yak/syntaxflow_scan/manager.go b/common/yak/syntaxflow_scan/manager.go
+index 4c8bb51..3b65da3 100644
+--- a/common/yak/syntaxflow_scan/manager.go
++++ b/common/yak/syntaxflow_scan/manager.go
+@@ -15,7 +15,6 @@ import (
+ 	"github.com/yaklang/yaklang/common/utils/diagnostics"
+ 	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+ 	"github.com/yaklang/yaklang/common/yak/ssaapi"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ 	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+ )
+ 
+@@ -158,7 +157,7 @@ func (m *scanManager) setScanBatch() {
+ 		m.taskRecorder = &schema.SyntaxFlowScanTask{}
+ 	}
+ 
+-	maxBatch, err := yakit.GetMaxScanBatch(ssadb.GetDB(), m.Config.GetProgramNames())
++	maxBatch, err := getMaxScanBatch(ssadb.GetDB(), m.Config.GetProgramNames())
+ 	if err != nil {
+ 		m.taskRecorder.ScanBatch = 1
+ 	} else {
+@@ -218,7 +217,7 @@ func (m *scanManager) captureTaskSnapshot(withLevelCounts bool) *schema.SyntaxFl
+ 	m.taskRecorder.Config, _ = json.Marshal(m.Config)
+ 	m.taskRecorder.ProjectId = m.Config.GetProjectID()
+ 	if withLevelCounts && (m.status == schema.SYNTAXFLOWSCAN_DONE || m.status == schema.SYNTAXFLOWSCAN_PAUSED) {
+-		levelCounts, errLC := yakit.GetSSARiskLevelCount(ssadb.GetDB(), &ypb.SSARisksFilter{
++		levelCounts, errLC := getSSARiskLevelCount(ssadb.GetDB(), &ypb.SSARisksFilter{
+ 			RuntimeID: []string{m.TaskId()},
+ 		})
+ 		if errLC == nil {
+@@ -317,7 +316,7 @@ func (m *scanManager) initByConfig() error {
+ 		}
+ 	} else if config.GetProjectID() != 0 {
+ 		// 前端如果没传programName扫描功能默认选择最新的programName进行扫描
+-		name, err := yakit.QueryLatestSSAProgramNameByProjectId(consts.GetGormSSAProjectDataBase(), config.GetProjectID())
++		name, err := queryLatestSSAProgramNameByProjectId(consts.GetGormSSAProjectDataBase(), config.GetProjectID())
+ 		if err != nil {
+ 			return utils.Errorf("SyntaxFlow Scan Failed: query latest SSA Program Name by Project ID failed: %s", err)
+ 		}
+@@ -361,8 +360,8 @@ func (m *scanManager) initByConfig() error {
+ 
+ 	setRuleChan := func(filter *ypb.SyntaxFlowRuleFilter) error {
+ 		db := consts.GetGormProfileDatabase()
+-		db = yakit.FilterSyntaxFlowRule(db, filter)
+-		db = yakit.ApplySyntaxFlowRuleModeFilter(db, ruleFilterModes(config))
++		db = filterSyntaxFlowRule(db, filter)
++		db = applySyntaxFlowRuleModeFilter(db, ruleFilterModes(config))
+ 		// get all rule name
+ 		var ruleNames []string
+ 		err := db.Pluck("rule_name", &ruleNames).Error
+diff --git a/common/yak/syntaxflow_scan/rule_preparation.go b/common/yak/syntaxflow_scan/rule_preparation.go
+index 0393c1c..0fa42de 100644
+--- a/common/yak/syntaxflow_scan/rule_preparation.go
++++ b/common/yak/syntaxflow_scan/rule_preparation.go
+@@ -7,7 +7,6 @@ import (
+ 	"github.com/yaklang/yaklang/common/schema"
+ 	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+ 	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+-	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+ )
+ 
+ // rulePreparation belongs to one product scan, not to the process/profile DB.
+@@ -48,7 +47,7 @@ func (c *Config) preparedRuleInputs() ([]*schema.SyntaxFlowRule, map[string]*sch
+ 				log.Warnf("compile scan rule input %d: %v", i, errs[i])
+ 				continue
+ 			}
+-			rule, err := yakit.ApplySyntaxFlowRuleInput(input, compiled[i])
++			rule, err := applySyntaxFlowRuleInput(input, compiled[i])
+ 			if err != nil {
+ 				log.Warnf("prepare scan rule input %d: %v", i, err)
+ 				continue
+diff --git a/common/yak/syntaxflow_scan/yakit_compat_grpc.go b/common/yak/syntaxflow_scan/yakit_compat_grpc.go
+new file mode 100644
+index 0000000..c8317f5
+--- /dev/null
++++ b/common/yak/syntaxflow_scan/yakit_compat_grpc.go
+@@ -0,0 +1,47 @@
++//go:build !ssa_only
++
++package syntaxflow_scan
++
++import (
++	"github.com/yaklang/gorm"
++	"github.com/yaklang/yaklang/common/schema"
++	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
++	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
++)
++
++type ssaRiskLevelCount struct {
++	Count    int64  `json:"count"`
++	Severity string `json:"severity"`
++}
++
++func getMaxScanBatch(db *gorm.DB, programs []string) (uint64, error) {
++	return yakit.GetMaxScanBatch(db, programs)
++}
++
++func getSSARiskLevelCount(db *gorm.DB, filter *ypb.SSARisksFilter) ([]*ssaRiskLevelCount, error) {
++	counts, err := yakit.GetSSARiskLevelCount(db, filter)
++	if err != nil {
++		return nil, err
++	}
++	out := make([]*ssaRiskLevelCount, 0, len(counts))
++	for _, count := range counts {
++		out = append(out, &ssaRiskLevelCount{Count: count.Count, Severity: count.Severity})
++	}
++	return out, nil
++}
++
++func queryLatestSSAProgramNameByProjectId(db *gorm.DB, projectID uint64) (string, error) {
++	return yakit.QueryLatestSSAProgramNameByProjectId(db, projectID)
++}
++
++func filterSyntaxFlowRule(db *gorm.DB, filter *ypb.SyntaxFlowRuleFilter) *gorm.DB {
++	return yakit.FilterSyntaxFlowRule(db, filter)
++}
++
++func applySyntaxFlowRuleModeFilter(db *gorm.DB, modes []string) *gorm.DB {
++	return yakit.ApplySyntaxFlowRuleModeFilter(db, modes)
++}
++
++func applySyntaxFlowRuleInput(input *ypb.SyntaxFlowRuleInput, rule *schema.SyntaxFlowRule) (*schema.SyntaxFlowRule, error) {
++	return yakit.ApplySyntaxFlowRuleInput(input, rule)
++}
+diff --git a/common/yak/syntaxflow_scan/yakit_compat_slim.go b/common/yak/syntaxflow_scan/yakit_compat_slim.go
+new file mode 100644
+index 0000000..d7628c2
+--- /dev/null
++++ b/common/yak/syntaxflow_scan/yakit_compat_slim.go
+@@ -0,0 +1,196 @@
++//go:build ssa_only
++
++package syntaxflow_scan
++
++import (
++	"path/filepath"
++	"strings"
++
++	"github.com/yaklang/gorm"
++	"github.com/yaklang/yaklang/common/schema"
++	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
++	"github.com/yaklang/yaklang/common/utils"
++	"github.com/yaklang/yaklang/common/utils/bizhelper"
++	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
++	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
++	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
++)
++
++type ssaRiskLevelCount struct {
++	Count    int64  `json:"count"`
++	Severity string `json:"severity"`
++}
++
++func getMaxScanBatch(db *gorm.DB, programs []string) (uint64, error) {
++	var result struct {
++		MaxBatch uint64 `json:"max_batch"`
++	}
++	programsStr := strings.Join(programs, schema.SYNTAXFLOWSCAN_PROGRAM_SPLIT)
++	err := db.Model(&schema.SyntaxFlowScanTask{}).
++		Where("programs = ?", programsStr).
++		Select("COALESCE(MAX(scan_batch), 0) as max_batch").
++		Scan(&result).Error
++	if err != nil {
++		return 0, err
++	}
++	return result.MaxBatch, nil
++}
++
++func getSSARiskLevelCount(db *gorm.DB, filter *ypb.SSARisksFilter) ([]*ssaRiskLevelCount, error) {
++	query := db.Model(&schema.SSARisk{})
++	if filter != nil {
++		// The scan task count path only filters by runtime id. Keep the slim
++		// helper focused; arbitrary report filters use the sfreport path.
++		query = bizhelper.ExactOrQueryStringArrayOr(query, "runtime_id", filter.GetRuntimeID())
++	}
++	query = query.Select("severity as severity, COUNT(*) as count").Group("severity")
++	var counts []*ssaRiskLevelCount
++	if err := query.Scan(&counts).Error; err != nil {
++		return nil, utils.Errorf("scan failed: %v", err)
++	}
++	return counts, nil
++}
++
++func queryLatestSSAProgramNameByProjectId(db *gorm.DB, projectID uint64) (string, error) {
++	var names []string
++	err := ssadb.GetDB().Model(&ssadb.IrProgram{}).
++		Where("project_id = ?", projectID).
++		Order("updated_at desc").
++		Limit(1).
++		Pluck("program_name", &names).Error
++	if err != nil {
++		return "", err
++	}
++	if len(names) == 0 {
++		return "", nil
++	}
++	return names[0], nil
++}
++
++func filterSyntaxFlowRule(db *gorm.DB, filter *ypb.SyntaxFlowRuleFilter) *gorm.DB {
++	db = db.Model(&schema.SyntaxFlowRule{})
++	if filter == nil {
++		return db
++	}
++	if len(filter.GetGroupNames()) > 0 {
++		db = db.Joins("JOIN syntax_flow_rule_and_group ON syntax_flow_rule_and_group.syntax_flow_rule_id = syntax_flow_rules.id").
++			Joins("JOIN syntax_flow_groups ON syntax_flow_groups.id = syntax_flow_rule_and_group.syntax_flow_group_id").
++			Where("syntax_flow_groups.group_name IN (?)", filter.GetGroupNames()).
++			Group("syntax_flow_rules.id")
++	}
++	db = bizhelper.ExactQueryUInt64ArrayOr(db, "id", filter.GetIds())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "rule_id", filter.GetRuleIds())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "severity", filter.GetSeverity())
++	if len(filter.GetRuleNames()) > 0 {
++		db = bizhelper.ExactOrQueryStringArrayOr(db, "rule_name", filter.GetRuleNames())
++	}
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "language", filter.GetLanguage())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "purpose", filter.GetPurpose())
++	db = bizhelper.ExactOrQueryStringArrayOr(db, "syntax_flow_rules.tag", filter.GetTag())
++	if keyword := strings.TrimSpace(filter.GetKeyword()); keyword != "" {
++		db = bizhelper.FuzzSearchWithStringArrayOrEx(db, []string{
++			"syntax_flow_rules.rule_name",
++			"syntax_flow_rules.title",
++			"syntax_flow_rules.title_zh",
++			"syntax_flow_rules.description",
++			"syntax_flow_rules.content",
++		}, []string{keyword}, false)
++	}
++	if filter.GetAfterId() > 0 {
++		db = db.Where("id > ?", filter.GetAfterId())
++	}
++	if filter.GetBeforeId() > 0 {
++		db = db.Where("id < ?", filter.GetBeforeId())
++	}
++	switch filter.GetFilterRuleKind() {
++	case "buildIn":
++		db = bizhelper.QueryByBool(db, "is_build_in_rule", true)
++	case "unBuildIn":
++		db = bizhelper.QueryByBool(db, "is_build_in_rule", false)
++	}
++	switch filter.GetFilterLibRuleKind() {
++	case "lib":
++		db = bizhelper.QueryByBool(db, "allow_included", true)
++	case "noLib":
++		db = bizhelper.QueryByBool(db, "allow_included", false)
++	}
++	return db
++}
++
++func applySyntaxFlowRuleModeFilter(db *gorm.DB, modes []string) *gorm.DB {
++	if db == nil || len(modes) == 0 {
++		return db
++	}
++	normalized := make([]string, 0, len(modes))
++	for _, mode := range modes {
++		if trimmed := strings.TrimSpace(mode); trimmed != "" {
++			normalized = append(normalized, string(schema.ValidRuleMode(trimmed)))
++		}
++	}
++	if len(normalized) == 0 {
++		return db
++	}
++	return bizhelper.ExactOrQueryStringArrayOr(db, "mode", normalized)
++}
++
++func applySyntaxFlowRuleInput(ruleInput *ypb.SyntaxFlowRuleInput, rule *schema.SyntaxFlowRule) (*schema.SyntaxFlowRule, error) {
++	if ruleInput == nil {
++		return nil, utils.Error("parse syntaxflow rule failed: rule input is nil")
++	}
++	if rule == nil {
++		rule = &schema.SyntaxFlowRule{}
++	}
++
++	if strings.TrimSpace(ruleInput.Language) != "" {
++		language, err := ssaconfig.ValidateLanguage(ruleInput.Language)
++		if err != nil {
++			return nil, err
++		}
++		rule.Language = language
++	} else if rule.Language == "" {
++		if inferred := inferLanguageFromRuleName(ruleInput.RuleName); inferred != "" {
++			rule.Language = inferred
++		} else {
++			rule.Language = ssaconfig.General
++		}
++	}
++	if strings.TrimSpace(ruleInput.RuleName) != "" {
++		rule.RuleName = ruleInput.RuleName
++		if strings.TrimSpace(rule.Title) == "" {
++			rule.Title = ruleInput.RuleName
++		}
++	}
++	if len(ruleInput.Tags) > 0 {
++		rule.Tag = strings.Join(ruleInput.Tags, "|")
++	}
++	if strings.TrimSpace(ruleInput.Description) != "" {
++		rule.Description = ruleInput.Description
++	}
++	if rule.Content == "" {
++		rule.Content = ruleInput.Content
++	}
++	rule.Version = sfdb.UpdateVersion(rule.Version)
++	if rule.AlertDesc == nil {
++		rule.AlertDesc = schema.MapEx[string, *schema.SyntaxFlowDescInfo]{}
++	}
++	for key, message := range ruleInput.AlertMsg {
++		rule.AlertDesc[key] = schema.ToSyntaxFlowAlertDesc(message)
++	}
++	return rule, nil
++}
++
++func inferLanguageFromRuleName(ruleName string) ssaconfig.Language {
++	if strings.TrimSpace(ruleName) == "" {
++		return ""
++	}
++	base := filepath.Base(ruleName)
++	languageRaw, _, ok := strings.Cut(base, "-")
++	if !ok {
++		return ""
++	}
++	language, err := ssaconfig.ValidateLanguage(languageRaw)
++	if err != nil {
++		return ""
++	}
++	return language
++}
+diff --git a/common/yak/typescript/ts2ssa/builder_dependency_grpc.go b/common/yak/typescript/ts2ssa/builder_dependency_grpc.go
+new file mode 100644
+index 0000000..594a43b
+--- /dev/null
++++ b/common/yak/typescript/ts2ssa/builder_dependency_grpc.go
+@@ -0,0 +1,29 @@
++//go:build !ssa_only
++
++package ts2ssa
++
++import (
++	"strings"
++
++	"github.com/yaklang/yaklang/common/log"
++	"github.com/yaklang/yaklang/common/sca"
++	"github.com/yaklang/yaklang/common/utils/filesys"
++	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
++	"github.com/yaklang/yaklang/common/utils/memedit"
++	"github.com/yaklang/yaklang/common/yak/ssa"
++)
++
++func handlePackageDependencies(prog *ssa.Program, fb *ssa.FunctionBuilder, filename string, editor *memedit.MemEditor, fileSystem fi.FileSystem) {
++	if strings.TrimLeft(filename, string(fileSystem.GetSeparators())) != "package.json" {
++		return
++	}
++	fb.SetEditor(editor)
++	vfs := filesys.NewVirtualFs()
++	vfs.AddFile(filename, editor.GetSourceCode())
++	pkgs, err := sca.ScanFilesystem(vfs)
++	if err != nil {
++		log.Warnf("scan package.json error: %v", err)
++	}
++	prog.SCAPackages = append(prog.SCAPackages, pkgs...)
++	fb.GenerateDependence(pkgs, filename)
++}
+diff --git a/common/yak/typescript/ts2ssa/builder_dependency_slim.go b/common/yak/typescript/ts2ssa/builder_dependency_slim.go
+new file mode 100644
+index 0000000..9a05baf
+--- /dev/null
++++ b/common/yak/typescript/ts2ssa/builder_dependency_slim.go
+@@ -0,0 +1,14 @@
++//go:build ssa_only
++
++package ts2ssa
++
++import (
++	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
++	"github.com/yaklang/yaklang/common/utils/memedit"
++	"github.com/yaklang/yaklang/common/yak/ssa"
++)
++
++// handlePackageDependencies is a no-op in the slim engine: SCA dependency
++// extraction is optional and not part of SSA compilation.
++func handlePackageDependencies(prog *ssa.Program, fb *ssa.FunctionBuilder, filename string, editor *memedit.MemEditor, fileSystem fi.FileSystem) {
++}
+diff --git a/common/yak/typescript/ts2ssa/builder_prehandler.go b/common/yak/typescript/ts2ssa/builder_prehandler.go
+index 748e6ef..6004625 100644
+--- a/common/yak/typescript/ts2ssa/builder_prehandler.go
++++ b/common/yak/typescript/ts2ssa/builder_prehandler.go
+@@ -6,8 +6,6 @@ import (
+ 	"strings"
+ 
+ 	"github.com/yaklang/yaklang/common/log"
+-	"github.com/yaklang/yaklang/common/sca"
+-	"github.com/yaklang/yaklang/common/utils/filesys"
+ 	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+ 	"github.com/yaklang/yaklang/common/utils/memedit"
+ 	"github.com/yaklang/yaklang/common/yak/ssa"
+@@ -56,18 +54,7 @@ func (s *SSABuilder) PreHandlerProject(fileSystem fi.FileSystem, ast ssa.FrontAS
+ 	}
+ 
+ 	filename := editor.GetFilename()
+-	// pom.xml
+-	if strings.TrimLeft(filename, string(fileSystem.GetSeparators())) == "package.json" {
+-		fb.SetEditor(editor)
+-		vfs := filesys.NewVirtualFs()
+-		vfs.AddFile(filename, editor.GetSourceCode())
+-		pkgs, err := sca.ScanFilesystem(vfs)
+-		if err != nil {
+-			log.Warnf("scan package.json error: %v", err)
+-		}
+-		prog.SCAPackages = append(prog.SCAPackages, pkgs...)
+-		fb.GenerateDependence(pkgs, filename)
+-	}
++	handlePackageDependencies(prog, fb, filename, editor, fileSystem)
+ 
+ 	saveExtraFile := func(path string) {
+ 		if prog.GetProgramName() == "" {
+diff --git a/common/yakgrpc/ypb/yakgrpc_grpc.pb.go b/common/yakgrpc/ypb/yakgrpc_grpc.pb.go
+index 2b51cf9..7f45f85 100644
+--- a/common/yakgrpc/ypb/yakgrpc_grpc.pb.go
++++ b/common/yakgrpc/ypb/yakgrpc_grpc.pb.go
+@@ -4,6 +4,8 @@
+ // - protoc             v5.29.4
+ // source: yakgrpc.proto
+ 
++//go:build !ssa_only
++
+ package ypb
+ 
+ import (
+-- 
+2.45.1.windows.1
+

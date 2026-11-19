@@ -1,0 +1,156 @@
+From a73dee1fad34592fe900f610b3264e60699db497 Mon Sep 17 00:00:00 2001
+From: Eviden0 <Eviden0@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:25:44 +0800
+Subject: [PATCH 1/3] fix(ssa): overlay query, include lib sub-query, and SARIF
+ export bugs
+
+Three defects found while validating incremental (overlay) scanning in CI:
+
+1. sfreport: report snapshot publish falls back to writing through the
+   already-open handle when the atomic rename fails (Windows: os.Rename
+   over a file the CLI itself holds open fails with Access is denied;
+   the CLI truncated the target first, so every report was silently
+   emptied).
+
+2. ssa-query: two fixes in the --sf/--sarif path:
+   - the second sarifCallback assignment shadowed the collecting one, so
+     --sf <dir> --sarif never appended results and exported nothing;
+   - query-mode results carry alert values only; call CreateRisk before
+     conversion so YieldRisk yields the built risks.
+
+3. ssaapi: <include> lib sub-queries were bound to the overlay's TOP
+   (diff) program via fetchProgram, hiding every base-layer value -
+   incremental (overlay) scans lost all findings that lived in unchanged
+   files. Bind the sub-query to the dual-source overlay instance instead
+   (QueryWithValue(overlay) + WithProgramOverlay) and skip the
+   *Program-keyed include cache for overlays.
+
+Verified on a Java project (80 files): incremental overlay scan now
+yields the full merged-view result set (50 findings, 50/50
+RiskFeatureHash stable vs the full-recompile baseline), vs 0/18 before.
+---
+ common/yak/cmd/yakcmds/ssacli.go            | 15 +++++++++--
+ common/yak/ssaapi/sf_native_call_include.go | 29 ++++++++++++++++++++-
+ common/yak/ssaapi/sfreport/output.go        |  7 ++++-
+ 3 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/common/yak/cmd/yakcmds/ssacli.go b/common/yak/cmd/yakcmds/ssacli.go
+index 74a8926..c4b3a63 100644
+--- a/common/yak/cmd/yakcmds/ssacli.go
++++ b/common/yak/cmd/yakcmds/ssacli.go
+@@ -2076,6 +2076,11 @@ Unlike code-scan, this command runs query-style output rather than batch report
+ 		var sarifCallback func(result *ssaapi.SyntaxFlowResult)
+ 		if haveSarifRequired {
+ 			sarifCallback = func(result *ssaapi.SyntaxFlowResult) {
++				// SARIF conversion consumes built risk objects (YieldRisk);
++				// query-mode results only carry alert values until CreateRisk.
++				if result.RiskCount() == 0 {
++					_ = result.CreateRisk()
++				}
+ 				results = append(results, result)
+ 			}
+ 		} else {
+@@ -2286,7 +2291,13 @@ func SyntaxFlowQuery(
+ 	if err != nil {
+ 		log.Errorf("load program [%v] from database failed: %v", programName, err)
+ 	}
+-	if dbDebug {
++	// Overlay programs must be queried through their merged dual-source
++	// instance; the raw program only carries the diff layer's IR.
++	queryTarget, qtErr := ssaapi.NewProgramFromDB(programName)
++	if qtErr != nil || queryTarget == nil {
++		queryTarget = prog
++	}
++	if dbDebug && prog != nil {
+ 		prog.DBDebug()
+ 	}
+ 	opt := make([]ssaapi.QueryOption, 0)
+@@ -2294,7 +2305,7 @@ func SyntaxFlowQuery(
+ 		opt = append(opt, ssaapi.QueryWithEnableDebug())
+ 	}
+ 	var execError error
+-	result, err := prog.SyntaxFlowWithError(syntaxFlow, opt...)
++	result, err := queryTarget.SyntaxFlowWithError(syntaxFlow, opt...)
+ 	if err != nil {
+ 		var otherErrs []string
+ 		if result != nil && len(result.GetErrors()) > 0 {
+diff --git a/common/yak/ssaapi/sf_native_call_include.go b/common/yak/ssaapi/sf_native_call_include.go
+index e2d2977..0002876 100644
+--- a/common/yak/ssaapi/sf_native_call_include.go
++++ b/common/yak/ssaapi/sf_native_call_include.go
+@@ -139,6 +139,18 @@ func nativeCallInclude(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCa
+ 		return false, nil, err
+ 	}
+ 
++	// Overlay queries must keep the lib sub-query on the dual-source view:
++	// fetchProgram unwraps a *ProgramOverLay to its top (diff) program, and
++	// binding the sub-query to that would hide every base-layer value.
++	var overlay *ProgramOverLay
++	_ = v.Recursive(func(operator sfvm.ValueOperator) error {
++		if o, ok := operator.(*ProgramOverLay); ok && o != nil {
++			overlay = o
++			return utils.Error("normal abort")
++		}
++		return nil
++	})
++
+ 	var inputs Values
+ 	v.Recursive(func(operator sfvm.ValueOperator) error {
+ 		val, ok := operator.(*Value)
+@@ -172,12 +184,22 @@ func nativeCallInclude(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCa
+ 		cacheKey = cacheKey + ":struct:" + bound.key
+ 	}
+ 	hash, ret, shouldCache := GetIncludeCacheValue(parent, cacheKey, inputs)
++	if overlay != nil {
++		// The include cache is keyed by *Program; an overlay's value space is
++		// base+diff, so a top-program cache entry would be wrong. Skip caching.
++		shouldCache = false
++		ret = nil
++	}
+ 	if ret != nil {
+ 		return true, ret, nil
+ 	}
+ 	var queryValue sfvm.Values
+ 	if len(inputs) == 0 {
+-		queryValue = sfvm.ValuesOf(parent)
++		if overlay != nil {
++			queryValue = sfvm.ValuesOf(overlay)
++		} else {
++			queryValue = sfvm.ValuesOf(parent)
++		}
+ 	} else {
+ 		queryValue = ToSFVMValues(inputs)
+ 	}
+@@ -192,6 +214,11 @@ func nativeCallInclude(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCa
+ 	}
+ 	if bound != nil && rule.IsStructMode() {
+ 		opts = append(opts, QueryWithStruct(bound.compileUnit()))
++	} else if overlay != nil {
++		opts = append(opts,
++			QueryWithValue(overlay),
++			QueryWithSFOption(sfvm.WithRuntimeOption(WithProgramOverlay(overlay))),
++		)
+ 	} else {
+ 		opts = append(opts, QueryWithProgram(parent))
+ 	}
+diff --git a/common/yak/ssaapi/sfreport/output.go b/common/yak/ssaapi/sfreport/output.go
+index 9076d66..e91e699 100644
+--- a/common/yak/ssaapi/sfreport/output.go
++++ b/common/yak/ssaapi/sfreport/output.go
+@@ -28,7 +28,12 @@ func writeReportSnapshot(w io.Writer, data []byte) error {
+ 	if named, ok := w.(interface{ Name() string }); ok {
+ 		if path := named.Name(); path != "" && path != "/dev/stdout" && path != "stdout" {
+ 			if _, err := os.Stat(filepath.Dir(path)); err == nil {
+-				return writeFileSnapshot(path, data)
++				if err := writeFileSnapshot(path, data); err == nil {
++					return nil
++				}
++				// Windows cannot rename over a file the CLI itself holds
++				// open (os.Rename fails with Access is denied); fall back
++				// to writing through the already-open handle below.
+ 			}
+ 		}
+ 	}
+-- 
+2.45.1.windows.1
+

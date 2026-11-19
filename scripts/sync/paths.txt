@@ -1,0 +1,40 @@
+# SSA / SyntaxFlow paths whose upstream changes we follow with path-filtered
+# cherry-picks. One git pathspec per line; lines starting with # are comments.
+#
+# Only commits that touch these paths are considered. Commits that also change
+# shared code outside these paths (ypb/consts/schema/etc.) are handled by a
+# separate, explicit closure-expansion review, never auto-applied here.
+
+# Engine core + scan orchestration
+common/yak/ssa/
+common/yak/ssa4analyze/
+common/yak/ssa_compile/
+common/yak/ssaapi/
+common/yak/ssaproject/
+common/yak/syntaxflow_scan/
+common/yak/static_analyzer/
+common/yak/cmd/ssacmds/
+
+# SyntaxFlow VM / rules / reporting
+common/syntaxflow/
+
+# Language frontends feeding SSA
+common/yak/c2ssa/
+common/yak/go2ssa/
+common/yak/java/
+common/yak/php/
+common/yak/python/
+common/yak/typescript/
+common/yak/yak2ssa/
+common/yak/csharp/
+
+# ANTLR grammars/parsers the frontends depend on
+common/yak/antlr4c/
+common/yak/antlr4go/
+common/yak/antlr4nasl/
+common/yak/antlr4util/
+common/yak/antlr4yak/
+
+# CLI entrypoints
+cmd/yak-ssa/
+cmd/ssa-scan/

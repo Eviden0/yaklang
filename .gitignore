@@ -14,3 +14,5 @@ scripts/closure/__pycache__/
 
 # Upstream sync scratch output
 /scripts/sync/conflicts/*.tmp
+# Conflict reports are per-run diagnostics resolved by hand, not committed.
+/scripts/sync/conflicts/

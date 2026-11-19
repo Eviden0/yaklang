@@ -1,0 +1,8 @@
+# Upstream sync state for path-filtered cherry-picks.
+#   base_merge_commit: the fork's merge-base with yaklang/yaklang main (2026-11-01)
+#   last_synced:       the upstream commit already reflected in this tree.
+#                      Update it after a successful --apply run.
+upstream_repo: git@github.com:yaklang/yaklang.git
+upstream_branch: main
+base_merge_commit: 238faf8
+last_synced: 238faf8
