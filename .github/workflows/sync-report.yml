@@ -1,0 +1,69 @@
+name: upstream-sync-report
+
+# Periodic, READ-ONLY report of upstream `yaklang/yaklang` commits that touch our
+# SSA pathspecs and are not yet synced (candidate list under
+# scripts/sync/upstream-state.yaml:last_synced). This never mutates the tree:
+# it only runs the dry-run of scripts/sync/sync-upstream.sh and uploads the
+# candidate list as an artifact for a human to land with `--apply`.
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      depth:
+        description: "Shallow fetch depth (raise to reach last_synced)."
+        required: false
+        default: "1000"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-report
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # SSH needs a deploy key; HTTPS works unauthenticated for a public repo.
+      - name: Add upstream remote (https)
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/yaklang/yaklang.git || \
+            git remote set-url upstream https://github.com/yaklang/yaklang.git
+
+      - name: Dry-run sync (candidate list)
+        env:
+          UPSTREAM_REMOTE: upstream
+          UPSTREAM_BRANCH: main
+          UPSTREAM_DEPTH: ${{ inputs.depth || '1000' }}
+        run: |
+          set -euo pipefail
+          bash scripts/sync/sync-upstream.sh | tee sync-report.txt
+
+      - name: Summarize candidates
+        run: |
+          set -euo pipefail
+          last_synced="$(awk -F': *' '/^last_synced:/{print $2}' scripts/sync/upstream-state.yaml)"
+          {
+            echo "## Upstream SSA sync report"
+            echo
+            echo "- generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- last_synced: \`${last_synced}\`"
+            echo
+            echo '```'
+            sed -n '/candidate commit(s) touching SSA paths/,$p' sync-report.txt
+            echo '```'
+          } > "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-report
+          path: sync-report.txt
+          if-no-files-found: error
