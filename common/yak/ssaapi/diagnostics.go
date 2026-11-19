@@ -1,0 +1,100 @@
+package ssaapi
+
+import (
+	"os"
+	"time"
+
+	"github.com/yaklang/yaklang/common/utils/diagnostics"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+)
+
+var withRuntimeDiagnostics = ssaconfig.SetOption("ssa_compile/diagnostics", func(c *Config, enabled bool) {
+	c.diagnosticsEnabled = enabled
+	if c.Config != nil {
+		c.Config.SetCompileDiagnostics(enabled)
+	}
+})
+
+func WithDiagnostics(enabled bool) ssaconfig.Option {
+	return func(c *ssaconfig.Config) error {
+		if c == nil {
+			return nil
+		}
+		if enabled {
+			ensureDiagnosticsLevelEnabled()
+		}
+		c.SetCompileDiagnostics(enabled)
+		return withRuntimeDiagnostics(enabled)(c)
+	}
+}
+
+func ensureDiagnosticsLevelEnabled() {
+	if diagnostics.GetLevel() != diagnostics.LevelOff {
+		return
+	}
+	if raw := os.Getenv("YAK_DIAGNOSTICS_LOG_LEVEL"); raw != "" {
+		if err := diagnostics.SetLevelFromString(raw); err == nil {
+			return
+		}
+	}
+	diagnostics.SetLevel(diagnostics.LevelLow)
+}
+
+func (c *Config) DiagnosticsEnabled() bool {
+	// Diagnostics monitoring removed; always returns false so all diagnostic code paths are no-ops.
+	return false
+}
+
+func (c *Config) applyNestedSettings(rec *diagnostics.Recorder) {
+	if rec == nil {
+		return
+	}
+	min := time.Second
+	if c.Config != nil && c.Config.GetCompileFilePerformanceLog() {
+		min = 100 * time.Millisecond
+	}
+	rec.SetNested(true)
+	rec.SetNestedLog(true, min, nil)
+}
+
+func (c *Config) DiagnosticsRecorder() *diagnostics.Recorder {
+	// Diagnostics monitoring removed; always returns nil.
+	return nil
+}
+
+func (c *Config) SetDiagnosticsRecorder(rec *diagnostics.Recorder) {
+	c.diagnosticsRecorder = rec
+}
+
+func (c *Config) LogDiagnostics(label string) {
+	if !c.DiagnosticsEnabled() {
+		return
+	}
+	recorder := c.DiagnosticsRecorder()
+	if recorder == nil {
+		return
+	}
+	diagnostics.LogRecorder(label, recorder)
+}
+
+func (c *Config) DiagnosticsTrack(name string, steps ...func() error) error {
+	return c.DiagnosticsRecorder().Track(name, steps...)
+}
+
+func (c *saveValueCtx) DiagnosticsTrack(name string, steps ...func() error) error {
+	return c.diagnosticsRecorder.Track(name, steps...)
+}
+
+func OptionSaveValue_Diagnostics(rec *diagnostics.Recorder) SaveValueOption {
+	return func(c *saveValueCtx) {
+		c.diagnosticsRecorder = rec
+	}
+}
+
+// GetFilePerformanceRecorder 获取文件性能 recorder
+func (c *Config) GetFilePerformanceRecorder() *diagnostics.Recorder {
+	if c == nil {
+		return nil
+	}
+	return c.filePerformanceRecorder
+}

@@ -1,0 +1,262 @@
+package ssaapi
+
+import (
+	"io"
+	"strings"
+	"time"
+
+	"github.com/yaklang/javajive/classparser"
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+	"github.com/yaklang/yaklang/common/yak/ssaproject"
+
+	"github.com/yaklang/yaklang/common/utils/memedit"
+
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/filesys"
+	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+)
+
+func getUnifiedSeparatorFs(fs fi.FileSystem) fi.FileSystem {
+	if fs == nil {
+		return nil
+	}
+
+	unifiedOptions := []filesys.UnifiedFsOption{
+		filesys.WithUnifiedFsSeparator(ssadb.IrSourceFsSeparators),
+	}
+
+	// 如果已经是 UnifiedFS 且分隔符匹配，直接返回，避免重复包装
+	if unifiedFS, ok := fs.(*filesys.UnifiedFS); ok {
+		if _, ok := unifiedFS.GetFileSystem().(*javaclassparser.JarFS); ok {
+			unifiedOptions = append(unifiedOptions, filesys.WithUnifiedFsExtMap(".class", ".java"))
+			return filesys.NewUnifiedFS(unifiedFS.GetFileSystem(), unifiedOptions...)
+		}
+		if unifiedFS.GetSeparators() == ssadb.IrSourceFsSeparators {
+			return fs
+		}
+		// 如果分隔符不匹配，提取底层文件系统重新包装
+		fs = unifiedFS.GetFileSystem()
+	}
+
+	if _, ok := fs.(*javaclassparser.JarFS); ok {
+		unifiedOptions = append(unifiedOptions, filesys.WithUnifiedFsExtMap(".class", ".java"))
+	}
+
+	return filesys.NewUnifiedFS(fs, unifiedOptions...)
+}
+
+var ttlSSAParseCache = createCache(30 * time.Minute)
+var parseSingleFlightCache = utils.NewSingleFlightCache(ttlSSAParseCache.CacheExWithKey)
+
+type programResult struct {
+	prog *Program
+	err  error
+}
+
+func createCache(ttl time.Duration) *utils.CacheWithKey[string, *programResult] {
+	cache := utils.NewTTLCacheWithKey[string, *programResult](ttl)
+	return cache
+}
+
+func ClearCache() {
+	ttlSSAParseCache.Purge()
+}
+
+// Parse 将一段源码编译为 SSA 程序对象，用于后续的 SyntaxFlow 查询与静态分析
+// 导出名为 ssa.Parse
+// 参数:
+//   - code: 待编译的源码字符串
+//   - opts: 编译可选项，如 ssa.withLanguage(ssa.Yak)、ssa.withProgramName 等
+//
+// 返回值:
+//   - 编译得到的 SSA 程序对象
+//   - 错误信息
+//
+// Example:
+// ```
+// prog = ssa.Parse("a = 1; b = a + 1; println(b)", ssa.withLanguage(ssa.Yak))~
+// result = prog.SyntaxFlowWithError("println(* as $arg)")~
+// assert result != nil, "syntaxflow result should not be nil"
+// ```
+func Parse(code string, opts ...ssaconfig.Option) (*Program, error) {
+	input := strings.NewReader(code)
+	return ParseFromReader(input, opts...)
+}
+
+// ParseFromReader parse simple file to ssa.Program
+func ParseFromReader(input io.Reader, opts ...ssaconfig.Option) (*Program, error) {
+	if input != nil {
+		raw, err := io.ReadAll(input)
+		if err != nil {
+			log.Warnf("read input error: %v", err)
+		}
+		// config.originEditor = memedit.NewMemEditor(string(raw))
+		opts = append(opts, WithEditor(memedit.NewMemEditor(string(raw))))
+	}
+	config, err := DefaultConfig(opts...)
+	if err != nil {
+		return nil, err
+	}
+	defer config.Cleanup()
+
+	if config.EnableCache {
+		hash := config.CalcHash()
+		result, err := parseSingleFlightCache.Do(hash, func() (*programResult, error) {
+			ret, err := config.parseFile()
+			return &programResult{
+				prog: ret,
+				err:  err,
+			}, err
+		})
+		if err != nil {
+			return nil, err
+		}
+		return result.prog, result.err
+	}
+
+	ret, err := config.parseFile()
+	return ret, err
+}
+
+func (p *Program) Feed(code io.Reader) error {
+	if p.config == nil || !p.config.feedCode || p.config.LanguageBuilder == nil {
+		return utils.Errorf("not support language %s", p.config.GetLanguage())
+	}
+
+	raw, err := io.ReadAll(code)
+	if err != nil {
+		return err
+	}
+
+	return p.config.feed(p.Program, memedit.NewMemEditor(string(raw)))
+}
+
+/*
+YaklangScriptChecking is a function that checks the syntax of a Yaklang script.
+
+Input: code string, pluginType: `"yak" "mitm" "port-scan" "codec" "syntaxflow"`
+
+Return: []*result.StaticAnalyzeResult
+*/
+func YaklangScriptChecking(code string, pluginType string) []any {
+	log.Warn("YaklangScriptChecking is not implemented! Please contact developers to fix it.")
+	return nil
+}
+
+func RegisterExport(name string, value any) {
+	if _, ok := Exports[name]; !ok {
+		log.Warnf("ssa Export [%s] create by Register but no default implement", name)
+	}
+	Exports[name] = value
+}
+
+var Exports = map[string]any{
+	"Parse":              Parse,
+	"ParseLocalProject":  ParseProjectFromPath,
+	"ParseProject":       ParseProject,
+	"NewFromProgramName": FromDatabase,
+	"NewProgramFromDB":   NewProgramFromDB,
+	// "NewRiskCompare":     NewSSAComparator[*schema.SSARisk],
+	// "NewRiskCompareItem": NewSSARiskComparisonItem,
+
+	"withProjectName": ssaconfig.WithProjectName,
+
+	"withConcurrency":    WithConcurrency,
+	"withLanguage":       WithRawLanguage,
+	"withConfigInfo":     ssaconfig.WithCodeSourceMap,
+	"withExternLib":      WithExternLib,
+	"withExternValue":    WithExternValue,
+	"withProgramName":    WithProgramName,
+	"withSetProgramName": WithSetProgramName,
+	"withDescription":    WithProgramDescription,
+	"withProcess":        WithProcess,
+	"withEntryFile":      WithFileSystemEntry,
+	"withReCompile":      WithReCompile,
+	"withStrictMode":     WithStrictMode,
+	"withContext":        WithContext,
+	"withPeepholeSize":   WithPeepholeSize,
+	"withExcludeFile":    WithUserExcludePatterns,
+	// withDefaultExcludeFunc is deprecated, use withExcludeFile instead.
+	// Note the misleading name: it sets USER exclude patterns, not the built-in
+	// default excludes (which are controlled by withDisableDefaultCompileExcludes).
+	"withDefaultExcludeFunc":            WithExcludeFunc,
+	"withDisableDefaultCompileExcludes": WithDisableDefaultCompileExcludes,
+	"withMemory":                        WithMemory,
+	"withFilePerformanceLog":            WithFilePerformanceLog,
+	"withBaseProgramName":               WithBaseProgramName,
+	"withEnableIncrementalCompile":      WithEnableIncrementalCompile,
+	"withStructRule":                    WithStructRule,
+	"withStructRules":                   WithStructRules,
+	"withStructRuleDir":                 WithStructRuleDir,
+	"withStructRuleRaw":                 WithStructRuleRaw,
+	"withStructRuleCallback":            WithStructRuleCallback,
+	"withStructRuleTimeout":             WithStructRuleTimeout,
+	"withStructRuleWorkLimit":           WithStructRuleWorkLimit,
+
+	// language:
+	"Javascript": ssaconfig.JS,
+	"GO":         ssaconfig.GO,
+	"Yak":        ssaconfig.Yak,
+	"PHP":        ssaconfig.PHP,
+	"Java":       ssaconfig.JAVA,
+	"Python":     ssaconfig.PYTHON,
+
+	/// static analyze
+	"YaklangScriptChecking": YaklangScriptChecking,
+
+	// result
+	"NewResultFromDB": LoadResultByID,
+
+	// SSA Project operations
+	"GetSSAProjectByID":         ssaproject.LoadSSAProjectByID,
+	"GetSSAProjectByNameAndURL": ssaproject.LoadSSAProjectByNameAndURL,
+	"NewSSAProject":             ssaproject.NewSSAProject,
+
+	// Query latest program name by project name
+	"GetLatestProgramNameByProjectName": getLatestProgramNameByProjectName,
+}
+
+// getLatestProgramNameByProjectName 根据 SSA 项目名查询其最新编译产物（program）的名称（导出名为 ssa.GetLatestProgramNameByProjectName）
+// 一个项目可能多次编译产生多个 program，本函数返回最近一次的 program 名称
+//
+// 参数:
+//   - projectName: SSA 项目名
+//
+// 返回值:
+//   - 最新的 program 名称
+//   - 错误信息（项目名为空或查询失败时返回）
+//
+// Example:
+// ```
+// // 该示例依赖数据库中已存在的 SSA 项目，仅作用法示意
+// name = ssa.GetLatestProgramNameByProjectName("my-project")~
+// println(name)
+// ```
+func getLatestProgramNameByProjectName(projectName string) (string, error) {
+	if projectName == "" {
+		return "", utils.Errorf("project name is empty")
+	}
+	db := consts.GetGormProfileDatabase()
+	if db == nil {
+		return "", utils.Errorf("profile database is not initialized")
+	}
+	var project schema.SSAProject
+	if err := db.Model(&schema.SSAProject{}).Where("project_name = ?", projectName).First(&project).Error; err != nil {
+		return "", utils.Errorf("find project by name %s failed: %s", projectName, err)
+	}
+	var names []string
+	if err := ssadb.GetDB().Model(&ssadb.IrProgram{}).
+		Where("project_id = ?", project.ID).
+		Order("updated_at desc").
+		Limit(1).
+		Pluck("program_name", &names).Error; err != nil {
+		return "", err
+	}
+	if len(names) == 0 {
+		return "", nil
+	}
+	return names[0], nil
+}

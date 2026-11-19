@@ -1,0 +1,453 @@
+package python2ssa
+
+import (
+	"github.com/yaklang/yaklang/common/log"
+	pythonparser "github.com/yaklang/yaklang/common/yak/python/parser"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+)
+
+// VisitRoot visits the root node of the Python AST.
+// This is the entry point for converting a Python file to SSA.
+func (b *singleFileBuilder) VisitRoot(raw pythonparser.IRootContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	root, ok := raw.(*pythonparser.RootContext)
+	if !ok || root == nil {
+		return nil
+	}
+
+	// Python files can have file_input, single_input, or eval_input
+	// For now, we'll handle file_input which is the most common case
+	if fileInput := root.File_input(); fileInput != nil {
+		b.VisitFileInput(fileInput)
+		if b.PreHandler() {
+			b.registerPythonFileBuild(fileInput)
+		}
+	} else if singleInput := root.Single_input(); singleInput != nil {
+		// A one-statement source parses as single_input (adaptive prediction
+		// prefers it over file_input). During the pre-handler pass, defer the
+		// statement like registerPythonFileBuild does for file_input — running
+		// it inline would execute imports before the batch's skeletons have
+		// published their exports (out-of-order binding with no on-demand
+		// fallback available, since PreHandler disables it).
+		if b.PreHandler() {
+			b.registerPythonSingleInputBuild(singleInput)
+		} else {
+			b.VisitSingleInput(singleInput)
+		}
+	} else if evalInput := root.Eval_input(); evalInput != nil {
+		b.VisitEvalInput(evalInput)
+	}
+
+	return nil
+}
+
+// VisitFileInput visits a file_input node (a complete Python file).
+func (b *singleFileBuilder) VisitFileInput(raw pythonparser.IFile_inputContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	fileInput, ok := raw.(*pythonparser.File_inputContext)
+	if !ok || fileInput == nil {
+		log.Debugf("python2ssa: VisitFileInput: fileInput is nil or type assertion failed")
+		return nil
+	}
+
+	stmts := fileInput.AllStmt()
+	if b.PreHandler() {
+		b.predeclareTopLevelFuncShells(stmts)
+		defer func() {
+			b.topLevelFuncShells = nil
+		}()
+		for _, stmt := range stmts {
+			b.visitFileInputStmtSkeleton(stmt)
+			if b.shouldStopStatementWalk() {
+				break
+			}
+		}
+		return nil
+	}
+
+	b.predeclareTopLevelFuncShells(stmts)
+	defer func() {
+		b.topLevelFuncShells = nil
+	}()
+	for _, stmt := range stmts {
+		b.VisitStmt(stmt)
+		if b.shouldStopStatementWalk() {
+			break
+		}
+	}
+
+	return nil
+}
+
+func (b *singleFileBuilder) visitFileInputStmtSkeleton(stmt pythonparser.IStmtContext) {
+	if stmt == nil {
+		return
+	}
+	stmtCtx, ok := stmt.(*pythonparser.StmtContext)
+	if !ok || stmtCtx == nil {
+		return
+	}
+	if compoundStmt := stmtCtx.Compound_stmt(); compoundStmt != nil {
+		if cfdCtx, ok := compoundStmt.(*pythonparser.Class_or_func_def_stmtContext); ok {
+			b.VisitClassOrFuncDefStmt(cfdCtx)
+		}
+	}
+}
+
+func (b *singleFileBuilder) registerPythonFileBuild(fileInput pythonparser.IFile_inputContext) {
+	if b == nil || fileInput == nil {
+		return
+	}
+	fileInputCtx, ok := fileInput.(*pythonparser.File_inputContext)
+	if !ok || fileInputCtx == nil {
+		return
+	}
+	capturedStmts := make([]pythonparser.IStmtContext, 0)
+	for _, stmt := range fileInputCtx.AllStmt() {
+		if isTopLevelClassOrFuncDefStmt(stmt) {
+			continue
+		}
+		capturedStmts = append(capturedStmts, ssa.DetachAST(stmt))
+	}
+	if len(capturedStmts) == 0 {
+		return
+	}
+	b.registerCapturedBuild(func(build *singleFileBuilder) {
+		for _, stmt := range capturedStmts {
+			build.VisitStmt(stmt)
+			if build.shouldStopStatementWalk() {
+				return
+			}
+		}
+	})
+}
+
+// registerPythonSingleInputBuild defers a one-statement source parsed as
+// single_input (see registerPythonFileBuild): class/func defs compile as
+// skeletons now, everything else runs in the deferred file build.
+func (b *singleFileBuilder) registerPythonSingleInputBuild(singleInput pythonparser.ISingle_inputContext) {
+	if b == nil || singleInput == nil {
+		return
+	}
+	singleInputCtx, ok := singleInput.(*pythonparser.Single_inputContext)
+	if !ok || singleInputCtx == nil {
+		return
+	}
+	var visitStmt func(build *singleFileBuilder)
+	if simple := singleInputCtx.Simple_stmt(); simple != nil {
+		detached := ssa.DetachAST(simple)
+		visitStmt = func(build *singleFileBuilder) { build.VisitSimpleStmt(detached) }
+	} else if compound := singleInputCtx.Compound_stmt(); compound != nil {
+		if isTopLevelClassOrFuncDefCompound(compound) {
+			// skeleton semantics, same as visitFileInputStmtSkeleton
+			if cfd, ok := compound.(*pythonparser.Class_or_func_def_stmtContext); ok {
+				b.VisitClassOrFuncDefStmt(cfd)
+			}
+			return
+		}
+		detached := ssa.DetachAST(compound)
+		visitStmt = func(build *singleFileBuilder) { build.VisitCompoundStmt(detached) }
+	} else {
+		return
+	}
+	b.registerCapturedBuild(func(build *singleFileBuilder) {
+		visitStmt(build)
+		if build.shouldStopStatementWalk() {
+			return
+		}
+	})
+}
+
+// registerCapturedBuild registers a deferred file build over pre-detached
+// statements: the shared plumbing (path/builder capture, fresh per-file
+// singleFileBuilder) of registerPythonFileBuild and
+// registerPythonSingleInputBuild.
+func (b *singleFileBuilder) registerCapturedBuild(visit func(build *singleFileBuilder)) {
+	prog := b.GetProgram()
+	if prog == nil {
+		return
+	}
+	editor := b.GetEditor()
+	path := "python"
+	if editor != nil && editor.GetUrl() != "" {
+		path = editor.GetUrl()
+	}
+	capturedBuilder := b.FunctionBuilder
+	prog.RegisterFileBuild(path, editor, capturedBuilder, func(fileFb *ssa.FunctionBuilder) {
+		build := &singleFileBuilder{
+			FunctionBuilder: fileFb,
+			constMap:        make(map[string]ssa.Value),
+			globalNames:     make(map[string]bool),
+		}
+		build.SupportClosure = true
+		visit(build)
+	})
+}
+
+func isTopLevelClassOrFuncDefStmt(stmt pythonparser.IStmtContext) bool {
+	stmtCtx, ok := stmt.(*pythonparser.StmtContext)
+	if !ok || stmtCtx == nil {
+		return false
+	}
+	return isTopLevelClassOrFuncDefCompound(stmtCtx.Compound_stmt())
+}
+
+func isTopLevelClassOrFuncDefCompound(compound pythonparser.ICompound_stmtContext) bool {
+	if compound == nil {
+		return false
+	}
+	_, ok := compound.(*pythonparser.Class_or_func_def_stmtContext)
+	return ok
+}
+
+// VisitSingleInput visits a single_input node (a single statement).
+func (b *singleFileBuilder) VisitSingleInput(raw pythonparser.ISingle_inputContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	singleInput, ok := raw.(*pythonparser.Single_inputContext)
+	if !ok || singleInput == nil {
+		return nil
+	}
+
+	// Single_input can have either Simple_stmt or Compound_stmt
+	if simpleStmt := singleInput.Simple_stmt(); simpleStmt != nil {
+		b.VisitSimpleStmt(simpleStmt)
+	} else if compoundStmt := singleInput.Compound_stmt(); compoundStmt != nil {
+		b.VisitCompoundStmt(compoundStmt)
+	}
+
+	return nil
+}
+
+// VisitEvalInput visits an eval_input node (an expression for evaluation).
+func (b *singleFileBuilder) VisitEvalInput(raw pythonparser.IEval_inputContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	evalInput, ok := raw.(*pythonparser.Eval_inputContext)
+	if !ok || evalInput == nil {
+		return nil
+	}
+
+	// For eval_input, we visit the testlist
+	if testlist := evalInput.Testlist(); testlist != nil {
+		b.VisitTestlist(testlist)
+	}
+
+	return nil
+}
+
+// VisitStmt visits a statement node.
+// This dispatches to either simple_stmt or compound_stmt handlers.
+func (b *singleFileBuilder) VisitStmt(raw pythonparser.IStmtContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	stmt, ok := raw.(*pythonparser.StmtContext)
+	if !ok || stmt == nil {
+		return nil
+	}
+
+	// Handle simple_stmt or compound_stmt
+	if simpleStmt := stmt.Simple_stmt(); simpleStmt != nil {
+		b.VisitSimpleStmt(simpleStmt)
+	} else if compoundStmt := stmt.Compound_stmt(); compoundStmt != nil {
+		b.VisitCompoundStmt(compoundStmt)
+	}
+
+	return nil
+}
+
+// VisitSimpleStmt visits a simple_stmt node.
+func (b *singleFileBuilder) VisitSimpleStmt(raw pythonparser.ISimple_stmtContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	simpleStmt, ok := raw.(*pythonparser.Simple_stmtContext)
+	if !ok || simpleStmt == nil {
+		return nil
+	}
+
+	// Visit all small_stmt nodes
+	for _, smallStmt := range simpleStmt.AllSmall_stmt() {
+		b.VisitSmallStmt(smallStmt)
+		if b.shouldStopStatementWalk() {
+			break
+		}
+	}
+
+	return nil
+}
+
+// VisitSmallStmt visits a small_stmt node.
+// This handles various small statements like assignments, expressions, etc.
+func (b *singleFileBuilder) VisitSmallStmt(raw pythonparser.ISmall_stmtContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	// Use type switch to handle different statement types
+	switch stmt := raw.(type) {
+	case *pythonparser.Type_stmtContext:
+		return b.VisitTypeStmt(stmt)
+	case *pythonparser.Expr_stmtContext:
+		return b.VisitExprStmt(stmt)
+	case *pythonparser.Return_stmtContext:
+		return b.VisitReturnStmt(stmt)
+	case *pythonparser.Break_stmtContext:
+		return b.VisitBreakStmt(stmt)
+	case *pythonparser.Continue_stmtContext:
+		return b.VisitContinueStmt(stmt)
+	case *pythonparser.Pass_stmtContext:
+		return b.VisitPassStmt(stmt)
+	case *pythonparser.Import_stmtContext:
+		return b.VisitImportStmt(stmt)
+	case *pythonparser.From_stmtContext:
+		return b.VisitFromStmt(stmt)
+	case *pythonparser.Global_stmtContext:
+		return b.VisitGlobalStmt(stmt)
+	case *pythonparser.Nonlocal_stmtContext:
+		return b.VisitNonlocalStmt(stmt)
+	case *pythonparser.Assert_stmtContext:
+		return b.VisitAssertStmt(stmt)
+	case *pythonparser.Raise_stmtContext:
+		return b.VisitRaiseStmt(stmt)
+	case *pythonparser.Del_stmtContext:
+		return b.VisitDelStmt(stmt)
+	case *pythonparser.Print_stmtContext:
+		return b.VisitPrintStmt(stmt)
+	case *pythonparser.Exec_stmtContext:
+		return b.VisitExecStmt(stmt)
+	case *pythonparser.Yield_stmtContext:
+		return b.VisitYieldStmt(stmt)
+	}
+
+	return nil
+}
+
+// VisitCompoundStmt visits a compound_stmt node.
+// This handles compound statements like if, for, while, def, class, etc.
+func (b *singleFileBuilder) VisitCompoundStmt(raw pythonparser.ICompound_stmtContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	// Use type switch to handle different compound statement types
+	switch stmt := raw.(type) {
+	case *pythonparser.If_stmtContext:
+		return b.VisitIfStmt(stmt)
+	case *pythonparser.While_stmtContext:
+		return b.VisitWhileStmt(stmt)
+	case *pythonparser.For_stmtContext:
+		return b.VisitForStmt(stmt)
+	case *pythonparser.Try_stmtContext:
+		return b.VisitTryStmt(stmt)
+	case *pythonparser.With_stmtContext:
+		return b.VisitWithStmt(stmt)
+	case *pythonparser.Match_stmtContext:
+		return b.VisitMatchStmt(stmt)
+	case *pythonparser.Class_or_func_def_stmtContext:
+		return b.VisitClassOrFuncDefStmt(stmt)
+	}
+
+	return nil
+}
+
+// VisitTestlist visits a testlist node.
+// This is used for expression lists in eval_input.
+func (b *singleFileBuilder) VisitTestlist(raw pythonparser.ITestlistContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	testlist, ok := raw.(*pythonparser.TestlistContext)
+	if !ok || testlist == nil {
+		return nil
+	}
+
+	// Visit all tests in the testlist
+	// Return the first value (for single expressions)
+	var result interface{}
+	for _, test := range testlist.AllTest() {
+		if testCtx, ok := test.(*pythonparser.TestContext); ok {
+			result = b.VisitTest(testCtx)
+			// For now, just process the first test
+			break
+		}
+	}
+
+	return result
+}
+
+// VisitTestlistStarExpr visits a testlist_star_expr node.
+// This is used for expressions and expression lists.
+func (b *singleFileBuilder) VisitTestlistStarExpr(raw pythonparser.ITestlist_star_exprContext) interface{} {
+	if b == nil || raw == nil || b.IsStop() {
+		return nil
+	}
+
+	recoverRange := b.SetRange(raw)
+	defer recoverRange()
+
+	testlistStarExpr, ok := raw.(*pythonparser.Testlist_star_exprContext)
+	if !ok || testlistStarExpr == nil {
+		return nil
+	}
+
+	// First check for testlist (for simple expressions like `x = 1` or `println(x)`)
+	if testlist := testlistStarExpr.Testlist(); testlist != nil {
+		return b.VisitTestlist(testlist)
+	}
+
+	// Visit all tests in the testlist_star_expr
+	// Return the first value (for single expressions)
+	tests := testlistStarExpr.AllTest()
+	var result interface{}
+	for _, test := range tests {
+		if testCtx, ok := test.(*pythonparser.TestContext); ok {
+			result = b.VisitTest(testCtx)
+			// For now, just process the first test
+			break
+		}
+	}
+
+	return result
+}

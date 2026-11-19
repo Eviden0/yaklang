@@ -1,0 +1,230 @@
+package schema
+
+import (
+	"fmt"
+	"github.com/samber/lo"
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/log"
+)
+
+var (
+	projectDataBase    *gorm.DB
+	profileDatabase    *gorm.DB
+	defaultSSADataBase *gorm.DB
+)
+
+func init() {
+	RegisterDatabaseSchema(KEY_SCHEMA_YAKIT_DATABASE, ProjectTables...)
+	RegisterDatabaseSchema(KEY_SCHEMA_PROFILE_DATABASE, ProfileTables...)
+}
+
+const (
+	KEY_SCHEMA_YAKIT_DATABASE uint8 = iota
+	KEY_SCHEMA_PROFILE_DATABASE
+	KEY_SCHEMA_CVE_DATABASE
+	KEY_SCHEMA_CVE_DESCRIPTION_DATABASE
+	KEY_SCHEMA_VULINBOX_DATABASE
+	KEY_SCHEMA_SSA_DATABASE
+)
+
+func KeySchemaToName(i uint8) string {
+	switch i {
+	case KEY_SCHEMA_YAKIT_DATABASE:
+		return "KEY_SCHEMA_YAKIT_DATABASE"
+	case KEY_SCHEMA_PROFILE_DATABASE:
+		return "KEY_SCHEMA_PROFILE_DATABASE"
+	case KEY_SCHEMA_CVE_DATABASE:
+		return "KEY_SCHEMA_CVE_DATABASE"
+	case KEY_SCHEMA_CVE_DESCRIPTION_DATABASE:
+		return "KEY_SCHEMA_CVE_DESCRIPTION_DATABASE"
+	case KEY_SCHEMA_VULINBOX_DATABASE:
+		return "KEY_SCHEMA_VULINBOX_DATABASE"
+	case KEY_SCHEMA_SSA_DATABASE:
+		return "KEY_SCHEMA_SSA_DATABASE"
+	default:
+		return "KEY_SCHEMA_Unknown"
+	}
+}
+
+// ProfileTables 这些表是独立与项目之外的，每一个用户的数据都不一样
+var ProfileTables = []interface{}{
+	&YakScript{}, &Payload{}, &MenuItem{}, &ContextMenuBinding{},
+	&GeneralStorage{}, &MarkdownDoc{},
+	&Project{},
+	&NavigationBar{}, &NaslScript{},
+	&WebFuzzerLabel{},
+	&PluginGroup{},
+	&CodecFlow{},
+	//general rule
+	&GeneralRule{},
+	&GeneralRuleGroup{},
+	//syntaxFlow rule
+	&SyntaxFlowRule{},
+	&SyntaxFlowGroup{},
+	&PluginEnv{},
+	&HotPatchTemplate{},
+	&AIForge{},
+
+	// aibalance 服务端已迁移到独立仓库，不再登记到全局 ProfileTables，
+	// 避免污染普通 yak 用户的 profile 数据库。
+	// 关键词: aibalance server externalized, 不进 ProfileTables
+	&AIThirdPartyConfig{},
+	&AIYakTool{},
+	&AISkill{}, // AI Skills for aiskillloader BM25 search
+
+	// UserAIStats: per-entity 命中计数 + per-user/day 汇总, 用户级反馈统计.
+	// 关键词: UserAIStats, ProfileTables 注册, 命中反馈
+	&AIStatsEntityHit{},
+	&AIUserDailyStats{},
+
+	&Snippets{}, // Snippets
+	// SSA Projects Config Info
+	&SSAProject{},
+	&ProxyEndpoint{},
+	&ProxyRoute{},
+	// 插件使用次数全局计数（与 yak_scripts 同库，供 QueryYakScript 按使用次数排序）
+	&PluginUsageCount{},
+}
+
+var databaseSchemas = map[uint8][]any{
+	KEY_SCHEMA_YAKIT_DATABASE:           nil,
+	KEY_SCHEMA_PROFILE_DATABASE:         nil,
+	KEY_SCHEMA_CVE_DATABASE:             nil,
+	KEY_SCHEMA_CVE_DESCRIPTION_DATABASE: nil,
+	KEY_SCHEMA_VULINBOX_DATABASE:        nil,
+	KEY_SCHEMA_SSA_DATABASE:             nil,
+}
+
+var databasePatches = map[uint8][]func(db *gorm.DB){
+	KEY_SCHEMA_YAKIT_DATABASE:           nil,
+	KEY_SCHEMA_PROFILE_DATABASE:         nil,
+	KEY_SCHEMA_CVE_DATABASE:             nil,
+	KEY_SCHEMA_CVE_DESCRIPTION_DATABASE: nil,
+	KEY_SCHEMA_VULINBOX_DATABASE:        nil,
+	KEY_SCHEMA_SSA_DATABASE:             nil,
+}
+
+// ProjectTables 这些表是和项目关联的，导出项目可以直接复制给用户
+var ProjectTables = []interface{}{
+	&WebsocketFlow{},
+	&HTTPFlow{}, &ExecHistory{}, &AnalyzedHTTPFlow{},
+	&ExtractedData{},
+	&Port{},
+	&Domain{}, &Host{},
+	&MarkdownDoc{}, &ExecResult{},
+	&Risk{}, &WebFuzzerTask{}, &WebFuzzerResponse{},
+	&ReportRecord{}, &ScreenRecorder{},
+	&ProjectGeneralStorage{},
+	// rss
+	&Briefing{}, &RssFeed{}, &WebShell{},
+	// &assets.SubscriptionSource{},
+	&AliveHost{},
+
+	// traffic
+	&TrafficSession{}, &TrafficPacket{}, &TrafficTCPReassembledFrame{},
+
+	// HybridScan
+	&HybridScanTask{},
+
+	// Progress
+	&Progress{},
+	// WebFuzzer Config
+	&WebFuzzerConfig{},
+
+	// Note
+	&Note{},
+
+	// AI
+	&AISession{},
+	&AIReActSchedule{},
+	&AISessionPlanAndExec{},
+	&AIAgentRuntime{},
+	&AITimelineHistory{},
+	&AITrajectory{},
+	&AiCheckpoint{},
+	&AiOutputEvent{},
+	&AiProcess{},
+	&AiProcessAndAiEvent{},
+	&AIMemoryEntity{},
+	&AIMemoryCollection{},
+
+	// project level vector collection
+	&VectorStoreCollection{},
+	&VectorStoreDocument{},
+	&VectorStoreGraphDelta{},
+}
+
+func RegisterDatabaseSchema(key uint8, schema ...any) {
+	if _, ok := databaseSchemas[key]; !ok {
+		panic("Database schema key invalid")
+	}
+
+	databaseSchemas[key] = lo.Uniq(append(databaseSchemas[key], schema...))
+}
+
+func AutoMigrate(db *gorm.DB, key uint8) {
+	if schemas, ok := databaseSchemas[key]; ok {
+		if len(schemas) == 0 {
+			log.Errorf("Database schema [%v] is empty", KeySchemaToName(key))
+			return
+		}
+		db.AutoMigrate(schemas...)
+	} else {
+		log.Errorf("Database schema key: %v is %v", key, KeySchemaToName(key))
+	}
+}
+
+// AutoMigrateChecked is used by stores whose initialization must reject partial
+// schema creation. Existing callers retain their historical migration behavior.
+func AutoMigrateChecked(db *gorm.DB, key uint8) error {
+	models, ok := databaseSchemas[key]
+	if !ok || len(models) == 0 {
+		return fmt.Errorf("database schema %d is unavailable", key)
+	}
+	return db.AutoMigrate(models...).Error
+}
+
+func RegisterDatabasePatch(key uint8, patch func(db *gorm.DB)) {
+	if _, ok := databasePatches[key]; !ok {
+		panic("Database schema key invalid")
+	}
+
+	databasePatches[key] = append(databasePatches[key], patch)
+}
+
+func ApplyPatches(db *gorm.DB, key uint8) {
+	if patches, ok := databasePatches[key]; ok {
+		for _, patch := range patches {
+			if patch == nil {
+				continue
+			}
+			patch(db)
+		}
+	}
+}
+
+// set from consts package
+func SetGormProjectDatabase(d *gorm.DB) {
+	projectDataBase = d
+}
+
+// set from consts package
+func SetGormProfileDatabase(d *gorm.DB) {
+	profileDatabase = d
+}
+
+func SetDefaultSSADatabase(d *gorm.DB) {
+	defaultSSADataBase = d
+}
+
+func GetGormProfileDatabase() *gorm.DB {
+	return profileDatabase
+}
+
+func GetGormProjectDatabase() *gorm.DB {
+	return projectDataBase
+}
+
+func GetDefaultSSADatabase() *gorm.DB {
+	return defaultSSADataBase
+}

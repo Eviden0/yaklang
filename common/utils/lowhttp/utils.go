@@ -1,0 +1,1109 @@
+package lowhttp
+
+import (
+	"bufio"
+	"bytes"
+	"io"
+	"net"
+	"net/http"
+	"net/textproto"
+	"net/url"
+	"path"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/yaklang/yaklang/common/filter"
+	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/utils"
+)
+
+const (
+	CRLF       = "\r\n"
+	DoubleCRLF = "\r\n\r\n"
+)
+
+var validPathSuffixRegexp = regexp.MustCompile(`^\.[A-Za-z0-9]+$`)
+
+type splitHTTPPacketReaderState struct {
+	packet bytes.Reader
+	reader *bufio.Reader
+}
+
+var splitHTTPPacketReaderPool = sync.Pool{
+	New: func() any {
+		state := &splitHTTPPacketReaderState{}
+		state.reader = bufio.NewReader(&state.packet)
+		return state
+	},
+}
+
+func acquireSplitHTTPPacketReader(raw []byte) *splitHTTPPacketReaderState {
+	state := splitHTTPPacketReaderPool.Get().(*splitHTTPPacketReaderState)
+	state.packet.Reset(raw)
+	state.reader.Reset(&state.packet)
+	return state
+}
+
+func releaseSplitHTTPPacketReader(state *splitHTTPPacketReaderState) {
+	// Do not keep the potentially large packet alive while the reader is idle
+	// in the pool. Resetting the bufio.Reader also drops its interface reference
+	// before the state becomes available to another goroutine.
+	state.packet.Reset(nil)
+	state.reader.Reset(&state.packet)
+	splitHTTPPacketReaderPool.Put(state)
+}
+
+// pathExtModifierChars 是 CDN/图片服务在 path 扩展名后常加的修饰符字符。
+// 例如 a.png!cc_218x300 中的 !、.jpg@100w 中的 @。提取“真实扩展名”时需在此类字符处截断，
+// 只保留如 .png、.jpg 这样的后缀。
+const pathExtModifierChars = "!@"
+
+// GetPathSuffix 从 path 中提取文件扩展名（含前导点），供过滤、匹配等使用。
+// 会先去掉 query 部分，并兼容 "/main.js/" 这类尾部多一个 "/" 的文件样式路径；
+// 再用 path.Ext 取扩展名，去掉 pathExtModifierChars 修饰符后，
+// 保证返回形如 ".png"、".js" 的字符串（无扩展名或无效时返回 ""）。
+func GetPathSuffix(pathStr string) string {
+	if idx := strings.IndexByte(pathStr, '?'); idx != -1 {
+		pathStr = pathStr[:idx]
+	}
+	pathStr = strings.TrimRight(pathStr, "/")
+	ret := path.Ext(pathStr)
+	if ret == "" {
+		return ""
+	}
+	if idx := strings.IndexAny(ret, pathExtModifierChars); idx != -1 {
+		ret = ret[:idx]
+	}
+	if ret == "" || ret == "." {
+		return ""
+	}
+	if !strings.HasPrefix(ret, ".") {
+		ret = "." + ret
+	}
+	if !validPathSuffixRegexp.MatchString(ret) {
+		return ""
+	}
+	return ret
+}
+
+// ExtractURLFromHTTPRequestRaw 从原始 HTTP 请求报文中提取 URL，返回URL结构体与错误
+//
+// 参数:
+//   - req: 原始 HTTP 请求报文字节
+//   - isHttps: 是否为 https 协议
+//
+// 返回值:
+//   - 解析出的 URL 实例
+//   - 错误信息
+//
+// Example:
+// ```
+// url, err := str.ExtractURLFromHTTPRequestRaw(b"GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n", false)
+// ```
+func ExtractURLFromHTTPRequestRaw(req []byte, isHttps bool) (*url.URL, error) {
+	r, err := ParseBytesToHttpRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return ExtractURLFromHTTPRequest(r, isHttps)
+}
+
+// ExtractURLStringFromHTTPRequestRaw parse url string
+func ExtractURLStringFromHTTPRequest(req any, isHttps bool) (string, error) {
+	var r *http.Request
+	var err error
+	switch ret := req.(type) {
+	case []byte:
+		r, err = ParseBytesToHttpRequest(ret)
+		if err != nil {
+			return "", err
+		}
+	case string:
+		r, err = ParseBytesToHttpRequest([]byte(ret))
+		if err != nil {
+			return "", err
+		}
+	case *http.Request:
+		r = ret
+	case http.Request:
+		r = &ret
+	default:
+		return "", utils.Errorf("not support type: %T", req)
+	}
+
+	u, err := ExtractURLFromHTTPRequest(r, isHttps)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+var (
+	contentLengthRegexp = regexp.MustCompile(`(Content-Length: \d+\r?\n)`)
+	hostRegexp          = regexp.MustCompile(`(Host: .*?\r?\n)`)
+)
+
+func fixInvalidHTTPHeaders(raw []byte) []byte {
+	res := contentLengthRegexp.FindIndex(raw)
+	if len(res) >= 2 {
+		raw = append(raw[:res[0]], raw[res[1]:]...)
+	}
+
+	res = hostRegexp.FindIndex(raw)
+	if len(res) < 2 {
+		return raw
+	}
+
+	raw = append(raw[:res[1]], append([]byte("Transfer-Encoding: chunked\n"), raw[res[1]:]...)...)
+
+	return raw
+}
+
+func AddConnectionClosed(raw []byte) []byte {
+	if bytes.Contains(raw, []byte("Connection: close")) {
+		return raw
+	}
+
+	res := contentLengthRegexp.FindIndex(raw)
+	if len(res) >= 2 {
+		raw = append(raw[:res[0]], raw[res[1]:]...)
+	}
+
+	res = hostRegexp.FindIndex(raw)
+	if len(res) < 2 {
+		return raw
+	}
+
+	raw = append(raw[:res[1]], append([]byte("Connection: close\r\n"), raw[res[1]:]...)...)
+
+	if bytes.HasSuffix(raw, []byte("\r\n\r\n")) {
+		return raw
+	}
+
+	if bytes.HasSuffix(raw, []byte("\r\n")) {
+		return append(raw, []byte("\r\n")...)
+	}
+
+	return append(raw, []byte("\r\n\r\n")...)
+}
+
+func TrimLeftHTTPPacket(raw []byte) []byte {
+	return bytes.TrimLeftFunc(raw, unicode.IsSpace)
+}
+
+func waitStreamHandlerDone(done <-chan struct{}, bodyReaderCh <-chan io.ReadCloser, timeout time.Duration, label string) {
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+		return
+	case <-time.After(timeout):
+	}
+
+	var bodyReader io.ReadCloser
+	select {
+	case bodyReader = <-bodyReaderCh:
+	default:
+	}
+	if bodyReader != nil {
+		_ = bodyReader.Close()
+	}
+
+	select {
+	case <-done:
+		return
+	case <-time.After(timeout):
+		log.Warnf("stream handler wait timeout: %s", label)
+	}
+}
+
+func TrimLeftCRLF(raw []byte) []byte {
+	return bytes.TrimLeftFunc(raw, func(r rune) bool {
+		return r == '\r' || r == '\n'
+	})
+}
+
+func TrimRightHTTPPacket(raw []byte) []byte {
+	return bytes.TrimRight(raw, "\t \n\v\f\n\b\r")
+}
+
+func TrimSpaceHTTPPacket(raw []byte) []byte {
+	// return bytes.Trim(raw, "\t \n\v\f\n\b\r")
+	return bytes.TrimFunc(raw, unicode.IsSpace)
+}
+
+// ExtractURLFromHTTPRequest 从 HTTP 请求结构体中提取 URL，返回URL结构体与错误
+//
+// 参数:
+//   - r: HTTP 请求结构体
+//   - https: 是否为 https 协议
+//
+// 返回值:
+//   - 解析出的 URL 实例
+//   - 错误信息
+//
+// Example:
+// ```
+// v, err = http.Raw("GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n")
+// url, err = str.ExtractURLFromHTTPRequest(v, false)
+// ```
+func ExtractURLFromHTTPRequest(r *http.Request, https bool) (*url.URL, error) {
+	if r == nil {
+		return nil, utils.Error("no request")
+	}
+
+	if utils.IsHttpOrHttpsUrl(r.RequestURI) {
+		uIns, err := url.Parse(r.RequestURI)
+		if err != nil {
+			return nil, err
+		}
+		if https {
+			uIns.Scheme = "https" // 强制修正https
+		}
+		return uIns, nil
+	}
+
+	if utils.IsWebsocketUrl(r.RequestURI) {
+		return url.Parse(r.RequestURI)
+	}
+
+	if r.URL.Scheme != "" {
+		switch r.URL.Scheme {
+		case "https", "wss", "ssh", "sftp":
+			https = true
+		default:
+			https = false
+		}
+	}
+
+	if r.URL.Scheme == "" {
+		if https {
+			r.URL.Scheme = "https"
+		} else {
+			r.URL.Scheme = "http"
+		}
+	}
+
+	var raw string
+	switch https {
+	case true:
+		raw = "https://"
+	default:
+		raw = "http://"
+	}
+
+	if strings.ToUpper(r.Method) == "CONNECT" {
+		return r.URL, nil
+	}
+
+	var host string
+	if r.Host != "" {
+		host = r.Host
+	} else {
+		host = r.Header.Get("Host")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil, utils.Errorf("empty hosts")
+	}
+
+	if strings.HasSuffix(host, ":443") && strings.HasPrefix(raw, "https://") {
+		// 修复 https :443 的不必要情况
+		raw += host[:len(host)-4]
+	} else {
+		raw += host
+	}
+	noPath := raw
+	if r.RequestURI != "" {
+		if r.RequestURI != r.URL.String() {
+			if !strings.HasPrefix(r.RequestURI, "/") {
+				raw += "/"
+			}
+			raw += r.RequestURI
+		} else {
+			raw += r.URL.Path
+		}
+	} else {
+		u := r.URL
+		if strings.HasPrefix(u.Path, "/") || u.RawQuery != "" {
+			raw += u.RequestURI()
+		} else {
+			raw += u.Path
+		}
+	}
+	uIns, err := url.Parse(raw)
+	if err != nil {
+		instance, err := url.Parse(utils.RemoveUnprintableCharsWithReplaceItem(noPath))
+		if instance == nil {
+			return nil, utils.Errorf("nopath [%s] error: %s", noPath, err)
+		}
+		instance.Path = r.RequestURI
+		return instance, nil
+	}
+	return uIns, nil
+}
+
+// ExtractBodyFromHTTPResponseRaw 从原始 HTTP 响应报文中提取 body
+//
+// 参数:
+//   - res: 原始 HTTP 响应报文字节
+//
+// 返回值:
+//   - 提取出的响应体字节
+//   - 错误信息
+//
+// Example:
+// ```
+// body, err = str.ExtractBodyFromHTTPResponseRaw(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // body = b"ok"
+// ```
+func ExtractBodyFromHTTPResponseRaw(res []byte) ([]byte, error) {
+	_, raw := SplitHTTPHeadersAndBodyFromPacket(res)
+	return raw, nil
+}
+
+// ParseStringToHTTPResponse 将字符串解析为 HTTP 响应
+//
+// 参数:
+//   - res: HTTP 响应报文字符串
+//
+// 返回值:
+//   - 解析出的 HTTP 响应结构体
+//   - 错误信息
+//
+// Example:
+// ```
+// res, err := str.ParseStringToHTTPResponse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+// ```
+func ParseStringToHTTPResponse(res string) (*http.Response, error) {
+	return ParseBytesToHTTPResponse([]byte(res))
+}
+
+// MergeUrlFromHTTPRequest 将传入的 target 与 原始 HTTP 请求报文中的 URL 进行合并，并返回合并后的 URL
+//
+// 参数:
+//   - rawRequest: 原始 HTTP 请求报文字节
+//   - target: 待合并的目标路径或 URL
+//   - isHttps: 是否为 https 协议
+//
+// 返回值:
+//   - 合并后的 URL 字符串
+//
+// Example:
+// ```
+// url = str.MergeUrlFromHTTPRequest(b"GET /z HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n", "/a/b", true) // url = "https://www.yaklang.com/z/a/b"
+// ```
+func MergeUrlFromHTTPRequest(rawRequest []byte, target string, isHttps bool) (newURL string) {
+	if utils.IsHttpOrHttpsUrl(target) {
+		return target
+	}
+
+	urlIns, err := ExtractURLFromHTTPRequestRaw(rawRequest, isHttps)
+	if err != nil {
+		return ""
+	}
+
+	raw, err := utils.UrlJoin(urlIns.String(), target)
+	if err != nil {
+		log.Errorf("url join failed: %s field: %v", urlIns.String(), target)
+		return ""
+	}
+	return raw
+}
+
+func IsMultipartFormDataRequest(req []byte) bool {
+	isMultipart := false
+	SplitHTTPHeadersAndBodyFromPacket(req, func(line string) {
+		if !isMultipart {
+			isMultipart = strings.Contains(strings.ToLower(line), "multipart/form-data")
+		}
+	})
+	return isMultipart
+}
+
+func SplitHTTPHeader(i string) (string, string) {
+	if ret := strings.Index(i, ":"); ret < 0 {
+		return i, ""
+	} else {
+		key := strings.TrimSpace(i[:ret])
+		value := strings.TrimSpace(i[ret+1:])
+		return key, value
+	}
+}
+
+func SplitKV(i string) (string, string) {
+	if ret := strings.Index(i, "="); ret < 0 {
+		return i, ""
+	} else {
+		key := i[:ret]
+		value := strings.TrimSpace(i[ret+1:])
+		return key, value
+	}
+}
+
+// ValidCookieValue 判断是否存在不允许的字符,
+func ValidCookieValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if !validCookieValueByte(value[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func validCookieValueByte(b byte) bool {
+	return 0x20 <= b && b < 0x7f && b != '"' && b != ';' && b != '\\'
+}
+
+func parseCookieValue(raw string, allowDoubleQuote bool) (string, bool) {
+	// Strip the quotes, if present.
+	if allowDoubleQuote && len(raw) > 1 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		raw = raw[1 : len(raw)-1]
+	}
+
+	return raw, true
+}
+
+// readCookies parses all "Cookie" values from the header h and
+// returns the successfully parsed Cookies.
+//
+// if filter isn't empty, only cookies of that name are returned
+// From Go Src
+func readCookies(h http.Header, filter string) []*http.Cookie {
+	lines := h["Cookie"]
+	if len(lines) == 0 {
+		return []*http.Cookie{}
+	}
+
+	cookies := make([]*http.Cookie, 0, len(lines)+strings.Count(lines[0], ";"))
+	for _, line := range lines {
+		line = textproto.TrimString(line)
+
+		var part string
+		for len(line) > 0 { // continue since we have rest
+			part, line, _ = strings.Cut(line, ";")
+			part = textproto.TrimString(part)
+			if part == "" {
+				continue
+			}
+			name, val, _ := strings.Cut(part, "=")
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			if filter != "" && filter != name {
+				continue
+			}
+
+			// 去掉友好显示的tag
+			if strings.HasPrefix(name, "{{urlescape(") ||
+				strings.HasPrefix(val, "{{urlescape(") {
+				name = strings.TrimPrefix(name, "{{urlescape(")
+				name = strings.TrimSuffix(name, ")}}")
+				val = strings.TrimPrefix(val, "{{urlescape(")
+				val = strings.TrimSuffix(val, ")}}")
+			}
+			if !strings.ContainsAny(val, " ,") {
+				// 只去双引号，不判断是否合法
+				val, _ = parseCookieValue(val, true)
+			}
+
+			//if strings.Contains(val, "%") {
+			//	valUnesc, err := url.QueryUnescape(val)
+			//	if err == nil {
+			//		val = valUnesc
+			//	}
+			//}
+			cookies = append(cookies, &http.Cookie{Name: name, Value: val})
+		}
+	}
+	return cookies
+}
+
+// ParseCookie parse 请求包中的 Cookie 字符串
+func ParseCookie(key, raw string) []*http.Cookie {
+	var cookies []*http.Cookie
+	if strings.ToLower(key) == "cookie" {
+		header := http.Header{}
+		header.Add("Cookie", raw)
+		cookies = readCookies(header, "")
+	} else if strings.ToLower(key) == "set-cookie" {
+		header := http.Header{}
+		header.Add("Set-Cookie", raw)
+		resp := http.Response{Header: header}
+		cookies = resp.Cookies()
+	}
+	return cookies
+}
+
+func MergeCookies(cookies ...*http.Cookie) string {
+	req := &http.Request{Header: make(http.Header)}
+	f := filter.NewFilter()
+	defer f.Close()
+	for _, c := range cookies {
+		if f.Exist(c.String()) {
+			continue
+		}
+		f.Insert(c.String())
+		f.Insert(c.String() + ";")
+		req.AddCookie(c)
+	}
+	return req.Header.Get("Cookie")
+}
+
+// func SplitContentTypesFromAcceptHeader(acceptHeader string) []string {
+// 	var contentTypes []string
+
+// 	parts := strings.Split(acceptHeader, ",")
+// 	for _, part := range parts {
+// 		contentType := strings.TrimSpace(part)
+// 		if idx := strings.Index(contentType, ";"); idx != -1 {
+// 			contentType = strings.TrimSpace(contentType[:idx])
+// 		}
+// 		if contentType != "" {
+// 			contentTypes = append(contentTypes, contentType)
+// 		}
+// 	}
+// 	return contentTypes
+// }
+
+func SplitHTTPHeadersAndBodyFromPacketEx(raw []byte, mf func(method string, requestUri string, proto string) error, hook ...func(line string)) (string, []byte) {
+	return splitHTTPHeadersAndBodyFromPacket(raw, mf, true, hook...)
+}
+
+// SplitHTTPHeadersAndBodyFromPacketViewEx parses the packet without copying its
+// body. The returned body aliases raw and is read-only; callers that mutate or
+// retain it independently must clone it first.
+func SplitHTTPHeadersAndBodyFromPacketViewEx(raw []byte, mf func(method string, requestUri string, proto string) error, hook ...func(line string)) (string, []byte) {
+	return splitHTTPHeadersAndBodyFromPacket(raw, mf, false, hook...)
+}
+
+func splitHTTPHeadersAndBodyFromPacket(raw []byte, mf func(method string, requestUri string, proto string) error, cloneBody bool, hook ...func(line string)) (string, []byte) {
+	if !cloneBody {
+		if headers, body, ok := splitCanonicalHTTPPacketView(raw, mf, hook...); ok {
+			return headers, body
+		}
+	}
+	if len(hook) > 0 {
+		return splitHTTPPacketEx(raw, mf, nil, nil, cloneBody, func(line string) (ret string) {
+			return callHTTPHeaderHooks(line, hook)
+		})
+	}
+	return splitHTTPPacketEx(raw, mf, nil, nil, cloneBody)
+}
+
+func callHTTPHeaderHooks(line string, hooks []func(string)) (ret string) {
+	ret = line
+	defer func() {
+		if err := recover(); err != nil {
+			utils.PrintCurrentGoroutineRuntimeStack()
+		}
+		ret = line
+	}()
+	for _, hook := range hooks {
+		hook(line)
+	}
+	return ret
+}
+
+// splitCanonicalHTTPPacketView avoids line-by-line reconstruction for ordinary
+// CRLF packets. Noncanonical packets retain the legacy parser's normalization,
+// folding and prefix handling.
+func splitCanonicalHTTPPacketView(raw []byte, reqFirstLine func(method string, requestURI string, proto string) error, headerHooks ...func(string)) (string, []byte, bool) {
+	headerEnd := bytes.Index(raw, []byte(DoubleCRLF))
+	if headerEnd <= 0 {
+		return "", nil, false
+	}
+
+	header := raw[:headerEnd]
+	firstLineEnd := bytes.Index(header, []byte(CRLF))
+	if firstLineEnd <= 0 {
+		return "", nil, false
+	}
+	firstLine := header[:firstLineEnd]
+	if bytes.IndexAny(firstLine, "\r\n") >= 0 || !bytes.Equal(firstLine, TrimSpaceHTTPPacket(firstLine)) {
+		return "", nil, false
+	}
+
+	isResp := bytes.HasPrefix(firstLine, []byte("HTTP/")) || bytes.HasPrefix(firstLine, []byte("RTSP/"))
+	haveContentLength := false
+	remaining := header[firstLineEnd+len(CRLF):]
+	for len(remaining) > 0 {
+		lineEnd := bytes.Index(remaining, []byte(CRLF))
+		line := remaining
+		if lineEnd >= 0 {
+			line = remaining[:lineEnd]
+			remaining = remaining[lineEnd+len(CRLF):]
+		} else {
+			remaining = nil
+		}
+		if bytes.IndexAny(line, "\r\n") >= 0 || (!isResp && len(bytes.TrimSpace(line)) == 0) {
+			return "", nil, false
+		}
+		if len(headerHooks) > 0 && isResp && len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			return "", nil, false
+		}
+		if separator := bytes.IndexByte(line, ':'); separator >= 0 {
+			key := bytes.TrimSpace(line[:separator])
+			if len(key) == len("content-length") && bytes.EqualFold(key, []byte("content-length")) {
+				haveContentLength = true
+			}
+		}
+	}
+
+	headers := string(raw[:headerEnd+len(DoubleCRLF)])
+	if !isResp && reqFirstLine != nil {
+		method, requestURI, proto, _ := utils.ParseHTTPRequestLine(headers[:firstLineEnd])
+		if err := reqFirstLine(method, requestURI, proto); err != nil && err.Error() != "normal abort" {
+			log.Debugf("reqHeader error: %s", err)
+			return "", nil, true
+		}
+	}
+	if len(headerHooks) > 0 {
+		remainingHeaders := headers[firstLineEnd+len(CRLF) : headerEnd]
+		for len(remainingHeaders) > 0 {
+			lineEnd := strings.Index(remainingHeaders, CRLF)
+			line := remainingHeaders
+			if lineEnd >= 0 {
+				line = remainingHeaders[:lineEnd]
+				remainingHeaders = remainingHeaders[lineEnd+len(CRLF):]
+			} else {
+				remainingHeaders = ""
+			}
+			callHTTPHeaderHooks(line, headerHooks)
+		}
+	}
+
+	body := raw[headerEnd+len(DoubleCRLF):]
+	if len(bytes.TrimSpace(body)) == 0 && !haveContentLength {
+		body = nil
+	}
+	return headers, body, true
+}
+
+func SplitHTTPPacketFast(raw any) (string, []byte) {
+	return SplitHTTPPacket(utils.InterfaceToBytes(raw), func(method string, requestUri string, proto string) error {
+		return nil
+	}, func(proto string, code int, codeMsg string) error {
+		return nil
+	})
+}
+
+// SplitHTTPPacket split http packet to headers and body
+// reqFirstLine: method, requestUri, proto: error for empty result
+// rspFirstLine: proto, code, codeMsg: error for empty result
+// hook: hook func
+func SplitHTTPPacket(
+	raw []byte,
+	reqFirstLine func(method string, requestUri string, proto string) error,
+	rspFirstLine func(proto string, code int, codeMsg string) error,
+	hook ...func(line string) string,
+) (string, []byte) {
+	return SplitHTTPPacketEx(raw, reqFirstLine, rspFirstLine, nil, hook...)
+}
+
+func SplitHTTPPacketEx(
+	raw []byte,
+	reqFirstLine func(method string, requestUri string, proto string) error,
+	rspFirstLine func(proto string, code int, codeMsg string) error,
+	rawFistLine func(string) error,
+	hook ...func(line string) string,
+) (string, []byte) {
+	return splitHTTPPacketEx(raw, reqFirstLine, rspFirstLine, rawFistLine, true, hook...)
+}
+
+func splitHTTPPacketEx(
+	raw []byte,
+	reqFirstLine func(method string, requestUri string, proto string) error,
+	rspFirstLine func(proto string, code int, codeMsg string) error,
+	rawFistLine func(string) error,
+	cloneBody bool,
+	hook ...func(line string) string,
+) (string, []byte) {
+	readerState := acquireSplitHTTPPacketReader(raw)
+	defer releaseSplitHTTPPacketReader(readerState)
+	reader := readerState.reader
+	firstLineBytes, err := utils.BufioReadLine(reader)
+	if err != nil {
+		return "", nil
+	}
+	prefix, firstLineBytes, _ := utils.CutBytesPrefixFunc(firstLineBytes, utils.NotSpaceRune)
+	firstLineBytes = TrimSpaceHTTPPacket(firstLineBytes)
+	// BufioReadLine returns a parser-owned allocation. Reuse it for every
+	// first-line callback and for the reconstructed header instead of copying
+	// the same line into multiple strings.
+	firstLine := utils.UnsafeBytesToString(firstLineBytes)
+	if rawFistLine != nil {
+		err := rawFistLine(firstLine)
+		if err != nil {
+			log.Debugf("rawFistLine error: %s", err)
+			return "", nil
+		}
+	}
+	var isResp = bytes.HasPrefix(firstLineBytes, []byte("HTTP/")) || bytes.HasPrefix(firstLineBytes, []byte("RTSP/"))
+	if isResp {
+		// rsp
+		if rspFirstLine != nil {
+			proto, code, codeMsg, _ := utils.ParseHTTPResponseLine(firstLine)
+			err := rspFirstLine(proto, code, codeMsg)
+			if err != nil {
+				log.Debugf("rspHeader error: %s", err)
+				return "", nil
+			}
+		}
+	} else {
+		// req
+		if reqFirstLine != nil {
+			method, requestURI, proto, _ := utils.ParseHTTPRequestLine(firstLine)
+			err := reqFirstLine(method, requestURI, proto)
+			if err != nil && err.Error() != "normal abort" {
+				log.Debugf("reqHeader error: %s", err)
+				return "", nil
+			}
+		}
+	}
+
+	var headers []string
+	headers = append(headers, firstLine)
+	haveCl := false
+	err = utils.ScanHTTPHeader(reader, func(rawHeader []byte) {
+		if len(rawHeader) == 0 {
+			return
+		}
+		// ScanHTTPHeader gives this callback an independent line allocation and
+		// never mutates it afterwards. The hook and reconstructed header can
+		// therefore retain a zero-copy string view safely.
+		line := utils.UnsafeBytesToString(rawHeader)
+		skipHeader := false
+		for _, h := range hook {
+			hooked := h(line)
+			if hooked == "" {
+				skipHeader = true
+			}
+			if skipHeader {
+				break
+			}
+			line = hooked
+		}
+		if skipHeader {
+			return
+		}
+		k, _ := SplitHTTPHeader(line)
+		if equalASCIIFoldOrLower(k, "content-length") {
+			haveCl = true
+		}
+		headers = append(headers, line)
+	}, prefix, isResp)
+	headersRaw := strings.Join(headers, CRLF) + CRLF + CRLF
+	// The reader is backed by the input packet, so its unread bytes are exactly
+	// the body. The public legacy API preserves its independent-copy contract;
+	// the explicit View API returns the same region without copying.
+	bodyLen := reader.Buffered() + readerState.packet.Len()
+	bodyView := raw[len(raw)-bodyLen:]
+	bodyRaw := bodyView
+	if cloneBody {
+		bodyRaw = make([]byte, bodyLen)
+		copy(bodyRaw, bodyView)
+	}
+
+	if len(bytes.TrimSpace(bodyRaw)) == 0 && !haveCl {
+		bodyRaw = nil
+	}
+
+	// 单独修复请求中的问题
+	//if !strings.HasPrefix(headersRaw, "HTTP/") {
+	//	if bytes.HasSuffix(bodyRaw, []byte("\n\n")) {
+	//		bodyRaw = bodyRaw[:len(bodyRaw)-2]
+	//	}
+	//}
+
+	return headersRaw, bodyRaw
+}
+
+// SplitHTTPHeadersAndBodyFromPacket 将传入的 HTTP 报文分割为 headers 和 body，如果传入了hook，则会在每次读取到一行 header 时调用 hook
+//
+// 参数:
+//   - raw: 原始 HTTP 报文字节
+//   - hook: 可选的逐行 header 回调函数
+//
+// 返回值:
+//   - headers: 报文头部字符串
+//   - body: 报文体字节
+//
+// Example:
+// ```
+// headers, body = str.SplitHTTPHeadersAndBodyFromPacket(b"GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n")
+// ```
+func SplitHTTPHeadersAndBodyFromPacket(raw []byte, hook ...func(line string)) (headers string, body []byte) {
+	return SplitHTTPHeadersAndBodyFromPacketEx(raw, nil, hook...)
+}
+
+// SplitHTTPHeadersAndBodyFromPacketView is the read-only, zero-body-copy form
+// of SplitHTTPHeadersAndBodyFromPacket. The returned body aliases raw.
+func SplitHTTPHeadersAndBodyFromPacketView(raw []byte, hook ...func(line string)) (headers string, body []byte) {
+	return SplitHTTPHeadersAndBodyFromPacketViewEx(raw, nil, hook...)
+}
+
+func RemoveZeroContentLengthHTTPHeader(raw []byte) []byte {
+	removeContentLength := false
+	chunk := false
+	method := ""
+	headers, body := SplitHTTPHeadersAndBodyFromPacketEx(raw, func(m string, _, _ string) error {
+		method = m
+		return nil
+	}, func(line string) {
+		if ret := strings.Split(line, ":"); len(ret) > 1 {
+			key, value := ret[0], strings.TrimSpace(ret[1])
+			if utils.AsciiEqualFold(key, "transfer-encoding") && utils.IContains(value, "chunked") {
+				chunk = true
+			}
+		}
+	})
+
+	cl := len(body)
+	removeContentLength = ShouldSendReqContentLength(method, int64(cl))
+
+	var lines []string
+	for line := range utils.ParseLines(headers) {
+		if (removeContentLength || chunk) && strings.HasPrefix(strings.ToLower(line), "content-length: ") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return ReplaceHTTPPacketBody([]byte(strings.Join(lines, "\r\n")), body, false)
+}
+
+// ShouldSendReqContentLength reports whether the http2.Transport should send
+// a "content-length" request header. This logic is basically a copy of the net/http
+// transferWriter.shouldSendContentLength.
+// The contentLength is the corrected contentLength (so 0 means actually 0, not unknown).
+// -1 means unknown.
+func ShouldSendReqContentLength(method string, contentLength int64) bool {
+	if contentLength > 0 {
+		return true
+	}
+	if contentLength < 0 {
+		return false
+	}
+	// For zero bodies, whether we send a content-length depends on the method.
+	// It also kinda doesn't matter for http2 either way, with END_STREAM.
+	switch method {
+	case "POST", "PUT", "PATCH":
+		return true
+	default:
+		return false
+	}
+}
+
+func ExtractWebsocketURLFromHTTPRequest(req *http.Request) (bool, string) {
+	isTls := false
+	if req != nil && req.URL != nil && strings.ToLower(req.URL.Scheme) == "https" {
+		isTls = true
+	}
+	urlRaw, err := ExtractURLFromHTTPRequest(req, isTls)
+	if err != nil {
+		log.Errorf("extract url(ws) from req failed: %s", err)
+		return isTls, ""
+	}
+
+	return isTls, urlRaw.String()
+}
+
+func ReadHTTPPacketBodySize(raw []byte) (cl int, chunked bool) {
+	haveCL := false
+	SplitHTTPHeadersAndBodyFromPacket(raw, func(line string) {
+		line = strings.ToLower(strings.TrimSpace(line))
+		if !haveCL && strings.HasPrefix(line, "content-type:") {
+			haveCL = true
+			n := strings.TrimSpace(line[13:])
+			cl, _ = strconv.Atoi(n)
+		}
+
+		if !chunked && !haveCL && _transferEncodingRE.MatchString(line) {
+			chunked = true
+		}
+	})
+
+	if haveCL {
+		return cl, false
+	}
+	return 0, chunked
+}
+
+func IsPrint(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] > '~' {
+			return false
+		}
+	}
+	return true
+}
+
+func ToLower(s string) (lower string, ok bool) {
+	if !IsPrint(s) {
+		return "", false
+	}
+	return strings.ToLower(s), true
+}
+
+func FixRequestHostAndPort(r *http.Request) {
+	var host string
+	if r.Host != "" {
+		host = r.Host
+	}
+
+	if host == "" {
+		host = r.Header.Get("Host")
+	}
+
+	if host == "" {
+		host = r.URL.Host
+	}
+
+	if host != "" && r.URL.Host == "" {
+		r.URL.Host = host
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(r.URL.Scheme))
+	if scheme == "" && r.TLS != nil {
+		scheme = "https"
+	}
+
+	host, port, err := utils.ParseStringToHostPort(formatRequestURLForHostPortFix(r.URL, scheme))
+	if err != nil {
+		return
+	}
+
+	r.Host = normalizeRequestHostWithScheme(host, port, scheme)
+	r.Header.Set("Host", r.Host)
+	r.URL.Host = r.Host
+}
+
+func formatRequestURLForHostPortFix(u *url.URL, scheme string) string {
+	if u == nil {
+		return ""
+	}
+	if scheme != "" {
+		clone := new(url.URL)
+		*clone = *u
+		if clone.Scheme == "" {
+			clone.Scheme = scheme
+		}
+		return clone.String()
+	}
+	return u.String()
+}
+
+func normalizeRequestHostWithScheme(host string, port int, scheme string) string {
+	switch scheme {
+	case "http", "ws":
+		if port == 80 {
+			return normalizeHostOnly(host)
+		}
+	case "https", "wss":
+		if port == 443 {
+			return normalizeHostOnly(host)
+		}
+	}
+
+	if port > 0 {
+		return utils.HostPort(host, port)
+	}
+	return normalizeHostOnly(host)
+}
+
+func normalizeHostOnly(host string) string {
+	if host == "" {
+		return ""
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		if parsed := net.ParseIP(host); parsed != nil {
+			return "[" + host + "]"
+		}
+	}
+	return host
+}
+
+// IsResp 判断传入的数据是否为 HTTP 响应报文
+// 参数:
+//   - raw: 待判断的数据，可为字节数组或字符串
+//
+// 返回值:
+//   - 是否为 HTTP 响应报文
+//
+// <|EXAMPLE_START|> 示例：判断一段数据是否为 HTTP 响应报文
+// ```
+// // 关键词: poc.IsResponse, 判断响应报文
+// // 注意: 在 yak 中该函数导出名为 poc.IsResponse
+// isResp = poc.IsResponse(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+// println("is response =", isResp)              // 预期输出: is response = true
+// assert isResp, "should be recognized as response"
+// isReq = poc.IsResponse(b"GET / HTTP/1.1\r\nHost: a.com\r\n\r\n")
+// assert !isReq, "request packet should not be a response"
+// ```
+// <|EXAMPLE_END|>
+func IsResp(raw any) (isHTTPResponse bool) {
+	switch data := raw.(type) {
+	case []byte:
+		_, err := ParseBytesToHTTPResponse(data)
+		return err == nil
+	case string:
+		_, err := ParseBytesToHTTPResponse([]byte(data))
+		return err == nil
+	case http.Response, *http.Response:
+		return true
+	}
+	return false
+}
+
+func IsRespFast(raw any) (isHTTPResponse bool) {
+	first := ""
+	switch data := raw.(type) {
+	case []byte:
+		first, _, _ = GetHTTPPacketFirstLine([]byte(data))
+	case string:
+		first, _, _ = GetHTTPPacketFirstLine([]byte(data))
+	case http.Response, *http.Response:
+		return true
+	}
+	return strings.HasPrefix(first, "HTTP/")
+}
+
+func IGetHeader(packet interface{}, headerKey string) []string {
+	var headers map[string][]string
+	switch data := packet.(type) {
+	case []byte:
+		headers = GetHTTPPacketHeadersFull(data)
+	case string:
+		headers = GetHTTPPacketHeadersFull([]byte(data))
+	case http.Response:
+		return IGetHTTPInsHeader(data.Header, headerKey)
+	case *http.Response:
+		return IGetHTTPInsHeader(data.Header, headerKey)
+	case http.Request:
+		return IGetHTTPInsHeader(data.Header, headerKey)
+	case *http.Request:
+		return IGetHTTPInsHeader(data.Header, headerKey)
+	}
+
+	var headerValue []string
+	for k, v := range headers {
+		if strings.ToLower(k) == strings.ToLower(headerKey) {
+			headerValue = append(headerValue, v...)
+		}
+	}
+	return nil
+}
+
+func IGetHTTPInsHeader(headers http.Header, headerKey string) []string {
+	var headerValue []string
+	for k, v := range headers {
+		if strings.ToLower(k) == strings.ToLower(headerKey) {
+			headerValue = append(headerValue, v...)
+		}
+	}
+	return headerValue
+}

@@ -1,0 +1,246 @@
+package java2ssa
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+
+	"github.com/yaklang/antlr/v4"
+	"github.com/yaklang/javajive/classparser"
+	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/filesys"
+	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+	"github.com/yaklang/yaklang/common/yak/antlr4util"
+	javaparser "github.com/yaklang/yaklang/common/yak/java/parser"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+)
+
+var INNER_CLASS_SPLIT = "$"
+
+// ========================================== For SSAAPI ==========================================
+
+type SSABuilder struct {
+	*ssa.PreHandlerBase
+}
+
+var _ ssa.Builder = (*SSABuilder)(nil)
+
+func CreateBuilder() ssa.Builder {
+	builder := &SSABuilder{
+		PreHandlerBase: ssa.NewPreHandlerBase(),
+	}
+	builder.WithLanguageConfigOpts(
+		ssa.WithLanguageConfigBind(true),
+		ssa.WithLanguageConfigSupportClass(true),
+		ssa.WithLanguageConfigIsSupportClassStaticModifier(true),
+		ssa.WithLanguageConfigAllowStaticMemberAccessByInstance(true),
+		ssa.WithLanguageConfigVirtualImport(true),
+		ssa.WithLanguageBuilder(builder),
+	)
+	return builder
+}
+
+func (s *SSABuilder) FilterParseAST(path string) bool {
+	extension := filepath.Ext(path)
+	return extension == ".java"
+}
+
+func (s *SSABuilder) GetAntlrCache() *ssa.AntlrCache {
+	return s.CreateAntlrCache(javaparser.GetJavaLexerSerializedATN(), javaparser.GetJavaParserSerializedATN())
+}
+
+func (s *SSABuilder) ParseAST(src string, cache *ssa.AntlrCache) (ssa.FrontAST, error) {
+	return Frontend(src, cache)
+}
+
+func (*SSABuilder) BuildFromAST(raw ssa.FrontAST, b *ssa.FunctionBuilder) error {
+	ast, ok := raw.(javaparser.ICompilationUnitContext)
+	if !ok {
+		return utils.Errorf("invalid AST type: %T, expected javaparser.ICompilationUnitContext", raw)
+	}
+	build := &singleFileBuilder{
+		FunctionBuilder:      b,
+		constMap:             make(map[string]ssa.Value),
+		fullTypeNameMap:      make(map[string][]string),
+		allImportPkgSlice:    make([][]string, 0),
+		selfPkgPath:          make([]string, 0),
+		methodOverloads:      make(map[*ssa.Blueprint]map[string][]*javaCallableCandidate),
+		constructorOverloads: make(map[*ssa.Blueprint][]*javaCallableCandidate),
+		stableNameCollision:  make(map[string]int),
+	}
+	build.initImport()
+	build.VisitCompilationUnit(ast)
+	return nil
+}
+
+func (s *SSABuilder) WrapWithPreprocessedFS(fs fi.FileSystem, jarRecursiveParse bool) fi.FileSystem {
+	if fs == nil || !jarRecursiveParse {
+		return fs
+	}
+	if _, ok := fs.(*javaclassparser.ExpandedZipFS); ok {
+		return fs
+	}
+
+	wrapped := javaclassparser.MaybeWrapExpandedArchiveFS(fs, jarRecursiveParse)
+	if wrapped == fs {
+		return fs
+	}
+	// Jar/zip roots from parseFSFromInfo may already be UnifiedFS(.class -> .java).
+	if _, ok := fs.(*filesys.UnifiedFS); !ok {
+		wrapped = filesys.NewUnifiedFS(wrapped,
+			filesys.WithUnifiedFsExtMap(".class", ".java"),
+		)
+	}
+	return wrapped
+}
+
+func (*SSABuilder) FilterFile(path string) bool {
+	ext := filepath.Ext(path)
+	return ext == ".java"
+}
+
+func (*SSABuilder) GetLanguage() ssaconfig.Language {
+	return ssaconfig.JAVA
+}
+
+func (*SSABuilder) UsesDeferredFileBuild() bool {
+	return true
+}
+
+// ========================================== Build Front End ==========================================
+
+type singleFileBuilder struct {
+	*ssa.FunctionBuilder
+	constMap map[string]ssa.Value
+
+	// for full type name
+	fullTypeNameMap   map[string][]string
+	allImportPkgSlice [][]string
+	selfPkgPath       []string
+
+	// framework support for spring boot
+	currentUIModel ssa.Value
+	isInController bool
+
+	// java overload and stable naming
+	methodOverloads      map[*ssa.Blueprint]map[string][]*javaCallableCandidate
+	constructorOverloads map[*ssa.Blueprint][]*javaCallableCandidate
+	stableNameCollision  map[string]int
+	callableDeclOrder    int
+	stableTempCounter    int
+	stableAnonClassSeq   int
+}
+
+// forkForLazyBuild gives a deferred task its own mutable frontend state. A
+// file can contribute lazy functions to different libraries, which the unit
+// scheduler may drain concurrently. Sharing FunctionBuilder between those
+// tasks lets one task's SwitchFunctionBuilder/PopFunction clear another's
+// active builder. The file-level lookup maps are copied after declaration
+// pre-handling has finished, so lazy writes cannot race with sibling tasks.
+func (b *singleFileBuilder) forkForLazyBuild() *singleFileBuilder {
+	if b == nil {
+		return nil
+	}
+	fork := *b
+	fork.constMap = make(map[string]ssa.Value, len(b.constMap))
+	for key, value := range b.constMap {
+		fork.constMap[key] = value
+	}
+	fork.fullTypeNameMap = make(map[string][]string, len(b.fullTypeNameMap))
+	for key, values := range b.fullTypeNameMap {
+		fork.fullTypeNameMap[key] = append([]string(nil), values...)
+	}
+	fork.allImportPkgSlice = make([][]string, len(b.allImportPkgSlice))
+	for index, values := range b.allImportPkgSlice {
+		fork.allImportPkgSlice[index] = append([]string(nil), values...)
+	}
+	fork.selfPkgPath = append([]string(nil), b.selfPkgPath...)
+	return &fork
+}
+
+func Frontend(src string, caches ...*ssa.AntlrCache) (javaparser.ICompilationUnitContext, error) {
+	var cache *ssa.AntlrCache
+	if len(caches) > 0 {
+		cache = caches[0]
+	}
+	src = preprocessJavaUnicodeEscapes(src)
+	src = preprocessJavaRecordPatternSwitchCases(src)
+	src = normalizeDecompiledJava(src)
+	lexicalErrors := antlr4util.NewErrorListener()
+	ast, err := antlr4util.ParseASTWithSLLFirst(
+		src,
+		func(input antlr.CharStream) *frontendJavaLexer {
+			return &frontendJavaLexer{javaparser.NewJavaLexer(input), lexicalErrors}
+		},
+		javaparser.NewJavaParser,
+		nil,
+		func(lexer *frontendJavaLexer, parser *javaparser.JavaParser) {
+			ssa.ParserSetAntlrCache(parser, lexer, cache)
+		},
+		func(parser *javaparser.JavaParser) javaparser.ICompilationUnitContext {
+			ast := parser.CompilationUnit()
+			if parser.GetTokenStream().LA(1) != antlr.TokenEOF {
+				parser.NotifyErrorListeners("unexpected trailing input after Java compilation unit", parser.GetCurrentToken(), nil)
+			}
+			return ast
+		},
+	)
+	return ast, errors.Join(err, lexicalErrors.Error())
+}
+
+// The two-stage helper replaces listeners between SLL and LL, then reuses the
+// already lexed tokens. Keep lexical errors independently, otherwise LL can
+// accept a recovered token stream without seeing the original invalid source.
+type frontendJavaLexer struct {
+	*javaparser.JavaLexer
+	lexicalErrors *antlr4util.ErrorListener
+}
+
+func (lexer *frontendJavaLexer) RemoveErrorListeners() {
+	lexer.JavaLexer.RemoveErrorListeners()
+	lexer.JavaLexer.AddErrorListener(lexer.lexicalErrors)
+}
+
+func (b *singleFileBuilder) AssignConst(name string, value ssa.Value) bool {
+	if ConstValue, ok := b.constMap[name]; ok {
+		log.Warnf("const %v has been defined value is %v", name, ConstValue.String())
+		return false
+	}
+
+	b.constMap[name] = value
+	return true
+}
+
+func (b *singleFileBuilder) ReadConst(name string) (ssa.Value, bool) {
+	v, ok := b.constMap[name]
+	return v, ok
+}
+
+func (b *singleFileBuilder) AssignClassConst(className, key string, value ssa.Value) {
+	name := fmt.Sprintf("%s_%s", className, key)
+	b.AssignConst(name, value)
+}
+func (b *singleFileBuilder) ReadClassConst(className, key string) (ssa.Value, bool) {
+	name := fmt.Sprintf("%s_%s", className, key)
+	return b.ReadConst(name)
+}
+
+func (b *singleFileBuilder) SwitchFunctionBuilder(s *ssa.StoredFunctionBuilder) func() {
+	previous := b.FunctionBuilder
+	execution, leave := s.EnterExecutionBuilder()
+	b.FunctionBuilder = execution
+	return func() {
+		leave()
+		b.FunctionBuilder = previous
+	}
+}
+
+func (b *singleFileBuilder) LoadBuilder(s *ssa.StoredFunctionBuilder) {
+	b.FunctionBuilder = s.NewExecutionBuilder()
+}
+
+func (b *singleFileBuilder) initImport() {
+	b.allImportPkgSlice = append(b.allImportPkgSlice, []string{"java", "lang", "*"})
+}

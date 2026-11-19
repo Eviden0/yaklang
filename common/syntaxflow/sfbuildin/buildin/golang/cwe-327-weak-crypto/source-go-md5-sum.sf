@@ -1,0 +1,55 @@
+desc(
+	mode: "source"
+	language: "golang"
+	title: "检测 Go crypto/md5"
+	title_zh: "检测 Go crypto/md5"
+	type: vuln
+	level: medium
+	rule_id: "source-go-md5-sum"
+	risk: "weak-hash"
+	desc: <<<DESC
+### 规则说明
+检测到 md5.New / md5.Sum 调用。仅匹配实际哈希 API，不匹配 import "crypto/md5"。
+
+### 风险类型
+weak-hash
+
+### 影响
+MD5 不抗碰撞，不应用于口令、签名或安全完整性校验。实现既有协议、必须协商服务端算法时，应人工确认为协议兼容而非本项目可替换的漏洞。
+
+### 检测方式
+源码模式正则匹配 md5.New( 或 md5.Sum( 调用。
+DESC
+	solution: <<<SOLUTION
+### 修复建议
+安全场景改用 crypto/sha256。协议兼容实现不要强行替换，以免无法互通。
+SOLUTION
+	alert_min: 1
+	"file://hash.go": <<<POS
+package main
+import "crypto/md5"
+func digest(b []byte) [16]byte { return md5.Sum(b) }
+
+POS
+	"safefile://hash-safe.go": <<<NEG
+package main
+import "crypto/sha256"
+func digest(b []byte) [32]byte { return sha256.Sum256(b) }
+
+NEG
+	"safefile://hash-import-only.go": <<<NEG
+package main
+import _ "crypto/md5"
+func digest() {}
+
+NEG
+)
+
+${*.go}.pattern_regex(/\bmd5\.(Sum|New)\s*\(/) as $hit
+alert $hit for {
+	level: "medium",
+	title: "检测 Go crypto/md5",
+	title_zh: "检测 Go crypto/md5",
+	message: "检测 Go crypto/md5",
+	risk: "weak-hash",
+}

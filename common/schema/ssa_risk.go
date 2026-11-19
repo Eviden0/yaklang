@@ -1,0 +1,220 @@
+package schema
+
+import (
+	"fmt"
+
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfrisk"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+)
+
+const (
+	ServerPushType_SSARisk = "ssa_risk"
+)
+
+type SSARisk struct {
+	gorm.Model
+
+	Hash string `json:"hash" gorm:"unique_index"`
+
+	// risk info
+	Title        string             `json:"title"`
+	TitleVerbose string             `json:"title_verbose"`
+	Description  string             `json:"description" gorm:"type:text"`
+	Solution     string             `json:"solution" gorm:"type:text"`
+	RiskType     string             `json:"risk_type"`
+	Details      string             `json:"details"`
+	Severity     SyntaxFlowSeverity `json:"severity" gorm:"index"`
+	Language     string             `json:"language"`
+	// 潜在威胁：用于输出合规性质的漏洞内容
+	IsPotential bool `json:"is_potential"`
+
+	// risk info
+	CVE                 string      `json:"cve"`
+	CWE                 StringArray `gorm:"type:text" json:"cwe"`
+	IsRead              bool        `json:"is_read"`
+	Ignore              bool        `json:"ignore"`
+	UploadOnline        bool        `json:"upload_online"`
+	CveAccessVector     string      `json:"cve_access_vector"`
+	CveAccessComplexity string      `json:"cve_access_complexity"`
+	Tags                string      `json:"tags"`
+
+	// 来源于哪个规则
+	FromRule string `json:"from_rule"`
+	// 风险来源的扫描模式: source (源码模式匹配/漏洞预检测) 或 ssa (SSA/深度静态分析)
+	ScanMode string `json:"scan_mode" gorm:"index;default:'ssa'"`
+	// 来源于哪个项目
+	ProgramName string `json:"program_name" gorm:"index"`
+	// file url yakurl
+	CodeSourceUrl string `json:"code_source_url" gorm:"index"`
+	CodeRange     string `json:"code_range" gorm:"type:text"`
+	CodeFragment  string `json:"code_fragment" gorm:"type:text"`
+	// for query risk
+	FunctionName string `json:"function_name" gorm:"index"`
+	Line         int64  `json:"line" gorm:"index"`
+	// 设置运行时 ID 关联 SyntaxflowTask
+	RuntimeId string `json:"runtime_id" gorm:"index"`
+	// for query result
+	ResultID uint64 `json:"result_id"` // result
+	// ResultUUID identifies the syntaxflow result that produced this risk even
+	// when the result was never persisted (in-memory scans have no row id).
+	// It is part of the row hash so findings of one scan stay distinguishable.
+	ResultUUID string `json:"result_uuid" gorm:"index"`
+	Variable   string `json:"variable"` // result/variable
+	Index      int64  `json:"index"`    // result/variable/index
+
+	// 最新处置状态
+	LatestDisposalStatus string `json:"latest_disposal_status" gorm:"index;default:'not_set'"`
+	// Risk 特征哈希，用于区分不同批次扫描的同一个漏洞，也是同一次扫描里后一个模式覆盖前一个模式的键。
+	// 包含 SSA 信息(disam、function)、FileUrl、SfRule 信息(ruleId、variableName、level)
+	RiskFeatureHash string `json:"risk_feature_hash" gorm:"index"`
+
+	SSAProjectID uint64 `json:"ssa_project_id" gorm:"index"`
+}
+
+func (*SSARisk) TableName() string {
+	return TableSSARisks
+}
+
+// CalcHash identifies one finding of one result. ResultUUID is enough;
+// an empty UUID is a valid input and does not need a second formula.
+func (s *SSARisk) CalcHash() string {
+	return utils.CalcSha1(s.CodeSourceUrl, s.CodeRange, s.RuntimeId,
+		s.ProgramName, s.ResultUUID, s.Variable, s.Index, s.Title, s.RiskType)
+}
+
+// CalcFeatureHash is the cover key shared by every scan mode of one finding.
+// disasm is the value text the producer already computed; this method does
+// not inspect SSA. Changing the rule is a different finding for diff history.
+func (s *SSARisk) CalcFeatureHash(disasm string) string {
+	return utils.CalcSha1(s.FunctionName, disasm, s.FromRule, s.Variable,
+		string(s.Severity), s.RiskType, s.Language, s.Title)
+}
+
+func SSARiskTypeVerbose(s string) string {
+	if definition, ok := sfrisk.Lookup(s); ok {
+		return definition.DisplayName
+	}
+	switch s {
+	case "cwe":
+		return "CWE"
+	case "owasp":
+		return "OWASP"
+	case "custom":
+		return "自定义"
+	default:
+		return s
+	}
+}
+
+func (s *SSARisk) ToGRPCModel() *ypb.SSARisk {
+	if utils.IsNil(s) {
+		return new(ypb.SSARisk)
+	}
+	return &ypb.SSARisk{
+		Id:                   int64(s.ID),
+		CreatedAt:            s.CreatedAt.Unix(),
+		UpdatedAt:            s.UpdatedAt.Unix(),
+		Hash:                 s.Hash,
+		ProgramName:          s.ProgramName,
+		CodeSourceUrl:        utils.EscapeInvalidUTF8Byte([]byte(s.CodeSourceUrl)),
+		CodeRange:            s.CodeRange,
+		CodeFragment:         utils.EscapeInvalidUTF8Byte([]byte(s.CodeFragment)),
+		Title:                s.Title,
+		TitleVerbose:         s.TitleVerbose,
+		RiskType:             s.RiskType,
+		RiskTypeVerbose:      SSARiskTypeVerbose(s.RiskType),
+		Details:              s.Details,
+		Severity:             string(s.Severity),
+		FromRule:             s.FromRule,
+		RuntimeID:            s.RuntimeId,
+		IsPotential:          s.IsPotential,
+		CVE:                  s.CVE,
+		CWE:                  s.CWE,
+		CveAccessVector:      s.CveAccessVector,
+		CveAccessComplexity:  s.CveAccessComplexity,
+		Tags:                 s.Tags,
+		ResultID:             s.ResultID,
+		ResultUUID:           s.ResultUUID,
+		IsRead:               s.IsRead,
+		Variable:             s.Variable,
+		Index:                s.Index,
+		FunctionName:         s.FunctionName,
+		Line:                 s.Line,
+		Description:          s.Description,
+		Solution:             s.Solution,
+		LatestDisposalStatus: s.LatestDisposalStatus,
+	}
+}
+
+// prepareForSave normalizes the row the same way for create and update so a
+// rewrite keeps a correct hash. FeatureText is the value text used by the
+// cover key; a blank text leaves an already computed feature hash alone.
+func (s *SSARisk) prepareForSave(featureText string) {
+	if s.RiskType == "" {
+		s.RiskType = "其他"
+	}
+	if s.ScanMode == "" {
+		s.ScanMode = "ssa"
+	}
+	s.Severity = ValidSeverityType(s.Severity)
+	if featureText != "" {
+		s.RiskFeatureHash = s.CalcFeatureHash(featureText)
+	}
+	s.Hash = s.CalcHash()
+}
+
+func (s *SSARisk) BeforeCreate(tx *gorm.DB) (err error) {
+	s.prepareForSave("")
+	return nil
+}
+
+func (s *SSARisk) BeforeUpdate(tx *gorm.DB) (err error) {
+	s.prepareForSave("")
+	return nil
+}
+
+// PrepareForSave normalizes the row for create or update outside gorm.
+// featureText, when given, also computes the cover key.
+func (s *SSARisk) PrepareForSave(featureText ...string) {
+	text := ""
+	if len(featureText) > 0 {
+		text = featureText[0]
+	}
+	s.prepareForSave(text)
+}
+
+func (s *SSARisk) AfterCreate(tx *gorm.DB) (err error) {
+	broadcastData.Call(ServerPushType_SSARisk, map[string]string{
+		"task_id": s.RuntimeId,
+		"action":  "update", // just notify update for frontend
+	})
+	return nil
+}
+
+func (s *SSARisk) AfterUpdate(tx *gorm.DB) (err error) {
+	broadcastData.Call(ServerPushType_SSARisk, map[string]string{
+		"task_id": s.RuntimeId,
+		"action":  "update",
+	})
+	return nil
+}
+
+func (s *SSARisk) String() string {
+	return fmt.Sprintf(`
+SSARisk: ID[%d] Hash[%s]
+Title: %s
+RiskType: %s
+Severity: %s
+Description: %s
+`, s.ID, s.Hash, s.Title, s.RiskType, s.Severity, s.Description)
+}
+
+func (s *SSARisk) GetAlertMsg() string {
+	title := s.TitleVerbose
+	if title == "" {
+		title = s.Title
+	}
+	return fmt.Sprintf("%s: %s", title, s.Details)
+}

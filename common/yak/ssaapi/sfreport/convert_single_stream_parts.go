@@ -1,0 +1,417 @@
+package sfreport
+
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/memedit"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+	"github.com/yaklang/yaklang/common/yak/ssaapi"
+	"github.com/yaklang/yaklang/common/yak/yaklib/codec"
+)
+
+// SSAResultParts is a streaming-friendly representation of one SyntaxFlowResult.
+// Files/dataflows are dedupable by hash, and each risk carries references
+// (file_hashes/dataflow_hashes) to avoid embedding heavy payloads.
+type SSAResultParts struct {
+	ProgramName string                 `json:"program_name"`
+	ReportType  string                 `json:"report_type"`
+	Files       []*File                `json:"files,omitempty"`
+	Dataflows   []*SSADataflowPart     `json:"dataflows,omitempty"`
+	Risks       []*SSARiskPart         `json:"risks,omitempty"`
+	Stats       map[string]interface{} `json:"stats,omitempty"`
+}
+
+type SSADataflowPart struct {
+	DataflowHash string          `json:"dataflow_hash"`
+	Payload      json.RawMessage `json:"payload"`
+}
+
+type SSARiskPart struct {
+	RiskHash       string          `json:"risk_hash"`
+	RiskJSON       json.RawMessage `json:"risk_json"`
+	FileHashes     []string        `json:"file_hashes,omitempty"`
+	DataflowHashes []string        `json:"dataflow_hashes,omitempty"`
+}
+
+type StreamPartsOptions struct {
+	ReportType          ReportType
+	ShowDataflowPath    bool
+	ShowFileContent     bool
+	WithFile            bool
+	DataflowDetailLevel DataflowDetailLevel
+}
+
+type StreamPartsOption func(*StreamPartsOptions)
+
+func NewStreamPartsOptions(opts ...StreamPartsOption) StreamPartsOptions {
+	o := StreamPartsOptions{
+		ReportType:          IRifyFullReportType,
+		ShowDataflowPath:    true,
+		ShowFileContent:     true,
+		WithFile:            true,
+		DataflowDetailLevel: DataflowDetailMinimal,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	if o.ReportType == "" {
+		o.ReportType = IRifyFullReportType
+	}
+	return o
+}
+
+// WithStreamReportType 设置流式报告的报告类型（导出名为 sfreport.withStreamReportType）
+// 参数:
+//   - v: 报告类型，如 sfreport.IRifyReportType
+//
+// 返回值:
+//   - 流式报告可选项
+//
+// Example:
+// ```
+// opt = sfreport.withStreamReportType(sfreport.IRifyReportType)
+// println(opt)
+// ```
+func WithStreamReportType(v ReportType) StreamPartsOption {
+	return func(o *StreamPartsOptions) {
+		o.ReportType = v
+	}
+}
+
+// WithStreamShowDataflowPath 设置流式报告是否展示数据流路径（导出名为 sfreport.withStreamShowDataflowPath）
+// 参数:
+//   - v: 是否展示数据流路径
+//
+// 返回值:
+//   - 流式报告可选项
+//
+// Example:
+// ```
+// opt = sfreport.withStreamShowDataflowPath(true)
+// println(opt)
+// ```
+func WithStreamShowDataflowPath(v bool) StreamPartsOption {
+	return func(o *StreamPartsOptions) {
+		o.ShowDataflowPath = v
+	}
+}
+
+// WithStreamShowFileContent 设置流式报告是否展示文件内容（导出名为 sfreport.withStreamShowFileContent）
+// 参数:
+//   - v: 是否展示文件内容
+//
+// 返回值:
+//   - 流式报告可选项
+//
+// Example:
+// ```
+// opt = sfreport.withStreamShowFileContent(true)
+// println(opt)
+// ```
+func WithStreamShowFileContent(v bool) StreamPartsOption {
+	return func(o *StreamPartsOptions) {
+		o.ShowFileContent = v
+	}
+}
+
+// WithStreamWithFile 设置流式报告是否携带文件数据（导出名为 sfreport.withStreamWithFile）
+// 参数:
+//   - v: 是否携带文件数据
+//
+// 返回值:
+//   - 流式报告可选项
+//
+// Example:
+// ```
+// opt = sfreport.withStreamWithFile(true)
+// println(opt)
+// ```
+func WithStreamWithFile(v bool) StreamPartsOption {
+	return func(o *StreamPartsOptions) {
+		o.WithFile = v
+	}
+}
+
+func WithStreamDataflowDetailLevel(v DataflowDetailLevel) StreamPartsOption {
+	return func(o *StreamPartsOptions) {
+		o.DataflowDetailLevel = v
+	}
+}
+
+// ConvertSingleResultToSSAResultPartsJSON 将单个扫描结果转换为 SSAResultParts 的 JSON 与统计信息
+// 导出名为 sfreport.ConvertSingleResultToSSAResultPartsJSONPayload（返回包含 json/stats/ok 的字典）
+// 参数:
+//   - result: SyntaxFlow 扫描结果对象
+//   - opts: 流式报告可选项
+//
+// 返回值:
+//   - SSAResultParts 的 JSON 字符串
+//   - 基础统计信息字典
+//   - 错误信息
+//
+// Example:
+// ```
+// // result 来自 ssa/syntaxflow 的扫描结果（示意性示例）
+// prog = ssa.Parse(code)~
+// result = prog.SyntaxFlowWithError("sink* as $sink")~
+// payload = sfreport.ConvertSingleResultToSSAResultPartsJSONPayload(result)~
+// dump(payload)
+// ```
+func ConvertSingleResultToSSAResultPartsJSON(result *ssaapi.SyntaxFlowResult, opts StreamPartsOptions) (string, map[string]any, error) {
+	parts, err := ConvertSingleResultToSSAResultParts(result, opts)
+	if err != nil {
+		return "", nil, err
+	}
+	if parts == nil {
+		return "", map[string]any{"has_payload": false}, nil
+	}
+	raw, err := json.Marshal(parts)
+	if err != nil {
+		return "", nil, err
+	}
+	stats := map[string]any{
+		"has_payload": true,
+		"risk_count":  len(parts.Risks),
+		"file_count":  len(parts.Files),
+		"flow_count":  len(parts.Dataflows),
+	}
+	return string(raw), stats, nil
+}
+
+// ConvertSingleResultToSSAResultParts converts one SyntaxFlowResult into stream-friendly parts.
+func ConvertSingleResultToSSAResultParts(result *ssaapi.SyntaxFlowResult, opts StreamPartsOptions) (*SSAResultParts, error) {
+	if result == nil {
+		return nil, nil
+	}
+	if opts.ReportType == "" {
+		opts.ReportType = IRifyFullReportType
+	}
+
+	// Keep this tiny context object only for NewRisk/NewFile behavior switches.
+	// We no longer build an intermediate Report from the whole result.
+	reportCtx := NewReport(opts.ReportType)
+	if opts.ShowDataflowPath {
+		reportCtx.config.showDataflowPath = true
+	}
+	if opts.ShowFileContent {
+		reportCtx.config.showFileContent = true
+	}
+
+	out := &SSAResultParts{
+		ProgramName: strings.TrimSpace(result.GetProgramName()),
+		ReportType:  string(reportCtx.ReportType),
+	}
+
+	var ruleName string
+	if rule := result.GetRule(); rule != nil {
+		ruleName = strings.TrimSpace(rule.RuleName)
+	}
+
+	fileByHash := make(map[string]*File, 256)
+	riskFiles := make(map[string][]string, 256)
+	riskFlows := make(map[string][]string, 256)
+	flowPayloads := make(map[string]json.RawMessage, 256)
+	riskSeen := make(map[string]struct{}, 256)
+
+	for ssarisk := range result.YieldRisk() {
+		if ssarisk == nil {
+			continue
+		}
+		value, err := result.GetValue(ssarisk.Variable, int(ssarisk.Index))
+		if err != nil {
+			log.Errorf("stream parts: get value failed variable=%s index=%d err=%v", ssarisk.Variable, ssarisk.Index, err)
+			continue
+		}
+
+		risk, toAddIrSourceHashes := NewRisk(ssarisk, reportCtx, value)
+		if risk == nil {
+			continue
+		}
+		riskHash := strings.TrimSpace(risk.Hash)
+		if riskHash == "" {
+			riskHash = strings.TrimSpace(ssarisk.Hash)
+		}
+		if riskHash == "" {
+			continue
+		}
+		if _, exists := riskSeen[riskHash]; exists {
+			continue
+		}
+		riskSeen[riskHash] = struct{}{}
+
+		risk.Hash = riskHash
+		if out.ProgramName == "" && risk.ProgramName != "" {
+			out.ProgramName = risk.ProgramName
+		}
+		if risk.ProgramName == "" {
+			risk.ProgramName = out.ProgramName
+		}
+		if risk.RuleName == "" {
+			risk.RuleName = ruleName
+		}
+
+		if opts.WithFile {
+			if value != nil && value.GetRange() != nil {
+				if editor := value.GetRange().GetEditor(); editor != nil {
+					if file := upsertStreamFileByEditor(fileByHash, editor, reportCtx); file != nil {
+						file.AddRisk(risk)
+						if hash := strings.TrimSpace(file.IrSourceHash); hash != "" {
+							riskFiles[riskHash] = append(riskFiles[riskHash], hash)
+						}
+					}
+				}
+			}
+			for _, h := range toAddIrSourceHashes {
+				h = strings.TrimSpace(h)
+				if h == "" {
+					continue
+				}
+				file, err := upsertStreamFileByHash(fileByHash, h, reportCtx)
+				if err != nil {
+					log.Errorf("stream parts: load file by hash failed hash=%s err=%v", h, err)
+					continue
+				}
+				if file != nil {
+					file.AddRisk(risk)
+					riskFiles[riskHash] = append(riskFiles[riskHash], h)
+				}
+			}
+		}
+
+		for _, p := range risk.DataFlowPaths {
+			raw, err := MarshalDataFlowPath(p, opts.DataflowDetailLevel)
+			if err != nil || len(raw) == 0 {
+				continue
+			}
+			flowHash := codec.Sha256(raw)
+			if flowHash == "" {
+				continue
+			}
+			if _, exists := flowPayloads[flowHash]; !exists {
+				flowPayloads[flowHash] = raw
+			}
+			riskFlows[riskHash] = append(riskFlows[riskHash], flowHash)
+		}
+
+		rc := *risk
+		rc.DataFlowPaths = nil
+		riskJSON, err := json.Marshal(&rc)
+		if err != nil {
+			continue
+		}
+		out.Risks = append(out.Risks, &SSARiskPart{
+			RiskHash:       riskHash,
+			RiskJSON:       riskJSON,
+			FileHashes:     dedupStrings(riskFiles[riskHash]),
+			DataflowHashes: dedupStrings(riskFlows[riskHash]),
+		})
+	}
+
+	if len(out.Risks) == 0 {
+		return nil, nil
+	}
+
+	if opts.WithFile {
+		fileHashes := make([]string, 0, len(fileByHash))
+		for h := range fileByHash {
+			fileHashes = append(fileHashes, h)
+		}
+		sort.Strings(fileHashes)
+		out.Files = make([]*File, 0, len(fileHashes))
+		for _, h := range fileHashes {
+			f := fileByHash[h]
+			if f == nil {
+				continue
+			}
+			ff := *f
+			if ff.Content != "" && !utf8.ValidString(ff.Content) {
+				ff.Content = utils.EscapeInvalidUTF8Byte([]byte(ff.Content))
+			}
+			ff.Risks = dedupStrings(ff.Risks)
+			out.Files = append(out.Files, &ff)
+		}
+	}
+
+	flowHashes := make([]string, 0, len(flowPayloads))
+	for h := range flowPayloads {
+		flowHashes = append(flowHashes, h)
+	}
+	sort.Strings(flowHashes)
+	out.Dataflows = make([]*SSADataflowPart, 0, len(flowHashes))
+	for _, h := range flowHashes {
+		out.Dataflows = append(out.Dataflows, &SSADataflowPart{
+			DataflowHash: h,
+			Payload:      flowPayloads[h],
+		})
+	}
+
+	sort.Slice(out.Risks, func(i, j int) bool {
+		return out.Risks[i].RiskHash < out.Risks[j].RiskHash
+	})
+
+	out.Stats = map[string]interface{}{
+		"risk_count": len(out.Risks),
+		"file_count": len(out.Files),
+		"flow_count": len(out.Dataflows),
+	}
+	return out, nil
+}
+
+func upsertStreamFileByEditor(fileByHash map[string]*File, editor *memedit.MemEditor, reportCtx *Report) *File {
+	if editor == nil {
+		return nil
+	}
+	hash := strings.TrimSpace(editor.GetIrSourceHash())
+	if hash == "" {
+		return nil
+	}
+	if f, ok := fileByHash[hash]; ok && f != nil {
+		return f
+	}
+	f := NewFile(editor, reportCtx)
+	fileByHash[hash] = f
+	return f
+}
+
+func upsertStreamFileByHash(fileByHash map[string]*File, irSourceHash string, reportCtx *Report) (*File, error) {
+	irSourceHash = strings.TrimSpace(irSourceHash)
+	if irSourceHash == "" {
+		return nil, nil
+	}
+	if f, ok := fileByHash[irSourceHash]; ok && f != nil {
+		return f, nil
+	}
+	editor, err := ssadb.GetEditorByHash(irSourceHash)
+	if err != nil {
+		return nil, err
+	}
+	f := NewFile(editor, reportCtx)
+	fileByHash[irSourceHash] = f
+	return f, nil
+}
+
+func dedupStrings(in []string) []string {
+	if len(in) <= 1 {
+		return in
+	}
+	set := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v = strings.TrimSpace(v); v == "" {
+			continue
+		}
+		if _, ok := set[v]; ok {
+			continue
+		}
+		set[v] = struct{}{}
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}

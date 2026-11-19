@@ -1,0 +1,468 @@
+package sfreport
+
+import (
+	"encoding/json"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/yak/ssaapi"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+)
+
+type Report struct {
+	mu     sync.RWMutex `json:"-"`
+	config Config       `json:"-"`
+	writer io.Writer    `json:"-"`
+	// fileByHash accelerates FirstOrCreateFile* and allows adding risks to existing files.
+	// It must not be serialized into JSON.
+	fileByHash map[string]*File `json:"-"`
+	// sinceFlush counts findings added since the last snapshot. A long scan
+	// publishes intermediate snapshots instead of writing only at the end.
+	sinceFlush int `json:"-"`
+	// flusher writes intermediate snapshots in the background so a long scan
+	// does not stall on the report file. A final Save() drains and stops it.
+	flusher *reportFlusher `json:"-"`
+	// info
+	ReportType    ReportType `json:"report_type"`
+	EngineVersion string     `json:"engine_version"`
+	ReportTime    time.Time  `json:"report_time"`
+
+	ProgramName   string             `json:"program_name"`
+	ProgramLang   ssaconfig.Language `json:"program_lang"`
+	Description   string             `json:"description"`
+	RepositoryURL string             `json:"repository_url"`
+	FileCount     int                `json:"file_count"`
+	CodeLineCount int                `json:"code_line_count"`
+	ScanStartTime time.Time          `json:"scan_start_time"`
+	ScanEndTime   time.Time          `json:"scan_end_time"`
+	// ProgramVersion string `json:"program_version"`
+	RiskNums int
+	// Program Program
+	Rules          []*Rule
+	Risks          map[string]*Risk    // hash -> risk
+	IrSourceHashes map[string]struct{} `json:"-"` // 用来去重文件
+	File           []*File             // irsourceHash -> file
+}
+
+// NewReport 创建一个 SyntaxFlow 扫描报告对象（导出名为 sfreport.NewReport）
+// 报告对象用于汇总规则、风险、文件等信息并最终序列化为 JSON 或 Markdown
+// 参数:
+//   - reportType: 报告类型，如 sfreport.IRifyReportType / sfreport.IRifyFullReportType
+//   - opts: 报告配置可选项，如 sfreport.withFileContent / sfreport.withDataflowPath
+//
+// 返回值:
+//   - 新建的报告对象
+//
+// Example:
+// ```
+// report = sfreport.NewReport(sfreport.IRifyReportType)
+// assert report.ReportType == sfreport.IRifyReportType, "report type should match"
+// ```
+func NewReport(reportType ReportType, opts ...Option) *Report {
+	now := time.Now()
+	report := &Report{
+		ReportType:    reportType,
+		EngineVersion: consts.GetYakVersion(),
+		ReportTime:    now,
+
+		// 初始化新增字段的默认值
+		ScanStartTime: now,
+		ScanEndTime:   now,
+		FileCount:     0,
+		CodeLineCount: 0,
+
+		Rules:          make([]*Rule, 0),
+		Risks:          make(map[string]*Risk),
+		IrSourceHashes: make(map[string]struct{}),
+		File:           make([]*File, 0),
+		fileByHash:     make(map[string]*File),
+	}
+	for _, o := range opts {
+		o(&report.config)
+	}
+	return report
+}
+
+func (r *Report) SetProgramName(programName string) {
+	r.ProgramName = programName
+}
+
+func (r *Report) SetProgramLang(lang ssaconfig.Language) {
+	r.ProgramLang = lang
+}
+
+func (r *Report) SetDescription(description string) {
+	r.Description = description
+}
+
+func (r *Report) SetRepositoryURL(url string) {
+	r.RepositoryURL = url
+}
+
+func (r *Report) SetFileCount(count int) {
+	r.FileCount = count
+}
+
+func (r *Report) SetCodeLineCount(count int) {
+	r.CodeLineCount = count
+}
+
+func (r *Report) SetScanStartTime(startTime time.Time) {
+	r.ScanStartTime = startTime
+}
+
+func (r *Report) SetScanEndTime(endTime time.Time) {
+	r.ScanEndTime = endTime
+}
+
+func (r *Report) SetScanTimes(startTime, endTime time.Time) {
+	r.ScanStartTime = startTime
+	r.ScanEndTime = endTime
+}
+
+func (r *Report) AddRules(rule ...*Rule) {
+	r.Rules = append(r.Rules, rule...)
+}
+
+func (r *Report) GetRule(ruleName string) *Rule {
+	for _, rule := range r.Rules {
+		if rule.RuleName == ruleName {
+			return rule
+		}
+	}
+	return nil
+}
+
+func (r *Report) AddRisks(risk ...*Risk) {
+	r.mu.Lock()
+
+	if r.Risks == nil {
+		r.Risks = make(map[string]*Risk)
+	}
+	for _, risk := range risk {
+		// set program from risk if not set in report
+		// TODO:不同program的risk能放在一个报告吗？
+		if r.ProgramName == "" && risk.GetProgramName() != "" {
+			r.ProgramName = risk.GetProgramName()
+		}
+
+		r.Risks[risk.GetHash()] = risk
+	}
+	r.sinceFlush++
+	flush := r.shouldFlushLocked()
+	r.mu.Unlock()
+	if flush {
+		// Serializing the document is cheap compared to the write; the write
+		// itself happens on the flusher so a long scan does not stall.
+		if data, err := r.snapshotJSON(); err != nil {
+			log.Errorf("serialize report snapshot failed: %v", err)
+		} else {
+			r.flusherFor().submit(data)
+		}
+	}
+}
+
+// flusherFor returns the background writer of this report, creating it on
+// first use.
+func (r *Report) flusherFor() *reportFlusher {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.flusher == nil {
+		r.flusher = newReportFlusher(r.writer)
+	}
+	return r.flusher
+}
+
+// currentFlusher returns the background writer without creating one.
+func (r *Report) currentFlusher() *reportFlusher {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.flusher
+}
+
+// shouldFlushLocked reports whether enough findings accumulated for another
+// snapshot. The caller releases the lock before writing it.
+func (r *Report) shouldFlushLocked() bool {
+	if r == nil || reportFlushEvery <= 0 {
+		return false
+	}
+	if r.sinceFlush < reportFlushEvery {
+		return false
+	}
+	r.sinceFlush = 0
+	return true
+}
+
+// ApplyRiskUpdate applies one decision. Create and update record the risk
+// and drop OldHash when the item names one. Delete only drops OldHash.
+func (r *Report) ApplyRiskUpdate(item schema.RiskUpdateItem) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	switch item.Mode {
+	case schema.RiskUpdateDelete:
+		r.dropRiskLocked(item.OldHash)
+	case schema.RiskUpdateCreate, schema.RiskUpdateUpdate:
+		if item.OldHash != "" && item.Risk != nil && item.OldHash != item.Risk.Hash {
+			r.dropRiskLocked(item.OldHash)
+		}
+		var value *ssaapi.Value
+		if item.Payload != nil {
+			value, _ = item.Payload.(*ssaapi.Value)
+		}
+		r.addSchemaRiskLocked(item.Risk, value)
+	}
+	flush := r.shouldFlushLocked()
+	r.mu.Unlock()
+	if flush {
+		if data, err := r.snapshotJSON(); err != nil {
+			log.Errorf("serialize report snapshot failed: %v", err)
+		} else {
+			r.flusherFor().submit(data)
+		}
+	}
+	return nil
+}
+
+// addSchemaRiskLocked records one risk from its own fields. When the scan hands
+// over the live value that produced the finding, NewRisk can build the
+// data-flow graph directly; without it (or for a persisted result) it falls
+// back to reloading audit rows by ResultID.
+func (r *Report) addSchemaRiskLocked(ssarisk *schema.SSARisk, value *ssaapi.Value) {
+	if r == nil || ssarisk == nil {
+		return
+	}
+	if r.Risks == nil {
+		r.Risks = make(map[string]*Risk)
+	}
+	if r.ProgramName == "" && ssarisk.ProgramName != "" {
+		r.ProgramName = ssarisk.ProgramName
+	}
+	var risk *Risk
+	if value != nil {
+		risk, _ = NewRisk(ssarisk, r, value)
+	} else {
+		risk, _ = NewRisk(ssarisk, r)
+	}
+	if risk == nil {
+		return
+	}
+	r.Risks[risk.GetHash()] = risk
+	if file := r.firstOrCreateFileByPath(ssarisk.CodeSourceUrl); file != nil {
+		file.AddRisk(risk)
+	}
+	ruleName := riskRuleName(ssarisk)
+	rule := r.FirstOrCreateRule(&schema.SyntaxFlowRule{
+		RuleName:    ruleName,
+		Title:       ssarisk.Title,
+		Severity:    ssarisk.Severity,
+		Description: ssarisk.Description,
+		Language:    ssaconfig.Language(ssarisk.Language),
+	})
+	if rule != nil {
+		risk.SetRule(rule)
+		rule.AddRisk(risk)
+	}
+	r.RiskNums = len(r.Risks)
+	r.sinceFlush++
+}
+
+// dropRiskLocked removes a replaced finding from the map and from the file and
+// rule references that were built from the rich result.
+func (r *Report) dropRiskLocked(hash string) {
+	if hash == "" {
+		return
+	}
+	delete(r.Risks, hash)
+	for _, file := range r.File {
+		file.Risks = dropHash(file.Risks, hash)
+	}
+	for _, rule := range r.Rules {
+		rule.Risks = dropHash(rule.Risks, hash)
+	}
+	r.RiskNums = len(r.Risks)
+}
+
+func dropHash(list []string, hash string) []string {
+	out := list[:0]
+	for _, item := range list {
+		if item != hash {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (r *Report) GetRisk(hash string) *Risk {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.Risks[hash]
+}
+
+func (r *Report) AddFile(file *File) {
+	if file != nil && file.IrSourceHash != "" {
+		if r.fileByHash == nil {
+			r.fileByHash = make(map[string]*File)
+		}
+		// Keep the first seen file instance for this hash to avoid duplicates.
+		if _, ok := r.fileByHash[file.IrSourceHash]; !ok {
+			r.fileByHash[file.IrSourceHash] = file
+		}
+		if r.IrSourceHashes == nil {
+			r.IrSourceHashes = make(map[string]struct{})
+		}
+		r.IrSourceHashes[file.IrSourceHash] = struct{}{}
+	}
+	r.File = append(r.File, file)
+}
+
+func (r *Report) GetFile(path string) *File {
+	for _, file := range r.File {
+		if file.Path == path {
+			return file
+		}
+	}
+	return nil
+}
+
+func (r *Report) Write(w io.Writer) error {
+	jsonData, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(jsonData)
+	return err
+}
+
+// ToSSAProjectReport 将 Report 转换为 SSAProjectReport
+func (r *Report) ToSSAProjectReport() *SSAProjectReport {
+	ssaReport := &SSAProjectReport{
+		// 封面信息
+		ProgramName: r.ProgramName,
+		ReportTime:  r.ReportTime,
+
+		// 项目信息
+		Language:      r.ProgramLang,
+		Description:   r.Description,
+		RepositoryURL: r.RepositoryURL,
+		FileCount:     r.FileCount,
+		CodeLineCount: r.CodeLineCount,
+		ScanStartTime: r.ScanStartTime,
+		ScanEndTime:   r.ScanEndTime,
+		TotalRules:    len(r.Rules),
+		EngineVersion: r.EngineVersion,
+
+		// 初始化集合
+		Risks: make([]*SSAReportRisk, 0, len(r.Risks)),
+		Files: make([]*SSAReportFile, 0, len(r.File)),
+		Rules: make(map[string]*SSAReportRule),
+	}
+
+	// 创建风险哈希到风险对象的映射，便于后续查找
+	riskHashMap := make(map[string]*Risk)
+	for hash, risk := range r.Risks {
+		riskHashMap[hash] = risk
+	}
+
+	// 转换风险数据并统计
+	ssaReport.convertRisks(r.Risks)
+
+	// 转换文件数据，传递风险映射以便计算统计
+	ssaReport.convertFiles(r.File, riskHashMap)
+
+	// 转换规则数据
+	ssaReport.convertRules(r.Rules)
+
+	return ssaReport
+}
+
+// convertRisks 转换风险数据并进行统计
+func (ssr *SSAProjectReport) convertRisks(risks map[string]*Risk) {
+	ssr.TotalRisksCount = len(risks)
+
+	// 统计各等级风险数量
+	for _, risk := range risks {
+		ssaRisk := &SSAReportRisk{
+			Title:                risk.GetTitle(),
+			TitleVerbose:         risk.GetTitleVerbose(),
+			Description:          risk.GetDescription(),
+			Solution:             risk.GetSolution(),
+			RiskType:             risk.GetRiskType(),
+			Severity:             risk.GetSeverity(),
+			FromRule:             risk.GetRuleName(),
+			CodeSourceUrl:        risk.GetCodeSourceURL(),
+			CodeRange:            risk.GetCodeRange(),
+			Line:                 risk.GetLine(),
+			CodeFragment:         risk.GetCodeFragment(),
+			FunctionName:         risk.GetFunctionName(),
+			LatestDisposalStatus: risk.GetLatestDisposalStatus(),
+		}
+		ssr.Risks = append(ssr.Risks, ssaRisk)
+
+		// 统计各等级风险数量
+		switch risk.GetSeverity() {
+		case severityCritical:
+			ssr.CriticalRisksCount++
+		case severityHigh:
+			ssr.HighRisksCount++
+		case severityMiddle:
+			ssr.MiddleRisksCount++
+		case severityLow:
+			ssr.LowRisksCount++
+		}
+	}
+}
+
+// convertFiles 转换文件数据
+func (ssr *SSAProjectReport) convertFiles(files []*File, riskHashMap map[string]*Risk) {
+	for _, file := range files {
+		ssaFile := &SSAReportFile{
+			FilePath:  file.Path,
+			Language:  ssr.Language, // 使用报告的语言信息
+			LineCount: file.LineCount,
+			RiskCount: len(file.Risks),
+		}
+
+		// 根据文件关联的风险计算各等级数量
+		ssr.calculateFileRiskCounts(ssaFile, file.Risks, riskHashMap)
+		ssr.Files = append(ssr.Files, ssaFile)
+	}
+}
+
+// convertRules 转换规则数据
+func (ssr *SSAProjectReport) convertRules(rules []*Rule) {
+	for _, rule := range rules {
+		ssaRule := &SSAReportRule{
+			RuleName:    rule.RuleName,
+			Title:       rule.Title,
+			TitleZh:     rule.TitleZh,
+			Severity:    rule.Severity,
+			Description: rule.Description,
+			RiskCount:   len(rule.Risks),
+		}
+		ssr.Rules[rule.RuleName] = ssaRule
+	}
+}
+
+// calculateFileRiskCounts 计算文件中各等级风险的数量
+func (ssr *SSAProjectReport) calculateFileRiskCounts(ssaFile *SSAReportFile, riskHashes []string, riskHashMap map[string]*Risk) {
+	// 根据风险哈希找到对应的风险并统计各等级数量
+	for _, hash := range riskHashes {
+		if risk, exists := riskHashMap[hash]; exists {
+			switch risk.GetSeverity() {
+			case severityCritical:
+				ssaFile.CriticalCount++
+			case severityHigh:
+				ssaFile.HighCount++
+			case severityMiddle:
+				ssaFile.MiddleCount++
+			case severityLow:
+				ssaFile.LowCount++
+			}
+		}
+	}
+}

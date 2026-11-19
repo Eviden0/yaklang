@@ -1,0 +1,16 @@
+# Built engine binaries
+/yak-ssa
+/yak-ssa.exe
+/ssa-scan
+/ssa-scan.exe
+
+# Go build/test artifacts
+*.test
+*.out
+
+# Python closure-script cache
+__pycache__/
+scripts/closure/__pycache__/
+
+# Upstream sync scratch output
+/scripts/sync/conflicts/*.tmp

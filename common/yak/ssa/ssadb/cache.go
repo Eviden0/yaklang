@@ -1,0 +1,305 @@
+package ssadb
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/samber/lo"
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/bizhelper"
+	"golang.org/x/sync/singleflight"
+)
+
+const (
+	irCacheCapacity = 100000          // 10w
+	irCacheTTL      = 5 * time.Minute // 5 minute
+
+	// ProgramCacheCapacity = 20 // 20 programs
+	ProgramCacheTTL = 10 * time.Minute // 30 minute
+
+	irRelationCount = 5
+)
+
+var irTypeSingleFlight singleflight.Group
+var initIrTypeOnce = sync.Once{}
+var irTypeCaches *utils.CacheEx[*utils.CacheExWithKey[int64, *IrType]]
+
+var irCodeSingleFlight singleflight.Group
+var initIrCodeOnce = sync.Once{}
+var irCodeCaches *utils.CacheEx[*utils.CacheExWithKey[int64, *IrCode]]
+
+var programRowCacheMu sync.Mutex
+
+// A parent entry owns its child cache's two background workers. Dropping a
+// pointer alone leaves those workers (and their cached rows) alive indefinitely.
+func newProgramRowCache[T any]() *utils.CacheEx[*utils.CacheExWithKey[int64, T]] {
+	parent := utils.NewCacheEx[*utils.CacheExWithKey[int64, T]](utils.WithCacheTTL(ProgramCacheTTL))
+	parent.SetExpirationCallback(func(_ string, child *utils.CacheExWithKey[int64, T], _ utils.EvictionReason) {
+		if child != nil {
+			child.Close()
+		}
+	})
+	return parent
+}
+
+func getProgramRowCache[T any](parent *utils.CacheEx[*utils.CacheExWithKey[int64, T]], name string) *utils.CacheExWithKey[int64, T] {
+	if child, ok := parent.Get(name); ok {
+		return child
+	}
+	programRowCacheMu.Lock()
+	defer programRowCacheMu.Unlock()
+	if child, ok := parent.Get(name); ok {
+		return child
+	}
+	child := utils.NewCacheExWithKey[int64, T](utils.WithCacheCapacity(irCacheCapacity), utils.WithCacheTTL(irCacheTTL))
+	// GetOrLoad retains completed flight results separately from TTL entries;
+	// using it here would resurrect a closed child after parent eviction.
+	parent.Set(name, child)
+	return child
+}
+
+func GetIrTypeCache(progName string) *utils.CacheExWithKey[int64, *IrType] {
+	initIrTypeOnce.Do(func() {
+		irTypeCaches = newProgramRowCache[*IrType]()
+	})
+	return getProgramRowCache(irTypeCaches, progName)
+}
+
+func deleteCache(progName string) {
+	if irCodeCaches != nil {
+		irCodeCaches.Delete(progName)
+	}
+	if irTypeCaches != nil {
+		irTypeCaches.Delete(progName)
+	}
+}
+
+func GetIrCodeCache(progName string) *utils.CacheExWithKey[int64, *IrCode] {
+	initIrCodeOnce.Do(func() {
+		irCodeCaches = newProgramRowCache[*IrCode]()
+	})
+	return getProgramRowCache(irCodeCaches, progName)
+}
+
+func dbKey(programName string, id int64) string {
+	return fmt.Sprintf("%s_%d", programName, id)
+}
+
+func GetIrCodeById(db *gorm.DB, progName string, id int64) *IrCode {
+	if id == -1 {
+		return nil
+	}
+
+	cache := GetIrCodeCache(progName)
+
+	// 先检查缓存
+	if ir, ok := cache.Get(id); ok {
+		return ir
+	}
+
+	// 使用singleflight确保同时只有一个协程查询相同的key
+	key := dbKey(progName, id)
+	result, _, _ := irCodeSingleFlight.Do(key, func() (interface{}, error) {
+		// 再次检查缓存，防止在等待期间其他协程已经加载了数据
+		if ir, ok := cache.Get(id); ok {
+			return ir, nil
+		}
+
+		ctx := context.Background()
+		itemsToCache := make(map[int64]*IrCode)
+		var ret *IrCode
+
+		// These are reads only. The SSA SQLite connection uses
+		// _txlock=immediate for write transactions, so wrapping this cache
+		// prefetch in GormTransaction would reserve the sole SQLite writer
+		// slot until all neighboring instructions had been loaded.
+		idsToLoad := make(map[int64]struct{})
+		addID := func(id int64) {
+			if id < 0 {
+				return
+			}
+			if _, ok := cache.Get(id); ok {
+				return
+			}
+			if _, ok := idsToLoad[id]; ok {
+				return
+			}
+			idsToLoad[id] = struct{}{}
+		}
+
+		// Load the requested instruction before prefetching its neighbors.
+		ret = GetIrCodeItemById(db, progName, id)
+		if ret == nil {
+			return nil, nil
+		}
+		itemsToCache[ret.CodeID] = ret
+
+		// Load users and enclosing function/block.
+		for _, userId := range ret.Users {
+			addID(userId)
+		}
+		addID(ret.CurrentFunction)
+		addID(ret.CurrentBlock)
+
+		// Prefetch nearby IDs.
+		for i := int64(1); i < irRelationCount; i++ {
+			addID(id + i)
+			addID(id - i)
+		}
+
+		// Fetch outside a transaction so reads do not reserve the write slot.
+		ids := lo.MapToSlice(idsToLoad, func(key int64, _ struct{}) int64 { return key })
+		query := bizhelper.ExactQueryInt64ArrayOr(db, "code_id", ids).Where("program_name = ?", progName)
+		for ir := range bizhelper.YieldModel[*IrCode](ctx, query, bizhelper.WithYieldModel_Fast()) {
+			itemsToCache[ir.CodeID] = ir
+		}
+
+		// 更新缓存
+		for id, item := range itemsToCache {
+			cache.Set(id, item)
+		}
+
+		return ret, nil
+	})
+
+	if result == nil {
+		return nil
+	}
+	return result.(*IrCode)
+}
+
+// ExistsIrCodeById checks whether a row exists for (program_name, code_id) without loading the full payload.
+func ExistsIrCodeById(db *gorm.DB, progName string, id int64) bool {
+	if id <= 0 || db == nil || progName == "" {
+		return false
+	}
+	cache := GetIrCodeCache(progName)
+	if cache != nil {
+		if _, ok := cache.Get(id); ok {
+			return true
+		}
+	}
+	var count int64
+	if err := db.Model(&IrCode{}).
+		Where("program_name = ? AND code_id = ?", progName, id).
+		Limit(1).
+		Count(&count).Error; err != nil {
+		return false
+	}
+	return count > 0
+}
+
+// GetIrCodeByIdFast loads ir code without neighbor prefetch, useful for hot paths that only need extra info.
+func GetIrCodeByIdFast(db *gorm.DB, progName string, id int64) *IrCode {
+	if id == -1 {
+		return nil
+	}
+
+	cache := GetIrCodeCache(progName)
+	if ir, ok := cache.Get(id); ok {
+		return ir
+	}
+
+	key := dbKey(progName, id)
+	result, _, _ := irCodeSingleFlight.Do(key, func() (interface{}, error) {
+		if ir, ok := cache.Get(id); ok {
+			return ir, nil
+		}
+		ret := GetIrCodeItemById(db, progName, id)
+		if ret == nil {
+			return nil, nil
+		}
+		cache.Set(id, ret)
+		return ret, nil
+	})
+	if result == nil {
+		return nil
+	}
+	return result.(*IrCode)
+}
+
+// PreloadIrCodesByIdsFast loads ir codes by ids without neighbor prefetch.
+// It only fills the cache and returns nothing.
+func PreloadIrCodesByIdsFast(db *gorm.DB, progName string, ids []int64) {
+	if len(ids) == 0 {
+		return
+	}
+	cache := GetIrCodeCache(progName)
+	if cache == nil {
+		return
+	}
+	missing := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := cache.Get(id); ok {
+			continue
+		}
+		missing = append(missing, id)
+	}
+	if len(missing) == 0 {
+		return
+	}
+	// O2: use the parameterized native-SQL batch read (skips GORM's heavy
+	// Scope.Fields/DB.clone/search.clone/buildScanPlan chain — ~38GB cum on
+	// hadoop). On any native error, fall back to the GORM Find path so a DB
+	// error is never mistaken for an empty result.
+	irs, err := nativeGetIrCodesByIds(db, progName, missing)
+	if err != nil {
+		irs = nil
+		if gerr := db.Model(&IrCode{}).
+			Where("program_name = ?", progName).
+			Where("code_id in (?)", missing).
+			Find(&irs).Error; gerr != nil {
+			return
+		}
+	}
+	for _, ir := range irs {
+		cache.Set(ir.CodeID, ir)
+	}
+}
+
+func GetIrTypeById(db *gorm.DB, progName string, id int64) *IrType {
+	if id < 0 {
+		return nil
+	}
+
+	cache := GetIrTypeCache(progName)
+
+	// 先检查缓存
+	if ir, ok := cache.Get(id); ok {
+		return ir
+	}
+
+	// 使用 singleflight 确保并发场景下同一个 type 只查询一次
+	key := dbKey(progName, id)
+	result, _, _ := irTypeSingleFlight.Do(key, func() (interface{}, error) {
+		// 再次检查缓存，防止在等待期间其他协程已经加载了数据
+		if ir, ok := cache.Get(id); ok {
+			return ir, nil
+		}
+
+		// 只加载当前这个 type，而不再预取邻居，减少数据库压力
+		ret := GetIrTypeItemById(db, progName, id)
+		if ret == nil {
+			return nil, nil
+		}
+
+		cache.Set(id, ret)
+		return ret, nil
+	})
+
+	if result == nil {
+		return nil
+	}
+	return result.(*IrType)
+}

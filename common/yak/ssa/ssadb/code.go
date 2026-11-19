@@ -1,0 +1,318 @@
+package ssadb
+
+import (
+	"encoding/json"
+	"fmt"
+	"slices"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/memedit"
+
+	"github.com/yaklang/gorm"
+)
+
+type IrCode struct {
+	gorm.Model
+	CodeID int64 `json:"code_id" gorm:"index:idx_ircode_program_codeid;index"`
+
+	ProgramName string `json:"program_name" gorm:"index:idx_ircode_program_codeid;index:idx_ircode_program_opcode;index"`
+	Version     string `json:"package_version" gorm:"index"`
+
+	// source code
+	SourceCodeStartOffset int64  `json:"source_code_start_offset"`
+	SourceCodeEndOffset   int64  `json:"source_code_end_offset"`
+	SourceCodeHash        string `json:"source_code_hash"` // default md5
+
+	// opcode
+	Opcode     int64  `json:"opcode" gorm:"index:idx_ircode_program_opcode"`
+	OpcodeName string `json:"opcode_name"`
+
+	// just for binary and unary operator
+	OpcodeOperator string `json:"opcode_operator"`
+
+	// basic info
+	Name              string `json:"name"`
+	VerboseName       string `json:"verbose_name"`
+	ShortVerboseName  string `json:"short_verbose_name"`
+	String            string `json:"string" gorm:"type:text"`
+	ReadableName      string `json:"readable_name" gorm:"type:text"`
+	ReadableNameShort string `json:"readable_name_short"`
+	// any IrCode in one block inner one  function
+	CurrentBlock    int64 `json:"current_block"`
+	CurrentFunction int64 `json:"current_function"`
+
+	// FunctionDefs
+	IsFunction     bool       `json:"is_function"`
+	FormalArgs     Int64Slice `json:"formal_args" gorm:"type:text"`
+	FreeValues     Int64Slice `json:"free_values" gorm:"type:text"`
+	MemberCallArgs Int64Slice `json:"formal_member_call_args" gorm:"type:text"`
+
+	SideEffects      Int64Slice `json:"side_effects" gorm:"type:text"`
+	IsVariadic       bool       `json:"is_variadic"`
+	ReturnCodes      Int64Slice `json:"return_codes" gorm:"type:text"`
+	IsExternal       bool       `json:"is_external"`
+	CodeBlocks       Int64Slice `json:"code_blocks" gorm:"type:text"`
+	EnterBlock       int64      `json:"enter_block"`
+	ExitBlock        int64      `json:"exit_block"`
+	DeferBlock       int64      `json:"defer_block"`
+	ChildrenFunction Int64Slice `json:"children_function" gorm:"type:text"`
+	ParentFunction   int64      `json:"parent_function"`
+
+	// block
+	IsBlock   bool       `json:"is_block"`
+	PredBlock Int64Slice `json:"pred_block" gorm:"type:text"`
+	SuccBlock Int64Slice `json:"succ_block" gorm:"type:text"`
+	Phis      Int64Slice `json:"phis_in_block" gorm:"type:text"`
+
+	// Use-Def Chains Relation
+	HasDefs bool       `json:"has_defs"`
+	Users   Int64Slice `json:"users" gorm:"type:text"`
+	// Phi Chains Relation
+	Occulatation Int64Slice `json:"phis" gorm:"type:text"`
+
+	// OOP Supporting
+	IsObject bool
+	// ObjectMembers is legacy single-value storage kept only for backward reads.
+	ObjectMembers     Int64Map `json:"object_members" gorm:"type:text"`
+	ObjectMemberPairs Int64Map `json:"object_member_pairs" gorm:"type:text"`
+	IsObjectMember    bool
+	// ObjectParent/ObjectKey are legacy single-owner fields kept only for backward reads.
+	ObjectParent     int64    `json:"object_parent"`
+	ObjectKey        int64    `json:"object_key"`
+	ObjectOwnerPairs Int64Map `json:"object_owner_pairs" gorm:"type:text"`
+
+	// Maskable
+	MaskedCodes Int64Slice `json:"masked_codes" gorm:"type:text"`
+	IsMasked    bool       `json:"is_masked"`
+
+	// Variable
+	Variable StringSlice `json:"variable" gorm:"type:text"`
+
+	// compile hash means: hash[ (file-content)+(program-name)+(package-name)+(program-index) ]
+	ProgramCompileHash string `json:"program_compile_hash" gorm:"index"`
+
+	// type
+	TypeID int64 `json:"type_id"`
+
+	// reference
+	Point   int64      `json:"point" gorm:"type:text"`
+	Pointer Int64Slice `json:"pointer" gorm:"type:text"`
+
+	// not important information
+	ExtraInformation string `json:"extra_information" gorm:"type:text"`
+
+	ConstType string `json:"const_type" gorm:"index"`
+}
+
+func (*IrCode) TableName() string {
+	return TableIrCodes
+}
+
+func EmptyIrCode(progName string, id int64) *IrCode {
+	return &IrCode{
+		ProgramName: progName,
+		CodeID:      id,
+	}
+}
+
+func GetIrCodeItemById(db *gorm.DB, progName string, id int64) *IrCode {
+	if id == -1 {
+		return nil
+	}
+	// Native-SQL fast path: skips GORM's per-query chain (Scope.Fields /
+	// DB.clone / search.clone / buildScanPlan, ~45GB combined on hadoop).
+	// Results are identical to the GORM First() path (same column set,
+	// soft-delete semantics, custom scanners). Context timeout/cancel on the
+	// native path does not fall back to GORM (that would re-hang).
+	native, err := nativeGetIrCodeItemByIdErr(db, progName, id)
+	if native != nil {
+		return native
+	}
+	if nativeContextErr(err) {
+		return nil
+	}
+	// check cache
+	ir := &IrCode{}
+	if db := db.Model(&IrCode{}).
+		Where("code_id = ?", id).
+		Where("program_name = ?", progName).
+		First(ir); db.Error != nil {
+		return nil
+	}
+	return ir
+}
+
+func (ir *IrCode) Save(db *gorm.DB) error {
+	return db.Save(ir).Error
+}
+
+// UpsertIrCode writes one row. It shares the batched upsert path so a single
+// row is still one INSERT ... ON CONFLICT statement instead of a per-row
+// FirstOrCreate SELECT that PG can resolve via the wrong (program_name, opcode)
+// index on large tables (30ms+ scans).
+func UpsertIrCode(db *gorm.DB, ir *IrCode) error {
+	if db == nil || ir == nil {
+		return nil
+	}
+	return SaveIrCodeBatch(db, []*IrCode{ir})
+}
+
+// irCodeBatchChunk bounds rows per SaveInBatches chunk. IrCode is a wide
+// model; 500 matches saveIrCodeInsertBatchSize and stays under SQLite's
+// host-parameter ceiling.
+const irCodeBatchChunk = 500
+
+// SaveIrCodeBatch writes IR snapshots as batched in-place upserts on
+// (program_name, code_id) via gorm SaveInBatches (native upsert or DM MERGE).
+// Updating in place keeps row ids and their secondary-index entries
+// stable across the resident-cache flush, and a rejected statement cannot first
+// remove the previous snapshot. The batch still inserts rows that do not exist
+// yet, so one call both publishes new IR and refreshes changed IR.
+// ux_ir_codes_program_code is created with the schema; SaveInBatches skips nil
+// elements itself and owns one transaction unless a caller supplied one.
+func SaveIrCodeBatch(db *gorm.DB, items []*IrCode) error {
+	if db == nil || len(items) == 0 {
+		return nil
+	}
+	if err := db.New().SaveInBatches(items, irCodeBatchChunk, "program_name", "code_id").Error; err != nil {
+		return fmt.Errorf("upsert IR snapshot: %w", err)
+	}
+	return nil
+}
+
+var hash = []string{
+	"", // empty string
+	"d41d8cd98f00b204e9800998ecf8427e",
+	"da39a3ee5e6b4b0d3255bfef95601890afd80709",
+	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	"/", // /
+	"6666cd76f96956469e7be39d750cc7d9",
+	"42099b4af021e53fd8fd4e056c2568d7c2e3ffa8",
+	"8a5edab282632443219e051e4ade2d1d5bbc671c781051bf1437897cbdfea0f1",
+}
+
+func (r *IrCode) IsEmptySourceCodeHash() bool {
+	if r == nil {
+		return true
+	}
+	if r.SourceCodeHash == "" {
+		return true
+	}
+	if slices.Contains(hash, r.SourceCodeHash) {
+		return true
+	}
+	return false
+}
+
+func (r *IrCode) GetIdInt64() int64 {
+	return int64(r.CodeID)
+}
+
+func (r *IrCode) GetIdInt() int {
+	return int(r.CodeID)
+}
+
+func (r *IrCode) SetExtraInfo(params map[string]any) {
+	results, err := json.Marshal(params)
+	if err != nil {
+		log.Warnf("BUG: cannot fetch instruction's extra info: %v, origin: %s", err, spew.Sdump(params))
+	}
+	r.ExtraInformation = string(results)
+}
+
+func (r *IrCode) GetExtraInfo() map[string]any {
+	results := make(map[string]any)
+	if r.ExtraInformation == "" {
+		return results
+	}
+	if err := json.Unmarshal([]byte(r.ExtraInformation), &results); err != nil {
+		log.Warnf("BUG: cannot fetch instruction's extra info: %v, origin: %v", err, r.ExtraInformation)
+	}
+	return results
+}
+
+func (r *IrCode) GetStartAndEndPositions() (*memedit.MemEditor, *memedit.Position, *memedit.Position, error) {
+	// instruction2IrCode/fitRange leave the entire tuple empty for IR which
+	// has no source range (e.g. synthetic constants, functions and blocks).
+	// That is an absent optional range, not a failed source lookup. A partial
+	// tuple must still be diagnosed rather than silently discarded.
+	if r.SourceCodeHash == "" && r.SourceCodeStartOffset == 0 && r.SourceCodeEndOffset == 0 {
+		return nil, nil, nil, ErrSourceRangeAbsent
+	}
+	// Undefined and extern values often have no backing source file.
+	isUndefinedOrExtern := (r.OpcodeName == "Undefined" || r.OpcodeName == "ExternLib") || r.IsExternal
+
+	editor, err := GetEditorByHash(r.SourceCodeHash)
+	if err != nil {
+		if isUndefinedOrExtern {
+			log.Debugf("GetStartAndEndPositions: source code not found for external/undefined value (opcode=%s, name=%s, hash=%s)",
+				r.OpcodeName, r.Name, r.SourceCodeHash)
+			return nil, nil, nil, ErrSourceRangeAbsent
+		}
+		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions failed: %v", err)
+	}
+	startOff, endOff := memedit.ClampOffsetPair(editor, int(r.SourceCodeStartOffset), int(r.SourceCodeEndOffset))
+	start, startErr := editor.GetPositionByOffsetWithError(startOff)
+	if startErr != nil {
+		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions start: %v", startErr)
+	}
+	end, endErr := editor.GetPositionByOffsetWithError(endOff)
+	if endErr != nil {
+		return nil, nil, nil, utils.Errorf("GetStartAndEndPositions end: %v", endErr)
+	}
+	if start == nil || end == nil {
+		return nil, nil, nil, ErrSourceRangeAbsent
+	}
+	return editor, start, end, nil
+}
+
+func (r *IrCode) GetSourceCode() string {
+	if r.IsEmptySourceCodeHash() {
+		return ""
+	}
+	editor, err := GetEditorByHash(r.SourceCodeHash)
+	if err != nil {
+		log.Warnf("GetSourceCode failed: %v", err)
+		return ""
+	}
+	codeRange := memedit.NewRangeFromOffsets(editor, int(r.SourceCodeStartOffset), int(r.SourceCodeEndOffset))
+	if codeRange == nil {
+		return ""
+	}
+	return editor.GetWordTextFromRange(codeRange)
+}
+
+func (r *IrCode) GetSourceCodeContext(n int) string {
+	editor, start, end, err := r.GetStartAndEndPositions()
+	if err != nil || editor == nil || start == nil || end == nil {
+		if err != nil {
+			log.Warnf("GetSourceCodeContext failed: %v", err)
+		}
+		return ""
+	}
+	result, err := editor.GetContextAroundRange(start, end, n)
+	if err != nil {
+		log.Warnf("editor.GetContextAroundRange(start, end, %v) failed: %v", n, err)
+		return ""
+	}
+	return result
+}
+
+func DeleteIrCode(DB *gorm.DB, id ...int64) error {
+	// log.Errorf("DeleteIrType: %d", len(id))
+	if len(id) == 0 {
+		return utils.Errorf("delete type from database id is empty")
+	}
+	return utils.GormTransaction(DB, func(tx *gorm.DB) error {
+		// split each 999
+		for i := 0; i < len(id); i += 999 {
+			end := i + 999
+			if end > len(id) {
+				end = len(id)
+			}
+			tx.Where("id IN (?)", id[i:end]).Unscoped().Delete(&IrCode{})
+		}
+		return nil
+	})
+}

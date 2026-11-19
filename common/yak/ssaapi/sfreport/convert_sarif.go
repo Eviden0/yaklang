@@ -1,0 +1,842 @@
+package sfreport
+
+import (
+	"bytes"
+	"io"
+	"path"
+	"strings"
+
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/sarif"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/memedit"
+	"github.com/yaklang/yaklang/common/yak/ssaapi"
+	"github.com/yaklang/yaklang/common/yak/yaklib/codec"
+)
+
+const (
+	// SarifDriverName identifies the scanning tool to GitHub code scanning.
+	// It stays stable across runs and versions: GitHub groups alerts by
+	// (tool name, category), so renaming it would orphan every existing alert.
+	SarifDriverName = "yaklang-code-scan"
+	// SarifDriverFullName is the human readable tool name.
+	SarifDriverFullName = "Yaklang SyntaxFlow Static Analysis"
+	// SarifDriverOrganization is the vendor shown in the GitHub UI.
+	SarifDriverOrganization = "yaklang.io"
+	// SarifInformationURI points at the tool homepage.
+	SarifInformationURI = "https://github.com/yaklang/yaklang"
+	// SarifFingerprintKey is the partial fingerprint name used to keep a
+	// finding matched to the same alert when a file moves or lines shift.
+	SarifFingerprintKey = "yaklangRiskFeatureHash"
+	// SarifRunAutomationID is the analysis category for every yak upload, and it
+	// matches the workflow's `category:`. The trailing slash is required: the id
+	// is parsed as "category/run-id", so a slash-less id leaves it empty.
+	SarifRunAutomationID = "yaklang-diff-code-check/"
+)
+
+// sarifResultKind is the SARIF "kind" for every finding.
+//
+// SARIF only allows a fixed enum here (notApplicable/pass/fail/review/open/
+// informational). yak's risk_type (command-injection, xss, ...) is *not*
+// valid and made the whole document schema-invalid, so GitHub rejected the
+// upload. A reported finding is a failure of the check, so we always emit
+// "fail"; the category travels in the rule tags instead.
+const sarifResultKind = "fail"
+
+// sarifSecuritySeverity maps a yak severity to the CVSS-like score GitHub
+// reads from properties["security-severity"] to label an alert
+// (critical/high/medium/low). Without it GitHub falls back to the SARIF level
+// and every finding renders as an undifferentiated warning.
+var sarifSecuritySeverity = map[schema.SyntaxFlowSeverity]string{
+	schema.SFR_SEVERITY_CRITICAL: "9.5",
+	schema.SFR_SEVERITY_HIGH:     "8.0",
+	schema.SFR_SEVERITY_WARNING:  "5.0",
+	schema.SFR_SEVERITY_LOW:      "2.0",
+	schema.SFR_SEVERITY_INFO:     "1.0",
+}
+
+// SarifReport accumulates findings and keeps the SARIF document it will emit
+// up to date as they stream in.
+//
+// The struct is serializable at any point, so a save taken mid-scan (one per
+// product stage, see ScanProject) is a complete, valid document describing
+// everything found so far. That is what makes a later stage failing harmless:
+// the artifact already holds the findings of the stages that finished.
+type SarifReport struct {
+	report *sarif.Report
+	writer io.Writer
+
+	root *SarifContext
+	// run is the single run every finding is merged into. GitHub refuses a
+	// document whose runs share one tool name, which is what a run per rule
+	// used to produce.
+	run *sarif.Run
+	// driver is run.Tool.Driver, kept for O(1) rule registration.
+	driver   *sarif.ToolComponent
+	ruleByID map[string]struct{}
+	// sarifResultByFeature is the index of an appended sarif.Result, keyed by
+	// the risk feature hash (the SARIF fingerprint). A later mode replaces that
+	// result instead of reporting the finding twice.
+	sarifResultByFeature map[string]int
+	// sinceFlush counts findings appended since the last snapshot, so a long
+	// scan publishes intermediate documents instead of only the final one.
+	sinceFlush int
+	// flusher writes intermediate snapshots in the background; a final Save()
+	// drains and stops it.
+	flusher *reportFlusher
+}
+
+// SarifContext accumulates the SARIF entities one result contributes (files,
+// locations, data-flow steps) while sharing a single artifact table with the
+// root context so several results reference the same artifact index.
+type SarifContext struct {
+	root *SarifContext
+
+	// sha256 -> index
+	_artifacts      []*sarif.Artifact
+	_ArtifactsTable map[string]int
+
+	// context for result
+	locations []*sarif.Location
+	codeFlows []*sarif.CodeFlow
+
+	//TODO: only mark cross function path
+	stack []*sarif.Stack
+}
+
+func (r *SarifReport) SetWriter(writer io.Writer) error {
+	if writer == nil {
+		return utils.Errorf("writer is nil")
+	}
+	r.writer = writer
+	return nil
+}
+
+func (r *SarifReport) AddSyntaxFlowRisks(risks ...*schema.SSARisk) {
+	log.Errorf("The sarif format cannot specify only a single risk for generation")
+}
+
+func NewSarifReport() (*SarifReport, error) {
+	sarifReport, err := sarif.New(sarif.Version210)
+	if err != nil {
+		log.Errorf("create sarif.New Report failed: %s", err)
+		return nil, err
+	}
+
+	driver := sarif.NewDriver(SarifDriverName).
+		WithFullName(SarifDriverFullName).
+		WithOrganization(SarifDriverOrganization).
+		WithInformationURI(SarifInformationURI).
+		WithVersion(consts.GetYakVersion())
+	run := sarif.NewRun(*sarif.NewTool(driver))
+	run.WithAutomationDetails(sarif.NewRunAutomationDetails().WithID(SarifRunAutomationID))
+	sarifReport.Runs = []*sarif.Run{run}
+
+	return &SarifReport{
+		report:   sarifReport,
+		root:     NewSarifContext(),
+		run:      run,
+		driver:   driver,
+		ruleByID: map[string]struct{}{},
+	}, nil
+}
+
+var _ IReport = (*SarifReport)(nil)
+
+// AddSyntaxFlowResult folds one SyntaxFlow result (one rule) into the run and
+// leaves the report ready to be serialized.
+func (r *SarifReport) AddSyntaxFlowResult(result *ssaapi.SyntaxFlowResult) bool {
+	if r == nil || result == nil {
+		return false
+	}
+	before := len(r.run.Results)
+	r.appendResult(result)
+	// New findings can bring new artifacts (files) with them.
+	r.run.Artifacts = r.root.Artifacts()
+	return len(r.run.Results) > before
+}
+
+// Save writes the current document.
+//
+// It runs at every stage boundary and once more when the whole pipeline is
+// done, and each call replaces the previous output rather than appending to
+// it. The struct is already current, so this is a plain encode of the
+// accumulated state.
+func (r *SarifReport) Save() error {
+	if r == nil {
+		return utils.Errorf("report is nil")
+	}
+	if r.writer == nil {
+		return nil
+	}
+	// A pending background snapshot would race this final document.
+	if flusher := r.currentFlusher(); flusher != nil {
+		flusher.stopAndWait()
+	}
+	var buf bytes.Buffer
+	if err := r.report.PrettyWrite(&buf); err != nil {
+		return err
+	}
+	// A file destination is replaced atomically; other destinations are rewound.
+	return writeReportSnapshot(r.writer, buf.Bytes())
+}
+
+// Report exposes the accumulated document for callers that want to serialize
+// or inspect it directly. It is always a valid SARIF 2.1.0 log.
+func (r *SarifReport) Report() *sarif.Report {
+	if r == nil {
+		return nil
+	}
+	return r.report
+}
+
+func (r *SarifReport) appendResult(result *ssaapi.SyntaxFlowResult) {
+	SFRule := result.GetRule()
+	ruleID := sarifRuleID(SFRule)
+	added := 0
+
+	for risk := range result.YieldRisk() {
+		value, err := result.GetValue(risk.Variable, int(risk.Index))
+		if err != nil {
+			log.Errorf("get value from result failed: resultId[%d: %s: %d] %s", result.GetResultID(), risk.Variable, risk.Index, err)
+			continue
+		}
+
+		sctx := r.root.CreateSubSarifContext()
+		sctx.AddSSAValue(value)
+
+		res := sarif.NewRuleResult(ruleID).
+			WithMessage(sarif.NewTextMessage(sarifRiskMessage(risk))).
+			WithLevel(ToSarifLevel(risk.Severity)).
+			WithKind(sarifResultKind).
+			WithPartialFingerPrints(sarifFingerprint(risk))
+
+		if rg := value.GetRange(); rg != nil && rg.GetEditor() != nil {
+			artifactId := r.root.GetArtifactIdFromEditor(rg.GetEditor())
+			if artifactId >= 0 {
+				if loc := r.root.CreateLocation(artifactId, rg); loc != nil {
+					res.WithLocations([]*sarif.Location{loc})
+				}
+			}
+		}
+
+		if len(sctx.codeFlows) > 0 {
+			res.WithCodeFlows(sctx.codeFlows)
+		}
+
+		r.registerRule(ruleID, SFRule, risk)
+		r.rememberSarifResult(risk)
+		r.run.Results = append(r.run.Results, res)
+		added++
+	}
+	r.noteFlush(added)
+}
+
+// noteFlush publishes an intermediate document once enough findings piled up.
+func (r *SarifReport) noteFlush(added int) {
+	if r == nil || added <= 0 {
+		return
+	}
+	r.sinceFlush += added
+	if reportFlushEvery <= 0 || r.sinceFlush < reportFlushEvery {
+		return
+	}
+	r.sinceFlush = 0
+	if r.writer == nil {
+		return
+	}
+	var buf bytes.Buffer
+	if err := r.report.PrettyWrite(&buf); err != nil {
+		log.Errorf("serialize sarif snapshot failed: %v", err)
+		return
+	}
+	r.flusherFor().submit(buf.Bytes())
+}
+
+// flusherFor returns the background writer of this report, creating it on
+// first use.
+func (r *SarifReport) flusherFor() *reportFlusher {
+	if r.flusher == nil {
+		r.flusher = newReportFlusher(r.writer)
+	}
+	return r.flusher
+}
+
+// currentFlusher returns the background writer without creating one.
+func (r *SarifReport) currentFlusher() *reportFlusher {
+	if r == nil {
+		return nil
+	}
+	return r.flusher
+}
+
+// rememberSarifResult records the slot a sarif.Result will occupy. Call it
+// immediately before appending that result.
+func (r *SarifReport) rememberSarifResult(risk *schema.SSARisk) {
+	if r == nil || risk == nil || r.run == nil {
+		return
+	}
+	key := sarifFeatureKey(risk)
+	if key == "" {
+		return
+	}
+	if r.sarifResultByFeature == nil {
+		r.sarifResultByFeature = map[string]int{}
+	}
+	r.sarifResultByFeature[key] = len(r.run.Results)
+}
+
+func sarifFeatureKey(risk *schema.SSARisk) string {
+	if risk == nil {
+		return ""
+	}
+	key := strings.TrimSpace(risk.RiskFeatureHash)
+	if key == "" {
+		key = strings.TrimSpace(risk.Hash)
+	}
+	return key
+}
+
+// ApplyRiskUpdate applies one decision. Create and update record the alert
+// and drop OldHash when the item names one. Delete only drops that alert.
+func (r *SarifReport) ApplyRiskUpdate(item schema.RiskUpdateItem) error {
+	if r == nil {
+		return nil
+	}
+	switch item.Mode {
+	case schema.RiskUpdateDelete:
+		r.removeSarifResult(strings.TrimSpace(item.OldHash))
+	case schema.RiskUpdateCreate, schema.RiskUpdateUpdate:
+		if item.OldHash != "" {
+			feature := sarifFeatureKey(item.Risk)
+			if feature == "" {
+				feature = strings.TrimSpace(item.OldHash)
+			}
+			r.removeSarifResult(feature)
+		}
+		r.appendRisk(item.Risk)
+	}
+	return nil
+}
+
+// appendRisk adds one alert from the risk itself. The scan does not hand over
+// the syntaxflow result, so there is no value to walk for a code flow.
+func (r *SarifReport) appendRisk(risk *schema.SSARisk) {
+	if r == nil || risk == nil || r.run == nil {
+		return
+	}
+	ruleName := riskRuleName(risk)
+	rule := &schema.SyntaxFlowRule{
+		RuleName:    ruleName,
+		Title:       risk.Title,
+		Severity:    risk.Severity,
+		Description: risk.Description,
+		Solution:    risk.Solution,
+	}
+	ruleID := sarifRuleID(rule)
+	res := sarif.NewRuleResult(ruleID).
+		WithMessage(sarif.NewTextMessage(sarifRiskMessage(risk))).
+		WithLevel(ToSarifLevel(risk.Severity)).
+		WithKind(sarifResultKind).
+		WithPartialFingerPrints(sarifFingerprint(risk))
+	if loc := locationFromRisk(risk); loc != nil {
+		res.WithLocations([]*sarif.Location{loc})
+	}
+	r.registerRule(ruleID, rule, risk)
+	r.rememberSarifResult(risk)
+	r.run.Results = append(r.run.Results, res)
+	r.noteFlush(1)
+}
+
+// locationFromRisk builds a physical location from the risk's file and line.
+// A risk without either still becomes an alert; it just has no region.
+func locationFromRisk(risk *schema.SSARisk) *sarif.Location {
+	if risk == nil {
+		return nil
+	}
+	uri := strings.TrimSpace(risk.CodeSourceUrl)
+	if uri == "" || risk.Line <= 0 {
+		return nil
+	}
+	return sarif.NewLocation().WithPhysicalLocation(
+		sarif.NewPhysicalLocation().
+			WithArtifactLocation(sarif.NewArtifactLocation().WithUri(uri)).
+			WithRegion(sarif.NewRegion().WithStartLine(int(risk.Line))),
+	)
+}
+
+// removeSarifResult drops the alert of a covered finding. The index is the
+// feature hash, which is also the SARIF fingerprint.
+func (r *SarifReport) removeSarifResult(feature string) {
+	feature = strings.TrimSpace(feature)
+	if feature == "" || r == nil || r.run == nil || r.sarifResultByFeature == nil {
+		return
+	}
+	idx, ok := r.sarifResultByFeature[feature]
+	delete(r.sarifResultByFeature, feature)
+	if !ok || idx < 0 || idx >= len(r.run.Results) {
+		return
+	}
+	last := len(r.run.Results) - 1
+	if idx != last {
+		moved := r.run.Results[last]
+		r.run.Results[idx] = moved
+		if key := sarifResultFeature(moved); key != "" {
+			r.sarifResultByFeature[key] = idx
+		}
+	}
+	r.run.Results = r.run.Results[:last]
+}
+
+func sarifResultFeature(res *sarif.Result) string {
+	if res == nil || res.PartialFingerprints == nil {
+		return ""
+	}
+	fp, ok := res.PartialFingerprints[SarifFingerprintKey]
+	if !ok {
+		return ""
+	}
+	text, _ := fp.(string)
+	return text
+}
+
+// registerRule appends the result rule to the driver once per rule ID.
+func (r *SarifReport) registerRule(ruleID string, rule *schema.SyntaxFlowRule, risk *schema.SSARisk) {
+	if _, ok := r.ruleByID[ruleID]; ok {
+		return
+	}
+
+	title := strings.TrimSpace(rule.Title)
+	if title == "" {
+		title = rule.RuleName
+	}
+	if title == "" {
+		title = ruleID
+	}
+
+	// shortDescription is the alert's one-line summary and is shown literally:
+	// GitHub only renders markdown that arrives in a `markdown` field, so a rule
+	// description placed here is printed as raw "### ..." text. Keep it plain
+	// and short; the description goes to fullDescription/help below.
+	descriptor := sarif.NewRule(ruleID).
+		WithName(title).
+		WithShortDescription(sarif.NewMultiformatMessageString(title)).
+		WithDefaultConfiguration(
+			sarif.NewReportingConfiguration().WithLevel(ToSarifLevel(risk.Severity)),
+		).
+		WithProperties(sarif.Properties{
+			"tags":              sarifRuleTags(rule, risk),
+			"security-severity": sarifSecuritySeverityFor(risk.Severity),
+		})
+
+	// The rule body is markdown. Put it in `markdown`, keeping `text` as a
+	// required plain-text fallback; GitHub renders the markdown on the alert
+	// page instead of dumping the source.
+	description := strings.TrimSpace(rule.Description)
+	if description != "" {
+		descriptor = descriptor.WithFullDescription(ruleMarkdownMessage(title, description))
+	}
+	// `help` is the remediation panel, so it carries the description plus the
+	// rule's solution when one is defined.
+	if help := ruleHelpMarkdown(description, rule.Solution); help != "" {
+		descriptor = descriptor.WithHelp(ruleMarkdownMessage(title, help))
+	}
+	if rule.RuleName != "" {
+		descriptor = descriptor.WithHelpURI(SarifInformationURI)
+	}
+
+	r.ruleByID[ruleID] = struct{}{}
+	r.driver.Rules = append(r.driver.Rules, descriptor)
+}
+
+// ruleMarkdownMessage builds a message whose markdown is rendered by GitHub.
+//
+// SARIF requires the plain-text `text` field, but GitHub displays `text`
+// literally and only renders `markdown`. Rule descriptions in yak are markdown,
+// so they are carried in `markdown` with the short title as the text fallback —
+// otherwise the alert page shows the raw source, e.g. a literal "### 漏洞描述".
+func ruleMarkdownMessage(fallback, markdown string) *sarif.MultiformatMessageString {
+	message := sarif.NewMultiformatMessageString(fallback)
+	if strings.TrimSpace(markdown) != "" {
+		message = message.WithMarkdown(markdown)
+	}
+	return message
+}
+
+// ruleHelpMarkdown joins the rule description with its remediation advice.
+func ruleHelpMarkdown(description, solution string) string {
+	parts := make([]string, 0, 2)
+	if text := strings.TrimSpace(description); text != "" {
+		parts = append(parts, text)
+	}
+	if fix := strings.TrimSpace(solution); fix != "" {
+		parts = append(parts, fix)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// sarifRuleID is the identifier GitHub matches alerts by, so it must not change
+// when a rule is edited. A content-derived id re-keys every finding whenever the
+// rule text changes — including its markdown description — which surfaces as
+// duplicate alerts and duplicate pull request comments. Rules carry a stable
+// `rule_id`; the rule name and, for ad-hoc rules declaring neither, a content
+// hash are the fallbacks.
+func sarifRuleID(rule *schema.SyntaxFlowRule) string {
+	if id := strings.TrimSpace(rule.RuleId); id != "" {
+		return id
+	}
+	if name := strings.TrimSpace(rule.RuleName); name != "" {
+		return name
+	}
+	return codec.Sha256(rule.Content)
+}
+
+func sarifSecuritySeverityFor(severity schema.SyntaxFlowSeverity) string {
+	if score, ok := sarifSecuritySeverity[severity]; ok {
+		return score
+	}
+	return "5.0"
+}
+
+// sarifRuleTags mirrors what the previous report path attached: a plain
+// "security" tag plus the rule identity. GitHub's SARIF parser rejects tags
+// that are not strings, so every entry is coerced.
+func sarifRuleTags(rule *schema.SyntaxFlowRule, risk *schema.SSARisk) []string {
+	seen := map[string]struct{}{}
+	tags := make([]string, 0, 4)
+	add := func(raw string) {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		tags = append(tags, value)
+	}
+
+	add("security")
+	add(rule.RuleName)
+	add(rule.Tag)
+	if risk != nil {
+		add(risk.RiskType)
+	}
+	return tags
+}
+
+// sarifFingerprint gives GitHub a stable identity for a finding so re-running
+// the scan updates the existing alert instead of opening a new one when the
+// line number shifts. RiskFeatureHash is derived from the function, rule and
+// variable rather than the position, which is exactly the intent here.
+func sarifFingerprint(risk *schema.SSARisk) map[string]interface{} {
+	value := strings.TrimSpace(risk.RiskFeatureHash)
+	if value == "" {
+		value = strings.TrimSpace(risk.Hash)
+	}
+	if value == "" {
+		return nil
+	}
+	return map[string]interface{}{SarifFingerprintKey: value}
+}
+
+// sarifRiskMessage builds a one-line title so the GitHub alert list stays
+// readable; the long description stays in the rule metadata.
+func sarifRiskMessage(risk *schema.SSARisk) string {
+	title := strings.TrimSpace(risk.TitleVerbose)
+	if title == "" {
+		title = strings.TrimSpace(risk.Title)
+	}
+	if title == "" {
+		title = risk.RiskType
+	}
+	if title == "" {
+		title = "SyntaxFlow risk"
+	}
+	parts := []string{title}
+	if rule := strings.TrimSpace(risk.FromRule); rule != "" {
+		parts = append(parts, "rule: "+rule)
+	}
+	if fn := strings.TrimSpace(risk.FunctionName); fn != "" {
+		parts = append(parts, "function: "+fn)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func (s *SarifContext) CreateSubSarifContext() *SarifContext {
+	return &SarifContext{
+		root: s,
+	}
+}
+
+func (s *SarifContext) ArtifactsExisted(hash string) (int, bool) {
+	if s.root == nil {
+		if id, ok := s._ArtifactsTable[hash]; ok {
+			return id, true
+		}
+		id := len(s._artifacts)
+		s._ArtifactsTable[hash] = id
+		return id, false
+	}
+	return s.root.ArtifactsExisted(hash)
+}
+
+func (s *SarifContext) appendArtifacts(art *sarif.Artifact) {
+	if s.root == nil {
+		s._artifacts = append(s._artifacts, art)
+		return
+	}
+	s.root.appendArtifacts(art)
+}
+
+// Artifacts exposes the collected artifacts for the merged run.
+func (s *SarifContext) Artifacts() []*sarif.Artifact {
+	if s == nil {
+		return nil
+	}
+	if s.root != nil {
+		return s.root.Artifacts()
+	}
+	return s._artifacts
+}
+
+func NewSarifContext() *SarifContext {
+	return &SarifContext{
+		root:            nil,
+		_ArtifactsTable: make(map[string]int),
+	}
+}
+
+func (s *SarifContext) AddSSAValue(v *ssaapi.Value) {
+	rg := v.GetRange()
+	editor := rg.GetEditor()
+	if editor == nil {
+		log.Warn("editor is nil (nil editor value cannot be treated as sarif.CodeFlow)")
+		return
+	}
+
+	artifactId := s.GetArtifactIdFromEditor(editor)
+	if artifactId < 0 {
+		log.Warn("artifactId < 0 (invalid artifactId value cannot be treated as sarif.CodeFlow)")
+		return
+	}
+	s.CreateCodeFlowsFromPredecessor(v)
+}
+
+func (s *SarifContext) createCodeFlowsFromPredecessor(v *ssaapi.Value) {
+	// Create a new thread flow for this path
+	threadFlow := sarif.NewThreadFlow()
+	threadFlows := []*sarif.ThreadFlowLocation{}
+	visited := make(map[*ssaapi.Value]bool)
+	visitedAuditNodes := make(map[uint]bool)
+
+	// Function to add a value to the thread flow
+	addValueToFlow := func(val *ssaapi.Value) bool {
+		if val == nil {
+			return false
+		}
+		// DB reloads (including temporary values and expired cache entries)
+		// can return a new wrapper for the same node. Pointer identity alone
+		// revisits shared subgraphs and fails to terminate persisted cycles.
+		if id := val.GetAuditNodeId(); id != 0 {
+			if visitedAuditNodes[id] {
+				return false
+			}
+			visitedAuditNodes[id] = true
+		} else {
+			if visited[val] {
+				return false
+			}
+			visited[val] = true
+		}
+
+		rg := val.GetRange()
+		if rg == nil || rg.GetEditor() == nil {
+			return false
+		}
+
+		artid := s.GetArtifactIdFromEditor(rg.GetEditor())
+		if artid < 0 {
+			return false
+		}
+
+		loc := s.CreateLocation(artid, rg)
+		if loc == nil {
+			return false
+		}
+		loc.WithMessage(sarif.NewTextMessage(rg.GetText()))
+
+		// Create thread flow threadFlow
+		threadFlowLocation := sarif.NewThreadFlowLocation().
+			WithLocation(loc)
+
+		// Add importance based on whether it's the target value
+		if val == v {
+			threadFlowLocation.WithImportance("essential")
+		} else {
+			threadFlowLocation.WithImportance("important")
+		}
+
+		threadFlows = append(threadFlows, threadFlowLocation)
+		return true
+	}
+
+	// Add the current value to the flow
+	if !addValueToFlow(v) {
+		return
+	}
+
+	// Process predecessors
+	var processNeighbors func(val *ssaapi.Value)
+	processNeighbors = func(val *ssaapi.Value) {
+		// Process direct predecessors
+		//TODO: fix this dataflow path
+		for _, pred := range val.GetPredecessors() {
+			if pred.Node != nil && addValueToFlow(pred.Node) {
+				processNeighbors(pred.Node)
+			}
+		}
+	}
+
+	// Start processing from the current value
+	processNeighbors(v)
+
+	// Only create a code flow if we have more than one location
+	if len(threadFlows) > 1 {
+		threadFlow.WithLocations(threadFlows)
+		codeFlow := sarif.NewCodeFlow().WithThreadFlows([]*sarif.ThreadFlow{threadFlow})
+		s.codeFlows = append(s.codeFlows, codeFlow)
+	}
+}
+
+func (s *SarifContext) CreateCodeFlowsFromPredecessor(v *ssaapi.Value) {
+	s.createCodeFlowsFromPredecessor(v)
+}
+
+func (s *SarifContext) CreateLocation(artifactId int, rg *memedit.Range) *sarif.Location {
+	al := sarif.NewArtifactLocation().WithIndex(artifactId)
+	// Include the URI directly in the result location so SARIF viewers
+	// (VS Code, GitHub, etc.) can resolve the file without looking up the
+	// run.artifacts array by index. Many viewers do not resolve index refs.
+	if editor := rg.GetEditor(); editor != nil {
+		if uri := sarifArtifactURI(editor); uri != "" {
+			al = al.WithUri(uri)
+		}
+	}
+	return sarif.NewLocation().
+		WithPhysicalLocation(
+			sarif.NewPhysicalLocation().WithArtifactLocation(al).WithRegion(
+				sarif.NewRegion().
+					WithStartLine(rg.GetStart().GetLine()).
+					WithStartColumn(rg.GetStart().GetColumn()).
+					WithEndLine(rg.GetEnd().GetLine()).
+					WithEndColumn(rg.GetEnd().GetColumn()),
+			),
+		)
+}
+
+func (s *SarifContext) GetArtifactIdFromEditor(editor *memedit.MemEditor) int {
+	if editor == nil {
+		return -1
+	}
+	hash := editor.SourceCodeSha256()
+	id, ok := s.ArtifactsExisted(hash)
+	if ok {
+		return id
+	}
+
+	url := sarifArtifactURI(editor)
+	if url == "" {
+		log.Warn("editor file path is empty, it will cause some problems will open in some sarif viewer")
+	}
+	sourceCode := editor.GetSourceCode()
+	art := sarif.NewArtifact().WithLength(len(sourceCode)).WithLocation(
+		sarif.NewArtifactLocation().WithUri(url).WithIndex(id),
+	).WithContents(
+		sarif.NewArtifactContent().WithText(sourceCode),
+	).WithHashes(map[string]string{
+		"sha256": hash,
+		"md5":    editor.SourceCodeMd5(),
+		"sha1":   editor.SourceCodeSha1(),
+	})
+	s.appendArtifacts(art)
+	return id
+}
+
+// sarifArtifactURI returns the repository-relative path GitHub needs to place
+// an annotation on a file.
+//
+// memedit's GetFilename() is only the basename ("main.go") and GetUrl()
+// prefixes the scan's virtual root ("/fs.zip(2025-0923-11:47)/sub/deep/x.go").
+// Neither resolves to a path in the repository, so GitHub silently dropped
+// every alert. GetFilePath() yields "/<folder>/<name>", which after trimming
+// the leading slash is exactly the repo-relative form.
+func sarifArtifactURI(editor *memedit.MemEditor) string {
+	if editor == nil {
+		return ""
+	}
+	uri := strings.TrimSpace(editor.GetFilePath())
+	if uri == "" {
+		uri = strings.TrimSpace(editor.GetUrl())
+	}
+	if uri == "" {
+		uri = strings.TrimSpace(editor.GetFilename())
+	}
+	return normalizeSarifURI(uri)
+}
+
+// normalizeSarifURI strips the scan's virtual program root and any leading
+// slash so the URI is relative to the repository root, and makes it a valid
+// URI reference by escaping spaces and backslashes.
+func normalizeSarifURI(raw string) string {
+	uri := strings.ReplaceAll(strings.TrimSpace(raw), "\\", "/")
+	if uri == "" {
+		return ""
+	}
+	// "/program(2025-0923-11:47)/a/b.go" -> "a/b.go"
+	if idx := strings.Index(uri, ")/"); idx >= 0 {
+		uri = uri[idx+2:]
+	}
+	uri = strings.TrimPrefix(uri, "/")
+	return path.Clean(uri)
+}
+
+// ConvertSyntaxFlowResultToSarifRun keeps the single-result helper for callers
+// that want a run rather than a whole log. Everything inside one SARIF document
+// is merged into a single run, so this is only meaningful in isolation.
+func ConvertSyntaxFlowResultToSarifRun(result *ssaapi.SyntaxFlowResult) *sarif.Run {
+	report, err := NewSarifReport()
+	if err != nil {
+		log.Errorf("create sarif report failed: %s", err)
+		return nil
+	}
+	if !report.AddSyntaxFlowResult(result) {
+		return nil
+	}
+	return report.run
+}
+
+func ConvertSyntaxFlowResultsToSarif(results ...*ssaapi.SyntaxFlowResult) (*sarif.Report, error) {
+	report, err := NewSarifReport()
+	if err != nil {
+		return nil, utils.Wrap(err, "create sarif.New Report failed")
+	}
+	for _, result := range results {
+		report.AddSyntaxFlowResult(result)
+	}
+	return report.Report(), nil
+}
+
+func ToSarifLevel(level schema.SyntaxFlowSeverity) string {
+	switch level {
+	case schema.SFR_SEVERITY_INFO:
+		return "note"
+	case schema.SFR_SEVERITY_LOW, schema.SFR_SEVERITY_WARNING:
+		return "warning"
+	case schema.SFR_SEVERITY_CRITICAL, schema.SFR_SEVERITY_HIGH:
+		return "error"
+	default:
+		return "note"
+	}
+}

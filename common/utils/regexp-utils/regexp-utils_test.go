@@ -1,0 +1,216 @@
+package regexp_utils
+
+import (
+	"regexp"
+	"testing"
+
+	regexp2 "github.com/VillanCh/go-pcre2-lite/regexp2"
+	"github.com/stretchr/testify/require"
+	"github.com/yaklang/yaklang/common/log"
+)
+
+func TestYakRegexpUtilsOption(t *testing.T) {
+	testRegexpOptionFunc := func(thisT *testing.T, regexpRaw, srcString, expected string, testOption regexp2.RegexOptions) {
+		reUtils := NewYakRegexpUtils(regexpRaw, WithPriorityMode(RegexpMode1), WithRegexpOption(testOption))
+		match, err := reUtils.MatchString(srcString)
+		require.NoError(thisT, err)
+		require.True(thisT, match)
+		findString, err := reUtils.FindString(srcString)
+		require.NoError(thisT, err)
+		require.Equal(thisT, expected, findString)
+
+		reUtils = NewYakRegexpUtils(regexpRaw, WithPriorityMode(RegexpMode1))
+		match, err = reUtils.MatchString(srcString)
+		require.NoError(thisT, err)
+		require.False(thisT, match)
+		findString, err = reUtils.FindString(srcString)
+		require.NoError(thisT, err)
+		require.Equal(thisT, "", findString)
+	}
+
+	t.Run("ignoreCase", func(t *testing.T) {
+		testRegexpOptionFunc(t, "abc", "cccccccABC", "ABC", regexp2.IgnoreCase)
+	})
+
+	t.Run("singleline", func(t *testing.T) {
+		testRegexpOptionFunc(t, "<div>.*</div>", "<div>\n<a>abc</a>\n</div>", "<div>\n<a>abc</a>\n</div>", regexp2.Singleline)
+	})
+
+	t.Run("multiline", func(t *testing.T) {
+		srcString := "Joe 164\n" +
+			"Sam 208\n" +
+			"Allison 211\n" +
+			"Gwen 171\n"
+		testRegexpOptionFunc(t, "^(\\w+)\\s(\\d+)$", srcString, "Joe 164", regexp2.Multiline)
+
+	})
+}
+
+func TestYakRegexpUtils_Priority(t *testing.T) {
+	t.Run("re1 Compile fail", func(t *testing.T) {
+		testRule := "cc(?#comment)abc"
+		_, err := regexp.Compile(testRule)
+		require.Error(t, err)
+		reUtils := NewYakRegexpUtils(testRule, WithPriorityMode(RegexpMode1))
+		match, err := reUtils.MatchString("ccabc")
+		require.NoError(t, err)
+		require.True(t, match)
+	})
+
+	t.Run("posix class supported by pcre2 backend", func(t *testing.T) {
+		// regexp2 后端已切换为 go-pcre2-lite (PCRE2). PCRE2 支持 POSIX 字符类
+		// [[:alpha:]] (匹配任意字母), 而旧 .NET 系后端不支持 (旧实现按字面集解析, 故 "ccabc"
+		// 不匹配). 切换后 pcre2 与标准库 RE2 行为一致, 二档优先级均匹配 (更符合 POSIX 标准).
+		testRule := "[[:alpha:]]"
+		reUtils := NewYakRegexpUtils(testRule, WithPriorityMode(RegexpMode2))
+		match, err := reUtils.MatchString("ccabc")
+		require.NoError(t, err)
+		require.True(t, match)
+
+		reUtils.SetPriority(RegexpMode1)
+		match, err = reUtils.MatchString("ccabc")
+		require.NoError(t, err)
+		require.True(t, match)
+	})
+}
+
+func TestSubmatchIndex(t *testing.T) {
+
+	// reg := NewYakRegexpUtils(rule)
+	// res, err := reg.FindAllSubmatchIndex(code)
+	// require.NoError(t, err)
+	// for i, v := range res {
+	// 	log.Infof("submatch %d: %v", i, v)
+	// 	if len(v) < 2 {
+	// 		continue
+	// 	}
+	// 	log.Infof("submatch %d: %s", i, code[v[0]:v[1]])
+	// }
+
+	check := func(t *testing.T, code, rule string, want []string) {
+		reg := NewYakRegexpUtils(rule)
+		res, err := reg.FindAllSubmatchIndex(code)
+		require.NoError(t, err)
+		got := make([]string, 0, len(res))
+		for _, v := range res {
+			if len(v) < 2 {
+				continue
+			}
+			got = append(got, code[v[0]:v[1]])
+		}
+		log.Infof("got: %v", got)
+		require.NotEqual(t, len(got), 0)
+		// each element of want should exist in got
+		for _, want := range want {
+			require.Contains(t, got, want)
+		}
+	}
+
+	t.Run("check regexp1", func(t *testing.T) {
+
+		code := `
+	spring.datasource.url=jdbc:mysql://localhost:3306/your_database
+	spring.datasource.username=your_username
+	spring.datasource.password=your_password
+	spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+	spring.jpa.hibernate.ddl-auto=update
+	spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.MySQL5InnoDBDialect
+	`
+
+		rule := `spring.datasource.url=(.*)`
+
+		check(t, code, rule, []string{
+			"spring.datasource.url=jdbc:mysql://localhost:3306/your_database",
+			"jdbc:mysql://localhost:3306/your_database",
+		})
+	})
+
+	t.Run("check regexp2", func(t *testing.T) {
+		code := `
+### check referer configuration begins ###
+joychou.security.referer.enabled = false
+joychou.security.referer.host = joychou.org, joychou.com
+# Only support ant url style.
+joychou.security.referer.uri = /jsonp/**
+### check referer configuration ends ###
+# Fake aksk. Simulate actuator info leak.
+jsc.accessKey.id=aaaaaaaaaaaa
+jsc.accessKey.secret=bbbbbbbbbbbbbbbbb
+		`
+
+		rule := `(?i).*access[_-]?[token|key].*\s*=\s*((?!\{\{)(?!(?i)^(true|false|on|off|yes|no|y|n|null)).+)`
+
+		check(t, code, rule, []string{
+			"jsc.accessKey.id=aaaaaaaaaaaa",
+			"jsc.accessKey.secret=bbbbbbbbbbbbbbbbb",
+		})
+	})
+
+	// Lookbehind patterns run through regexp2, which reports rune indices.
+	// Callers slice the original string with these offsets, so multibyte text
+	// before the match must not shift the returned spans.
+	t.Run("lookbehind with multibyte prefix", func(t *testing.T) {
+		code := "前缀───${DEFAULT_MODULES} 尾部\n# 注释 ${seen_files}\n"
+		rule := `(?<![\w"'=:])\$\{[A-Za-z_][^}]*\}`
+		check(t, code, rule, []string{"${DEFAULT_MODULES}", "${seen_files}"})
+	})
+}
+
+func TestBearerRegexCompatibility(t *testing.T) {
+	src := `Authorization: Bearer AbCdEf1234567890+/=`
+
+	t.Run("legacy_inline_flag_position_not_usable", func(t *testing.T) {
+		legacy := `(\b(?i)Bearer [A-Za-z0-9-._~+/]{8,}={0,2})|((?i)Authorization:\s*[` + "`'\"" + `]?Bearer [A-Za-z0-9-._~+/]+={0,2}[` + "`'\"" + `]?))`
+		reUtils := NewYakRegexpUtils(legacy)
+		_, err := reUtils.FindAllSubmatchIndex(src)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "no usable regexp")
+	})
+
+	t.Run("fixed_inline_flag_position_works", func(t *testing.T) {
+		fixed := `(?i)(\bBearer [A-Za-z0-9-._~+/]{8,}={0,2}|Authorization:\s*[` + "`'\"" + `]?Bearer [A-Za-z0-9-._~+/]+={0,2}[` + "`'\"" + `]?)`
+		reUtils := NewYakRegexpUtils(fixed)
+		indices, err := reUtils.FindAllSubmatchIndex(src)
+		require.NoError(t, err)
+		require.NotEmpty(t, indices)
+	})
+}
+
+// FindAllMatchIndex answers "where did each match start and end", so it must
+// report one range per match and never the capture groups, and both engines
+// have to speak byte offsets.
+func TestFindAllMatchIndex(t *testing.T) {
+	t.Run("skips capture groups", func(t *testing.T) {
+		code := "needle one needle two"
+		reUtils := NewYakRegexpUtils(`(needle) (one|two)`)
+		indices, err := reUtils.FindAllMatchIndex(code)
+		require.NoError(t, err)
+		require.Equal(t, [][]int{{0, 10}, {11, 21}}, indices)
+	})
+
+	t.Run("regexp2 fallback reports byte offsets", func(t *testing.T) {
+		code := "中文yak-123"
+		reUtils := NewYakRegexpUtils(`(?<=yak-)\d+`, WithPriorityMode(RegexpMode2))
+		indices, err := reUtils.FindAllMatchIndex(code)
+		require.NoError(t, err)
+		require.Equal(t, [][]int{{10, 13}}, indices)
+		require.Equal(t, "123", code[indices[0][0]:indices[0][1]])
+	})
+
+	t.Run("both engines agree", func(t *testing.T) {
+		code := "中文123 abc 45"
+		for _, mode := range []regexpMode{RegexpMode1, RegexpMode2} {
+			reUtils := NewYakRegexpUtils(`\d+`, WithPriorityMode(mode))
+			indices, err := reUtils.FindAllMatchIndex(code)
+			require.NoError(t, err)
+			require.Equal(t, [][]int{{6, 9}, {14, 16}}, indices)
+		}
+	})
+
+	t.Run("zero width match keeps start equal to end", func(t *testing.T) {
+		reUtils := NewYakRegexpUtils(`^`)
+		indices, err := reUtils.FindAllMatchIndex("ab")
+		require.NoError(t, err)
+		require.Equal(t, [][]int{{0, 0}}, indices)
+	})
+}

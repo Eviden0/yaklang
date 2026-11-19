@@ -1,0 +1,573 @@
+package preprocess
+
+import (
+	"archive/zip"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/utils/filesys"
+	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+)
+
+func TestApplyDefineLineObject(t *testing.T) {
+	tables := NewMacroTables()
+	ApplyDefineLine("#define A 1", &tables, false)
+	require.Equal(t, "1", tables.Object["A"])
+}
+
+func TestApplyDefineLine_SpacedParenIsObjectMacro(t *testing.T) {
+	tables := NewMacroTables()
+	ApplyDefineLine("#define __ASSERT_VOID_CAST (void)", &tables, false)
+	_, isFn := tables.Function["__ASSERT_VOID_CAST"]
+	require.False(t, isFn, "space before '(' must not make a function-like macro")
+	require.Equal(t, "(void)", tables.Object["__ASSERT_VOID_CAST"])
+}
+
+func TestCollectObjectMacroFromProjectHeaders(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/a.h", []byte("#define A 1\n"), 0o644))
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte("int x = A;\n"), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include"}
+	project := BuildProject(fs, cfg)
+	tables := project.collectMacroEnvironment("apps/foo.c", ppMustRead(fs, "apps/foo.c"))
+	require.Equal(t, "1", tables.Object["A"])
+}
+
+func TestRegistry_IgnoresHInTemplate(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/openssl/safestack.h.in", []byte("#define STACK_OF(type) struct stack_st_##type\n"), 0o644))
+	reg := BuildHeaderRegistry(fs)
+	_, ok := reg.Lookup("include/openssl/safestack.h")
+	require.False(t, ok)
+	_, ok = reg.Lookup("openssl/safestack.h")
+	require.False(t, ok)
+}
+
+func TestResolver_QuotedInclude(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("apps/include/apps.h", []byte("#define APP 1\n"), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"apps/include", "include"}
+	reg := BuildHeaderRegistry(fs)
+	res := NewIncludeResolver(reg, cfg)
+	stored, ok := res.Resolve("apps.h", false, "apps/verify.c")
+	require.True(t, ok)
+	require.Contains(t, stored, "apps.h")
+}
+
+func TestResolver_AngleInclude(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/openssl/safestack.h", []byte("#define STACK_OF(type) struct stack_st_##type\n"), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include", "include/openssl"}
+	reg := BuildHeaderRegistry(fs)
+	res := NewIncludeResolver(reg, cfg)
+	stored, ok := res.Resolve("openssl/safestack.h", true, "apps/foo.c")
+	require.True(t, ok)
+	content, ok := reg.Lookup(stored)
+	require.True(t, ok)
+	require.Contains(t, string(content.Content), "STACK_OF")
+}
+
+func TestCond_Ifndef(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("apps/include/feature.h", []byte("#define FEATURE 1\n"), 0o644))
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(`
+#include "feature.h"
+#ifndef FEATURE
+int disabled = 1;
+#else
+int enabled = 1;
+#endif
+`), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"apps/include", "include"}
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/foo.c", ppMustRead(fs, "apps/foo.c"))
+	require.NoError(t, err)
+	require.NotContains(t, out, "disabled")
+	require.Contains(t, out, "enabled")
+}
+
+func TestCond_Defined(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	cfg := DefaultConfig()
+	cfg.Defines["OPENSSL_NO_SRP"] = "1"
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(`
+#ifdef OPENSSL_NO_SRP
+int no_srp = 1;
+#else
+int has_srp = 1;
+#endif
+`), 0o644))
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/foo.c", ppMustRead(fs, "apps/foo.c"))
+	require.NoError(t, err)
+	require.Contains(t, out, "no_srp")
+	require.NotContains(t, out, "has_srp")
+}
+
+func TestMacroEnv_IncludeSilentlyDropped(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/a.h", []byte("#define A 1\n"), 0o644))
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(`
+#include "a.h"
+int x = A;
+`), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include"}
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/foo.c", ppMustRead(fs, "apps/foo.c"))
+	require.NoError(t, err)
+	require.NotContains(t, out, `#include "a.h"`)
+	require.Contains(t, strings.ReplaceAll(out, " ", ""), "x=1")
+}
+
+func TestTU_PreservesMultilineComment(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	src := `/*
+ * Copyright 2025-2026 The OpenSSL Project Authors.
+ */
+#include <stdio.h>
+int main() { return 0; }
+`
+	require.NoError(t, fs.WriteFile("apps/configutl.c", []byte(src), 0o644))
+	cfg := DefaultConfig()
+	cfg.ExternalIncludeDirs = []string{}
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/configutl.c", src)
+	require.NoError(t, err)
+	require.Contains(t, out, "/*")
+	require.Contains(t, out, "Copyright 2025-2026")
+	require.Contains(t, out, "*/")
+}
+
+func TestExpandFunctionMacros_PreservesMultilineComment(t *testing.T) {
+	src := "/*\n * header\n */\nint x = 1;\n"
+	out, err := ExpandFunctionMacros(src)
+	require.NoError(t, err)
+	require.Contains(t, out, "/*")
+	require.Contains(t, out, "* header")
+	require.Contains(t, out, "*/")
+}
+
+func TestExpandFunctionMacros_PreservesCharLiteral(t *testing.T) {
+	src := `
+#define F(x) (x)
+int f(int c) {
+    switch (c) {
+    case '\n': return 1;
+    case '\t': return 2;
+    default: return F(c);
+    }
+}
+`
+	out, err := ExpandFunctionMacros(src)
+	require.NoError(t, err)
+	require.Contains(t, out, `case '\n':`)
+	require.Contains(t, out, `case '\t':`)
+}
+
+func TestTU_StackOf(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/openssl/safestack.h", []byte("#define STACK_OF(type) struct stack_st_##type\n"), 0o644))
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte("STACK_OF(X)* p;\n"), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include", "include/openssl"}
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/foo.c", ppMustRead(fs, "apps/foo.c"))
+	require.NoError(t, err)
+	require.Contains(t, out, "struct stack_st_X")
+}
+
+// TestTU_ConfigutlPattern: STACK_OF expands from project headers without #include in the .c file.
+func TestTU_ConfigutlPattern(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/openssl/safestack.h", []byte(`#ifndef OPENSSL_SAFESTACK_H
+#define OPENSSL_SAFESTACK_H
+#define STACK_OF(type) struct stack_st_##type
+#endif
+`), 0o644))
+	require.NoError(t, fs.WriteFile("include/openssl/conf.h", []byte(`#ifndef OPENSSL_CONF_H
+#define OPENSSL_CONF_H
+#include <openssl/safestack.h>
+#endif
+`), 0o644))
+	src := `static void print_section(void) {
+    STACK_OF(CONF_VALUE) *values;
+}
+`
+	require.NoError(t, fs.WriteFile("apps/configutl.c", []byte(src), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include", "include/openssl"}
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/configutl.c", src)
+	require.NoError(t, err)
+	require.NotContains(t, out, "STACK_OF(CONF_VALUE)")
+	require.Contains(t, out, "struct stack_st_CONF_VALUE")
+}
+
+func TestCollect_ConfigutlPatternHasStackOf(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/openssl/safestack.h", []byte("#define STACK_OF(type) struct stack_st_##type\n"), 0o644))
+	require.NoError(t, fs.WriteFile("include/openssl/conf.h", []byte("#include <openssl/safestack.h>\n"), 0o644))
+	src := "static void f(void) {}\n"
+	require.NoError(t, fs.WriteFile("apps/configutl.c", []byte(src), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include", "include/openssl"}
+	project := BuildProject(fs, cfg)
+	tables := project.collectMacroEnvironment("apps/configutl.c", src)
+	_, ok := tables.Function["STACK_OF"]
+	require.True(t, ok, "STACK_OF must be collected from all project headers")
+}
+
+func TestResolver_SystemIncludeIncludePrefix(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/openssl/safestack.h", []byte("#define X 1\n"), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include"}
+	reg := BuildHeaderRegistry(fs)
+	res := NewIncludeResolver(reg, cfg)
+	stored, ok := res.Resolve("openssl/safestack.h", true, "apps/configutl.c")
+	require.True(t, ok)
+	require.Contains(t, stored, "safestack")
+}
+
+func TestMacroEnv_UndefShadow(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/a.h", []byte("#define F(x) (x)\n#undef F\n"), 0o644))
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(`
+#include "a.h"
+int y = F(1);
+`), 0o644))
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include"}
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/foo.c", ppMustRead(fs, "apps/foo.c"))
+	require.NoError(t, err)
+	require.Contains(t, out, "F(1)")
+}
+
+// TestHeaderMacroCache_MultiTUStable locks include-agnostic header macros + project-level cache:
+// multiple TUs on one project must see the same header macros and stable PreprocessTU output.
+func TestHeaderMacroCache_MultiTUStable(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/common.h", []byte("#define MAGIC 42\n#define TWICE(x) ((x)+(x))\n"), 0o644))
+	srcA := "int a = MAGIC;\nint b = TWICE(3);\n"
+	srcB := "int c = MAGIC;\nint d = TWICE(MAGIC);\n"
+	require.NoError(t, fs.WriteFile("apps/a.c", []byte(srcA), 0o644))
+	require.NoError(t, fs.WriteFile("apps/b.c", []byte(srcB), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include"}
+	project := BuildProject(fs, cfg)
+
+	outA1, err := project.PreprocessTU("apps/a.c", srcA)
+	require.NoError(t, err)
+	outA2, err := project.PreprocessTU("apps/a.c", srcA)
+	require.NoError(t, err)
+	require.Equal(t, outA1, outA2, "repeated PreprocessTU on same TU must be byte-identical")
+
+	outB, err := project.PreprocessTU("apps/b.c", srcB)
+	require.NoError(t, err)
+
+	require.Contains(t, outA1, "42")
+	require.Contains(t, outA1, "((3)+(3))")
+	require.Contains(t, outB, "42")
+	require.Contains(t, outB, "((42)+(42))")
+
+	// Header tables computed once; both TUs merge the same cached headers.
+	tablesA := project.buildMacroTables("apps/a.c", srcA)
+	tablesB := project.buildMacroTables("apps/b.c", srcB)
+	require.Equal(t, "42", tablesA.Object["MAGIC"])
+	require.Equal(t, "42", tablesB.Object["MAGIC"])
+	require.Equal(t, tablesA.Function["TWICE"], tablesB.Function["TWICE"])
+}
+
+// TestExpandPath_DefineUndefInterleaved ensures reused expandEnv stays correct across #define/#undef.
+func TestExpandPath_DefineUndefInterleaved(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/empty.h", []byte("/* no macros */\n"), 0o644))
+	src := strings.Join([]string{
+		"#define X 1",
+		"int a = X;",
+		"#undef X",
+		"#define X 2",
+		"int b = X;",
+		"#define Y X",
+		"int c = Y;",
+		"#undef Y",
+		"int d = X;",
+	}, "\n")
+	require.NoError(t, fs.WriteFile("apps/interleaved.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include"}
+	project := BuildProject(fs, cfg)
+
+	out1, err := project.PreprocessTU("apps/interleaved.c", src)
+	require.NoError(t, err)
+	out2, err := project.PreprocessTU("apps/interleaved.c", src)
+	require.NoError(t, err)
+	require.Equal(t, out1, out2)
+
+	require.Contains(t, out1, "int a = 1;")
+	require.Contains(t, out1, "int b = 2;")
+	require.Contains(t, out1, "int c = 2;")
+	require.Contains(t, out1, "int d = 2;")
+	require.NotContains(t, out1, "int a = X;")
+	require.NotContains(t, out1, "int b = X;")
+}
+
+func TestLookupObject_ChainMatchesFlatten(t *testing.T) {
+	parent := NewMacroEnvironment(nil)
+	parent.tables.Object["A"] = "1"
+	parent.tables.Object["B"] = "parentB"
+
+	child := NewMacroEnvironment(parent)
+	child.tables.Object["B"] = "childB"
+	child.tables.Object["C"] = "3"
+
+	for _, name := range []string{"A", "B", "C", "missing"} {
+		flat := child.Flatten()
+		want, wantOK := flat.Object[name]
+		got, gotOK := child.LookupObject(name)
+		require.Equal(t, wantOK, gotOK, "name=%s", name)
+		require.Equal(t, want, got, "name=%s", name)
+	}
+}
+
+func TestTU_ExternalInclude_ListForeach(t *testing.T) {
+	ext := filesys.NewVirtualFs()
+	require.NoError(t, ext.WriteFile("sys/queue.h", []byte(`
+#define LIST_FOREACH(var, head, field) \
+	for ((var) = ((head)->lh_first); (var); (var) = ((var)->field.le_next))
+`), 0o644))
+
+	fs := filesys.NewVirtualFs()
+	src := `#include <sys/queue.h>
+void walk(void) {
+	LIST_FOREACH(n, &head, next) { use(n); }
+}
+`
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.ExternalIncludeDirs = []string{}
+	cfg.ExternalIncludeFS = []fi.FileSystem{ext}
+	project := BuildProject(fs, cfg)
+
+	out, err := project.PreprocessTU("apps/foo.c", src)
+	require.NoError(t, err)
+	require.NotContains(t, out, `#include <sys/queue.h>`)
+	require.NotContains(t, out, "LIST_FOREACH")
+	require.Contains(t, out, "lh_first")
+	require.Contains(t, out, "le_next")
+}
+
+func TestTU_ProjectHeaderFollowsExternalInclude(t *testing.T) {
+	ext := filesys.NewVirtualFs()
+	require.NoError(t, ext.WriteFile("sys/queue.h", []byte("#define LIST_EMPTY(head) ((head)->lh_first == NULL)\n"), 0o644))
+
+	fs := filesys.NewVirtualFs()
+	require.NoError(t, fs.WriteFile("include/event-internal.h", []byte("#include <sys/queue.h>\n"), 0o644))
+	src := "int empty = LIST_EMPTY(&head);\n"
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.IncludeDirs = []string{"include"}
+	cfg.ExternalIncludeDirs = []string{}
+	cfg.ExternalIncludeFS = []fi.FileSystem{ext}
+	project := BuildProject(fs, cfg)
+
+	out, err := project.PreprocessTU("apps/foo.c", src)
+	require.NoError(t, err)
+	require.NotContains(t, out, "LIST_EMPTY")
+	require.Contains(t, out, "lh_first")
+}
+
+func TestTU_ExternalInclude_NestedWindowsMacros(t *testing.T) {
+	ext := filesys.NewVirtualFs()
+	require.NoError(t, ext.WriteFile("windef.h", []byte("#define WINAPI __stdcall\n"), 0o644))
+	require.NoError(t, ext.WriteFile("windows.h", []byte(`#include <windef.h>
+#define CALLBACK WINAPI
+`), 0o644))
+
+	fs := filesys.NewVirtualFs()
+	src := `#include <windows.h>
+typedef void (WINAPI *handler)(void);
+typedef void (CALLBACK *cb)(void);
+`
+	require.NoError(t, fs.WriteFile("apps/win.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.ExternalIncludeDirs = []string{}
+	cfg.ExternalIncludeFS = []fi.FileSystem{ext}
+	project := BuildProject(fs, cfg)
+
+	out, err := project.PreprocessTU("apps/win.c", src)
+	require.NoError(t, err)
+	require.NotContains(t, out, "WINAPI")
+	require.NotContains(t, out, "CALLBACK")
+	require.Contains(t, out, "__stdcall")
+}
+
+func TestTU_ExternalInclude_ZipRoot(t *testing.T) {
+	zipPath := filepath.Join(t.TempDir(), "c-headers.zip")
+	writeTestZip(t, zipPath, map[string]string{
+		"include/sys/queue.h": "#define LIST_END(head) ((void *)0)\n",
+	})
+
+	fs := filesys.NewVirtualFs()
+	src := `#include <sys/queue.h>
+void *p = LIST_END(&head);
+`
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.ExternalIncludeDirs = []string{zipPath}
+	project := BuildProject(fs, cfg)
+	t.Cleanup(func() { _ = project.Close() })
+
+	out, err := project.PreprocessTU("apps/foo.c", src)
+	require.NoError(t, err)
+	require.NotContains(t, out, "LIST_END")
+	require.Contains(t, strings.ReplaceAll(out, " ", ""), "p=((void*)0)")
+}
+
+func TestTU_ExternalInclude_DirRoot(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sys"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sys", "queue.h"), []byte("#define Q_EMPTY 1\n"), 0o644))
+
+	fs := filesys.NewVirtualFs()
+	src := `#include <sys/queue.h>
+int x = Q_EMPTY;
+`
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.ExternalIncludeDirs = []string{dir}
+	project := BuildProject(fs, cfg)
+
+	out, err := project.PreprocessTU("apps/foo.c", src)
+	require.NoError(t, err)
+	require.Contains(t, strings.ReplaceAll(out, " ", ""), "x=1")
+}
+
+func TestTU_SkipSystemInclude_WithoutExternal(t *testing.T) {
+	fs := filesys.NewVirtualFs()
+	src := `#include <stdio.h>
+int x = LIST_FOREACH;
+`
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(src), 0o644))
+	cfg := DefaultConfig()
+	cfg.ExternalIncludeDirs = []string{}
+	project := BuildProject(fs, cfg)
+	out, err := project.PreprocessTU("apps/foo.c", src)
+	require.NoError(t, err)
+	require.NotContains(t, out, `#include <stdio.h>`)
+	require.Contains(t, out, "LIST_FOREACH")
+}
+
+func TestTU_ExternalInclude_KeepsTypesDropsFunctions(t *testing.T) {
+	ext := filesys.NewVirtualFs()
+	require.NoError(t, ext.WriteFile("sys/demo.h", []byte(`
+#define DEMO_MAGIC 7
+typedef unsigned int demo_size_t;
+struct demo_node {
+	int value;
+};
+int demo_library_func(int x);
+static inline int demo_inline(void) { return 1; }
+`), 0o644))
+
+	fs := filesys.NewVirtualFs()
+	src := `#include <sys/demo.h>
+demo_size_t n = DEMO_MAGIC;
+`
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	cfg.ExternalIncludeDirs = []string{}
+	cfg.ExternalIncludeFS = []fi.FileSystem{ext}
+	project := BuildProject(fs, cfg)
+
+	out, err := project.PreprocessTU("apps/foo.c", src)
+	require.NoError(t, err)
+	require.Contains(t, strings.ReplaceAll(out, " ", ""), "n=7")
+	require.Contains(t, out, "typedef unsigned int demo_size_t")
+	require.Contains(t, out, "struct demo_node")
+	require.NotContains(t, out, "demo_library_func")
+	require.NotContains(t, out, "demo_inline")
+}
+
+func TestTU_YakitHomeCHeaders_CopyAndExpand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("YAKIT_HOME", home)
+
+	headerSrcDir := t.TempDir()
+	srcHeader := filepath.Join(headerSrcDir, "demo.h")
+	require.NoError(t, os.WriteFile(srcHeader, []byte(`
+#define HOME_MAGIC 99
+typedef unsigned long home_size_t;
+int home_library_should_not_import(void);
+`), 0o644))
+
+	dstHeader := filepath.Join(consts.GetDefaultCHeadersDir(), "sys", "demo.h")
+	copyFileTo(t, srcHeader, dstHeader)
+
+	fs := filesys.NewVirtualFs()
+	src := `#include <sys/demo.h>
+home_size_t n = HOME_MAGIC;
+`
+	require.NoError(t, fs.WriteFile("apps/foo.c", []byte(src), 0o644))
+
+	cfg := DefaultConfig()
+	require.Contains(t, cfg.ExternalIncludeDirs, consts.GetDefaultCHeadersDir())
+	project := BuildProject(fs, cfg)
+	t.Cleanup(func() { _ = project.Close() })
+
+	out, err := project.PreprocessTU("apps/foo.c", src)
+	require.NoError(t, err)
+	require.Contains(t, strings.ReplaceAll(out, " ", ""), "n=99")
+	require.Contains(t, out, "typedef unsigned long home_size_t")
+	require.NotContains(t, out, "home_library_should_not_import")
+	require.NotContains(t, out, "HOME_MAGIC")
+}
+
+func copyFileTo(t *testing.T, src, dst string) {
+	t.Helper()
+	data, err := os.ReadFile(src)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(dst), 0o755))
+	require.NoError(t, os.WriteFile(dst, data, 0o644))
+}
+
+func writeTestZip(t *testing.T, zipPath string, files map[string]string) {
+	t.Helper()
+	f, err := os.Create(zipPath)
+	require.NoError(t, err)
+	defer f.Close()
+	w := zip.NewWriter(f)
+	for name, content := range files {
+		fw, err := w.Create(name)
+		require.NoError(t, err)
+		_, err = fw.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Close())
+}
+
+func ppMustRead(fs *filesys.VirtualFS, path string) string {
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}

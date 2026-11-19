@@ -1,0 +1,2053 @@
+//go:build !irify_exclude
+
+package ssacmds
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/yaklang/yaklang/common/yak/syntaxflow_scan"
+
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfbuildin"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfrisk"
+	"github.com/yaklang/yaklang/common/utils/bizhelper"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/sfreport"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+	"golang.org/x/exp/slices"
+
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfanalysis"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+	cli "github.com/yaklang/yaklang/common/urfavecli"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/filesys"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+	"github.com/yaklang/yaklang/common/yak/ssaapi"
+)
+
+var ssaRemove = &cli.Command{
+	Name:    "ssa-remove",
+	Aliases: []string{"ssa-rm"},
+	Usage:   "Remove SSA OpCodes from database",
+	Action: func(c *cli.Context) {
+		for _, name := range c.Args() {
+			if name == "*" {
+				for _, name := range ssadb.AllProgramNames(ssadb.GetDB()) {
+					log.Infof("Start to delete program: %v", name)
+					ssadb.DeleteProgram(ssadb.GetDB(), name)
+				}
+				break
+			}
+			log.Infof("Start to delete program: %v", name)
+			ssadb.DeleteProgram(ssadb.GetDB(), name)
+		}
+	},
+}
+
+var staticCheck = &cli.Command{
+	Name:    "static-check",
+	Aliases: []string{"check"},
+	Usage:   "Legacy local SyntaxFlow rule assertion check",
+	UsageText: "yak static-check --input-file <target> --rules <rule-dir> " +
+		"[--language <lang>] [--exclude-file <glob>]",
+	Description: `Compile local target and execute all .sf rules under --rules.
+This command is mainly for rule author testing. It returns non-zero when any rule reports alerts.`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:     "input-file,file",
+			Usage:    "target source path/archive to compile",
+			Required: true,
+		},
+		cli.StringFlag{
+			Name:     "rules",
+			Usage:    "directory containing .sf rules",
+			Required: true,
+		},
+		cli.StringFlag{
+			Name:  "language",
+			Usage: "source language (auto-detect when omitted)",
+		},
+		cli.StringFlag{
+			Name:  "exclude-file",
+			Usage: "exclude files by glob, e.g. vendor/*, test/*",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		var sfrules []*schema.SyntaxFlowRule
+		file := c.String("file")
+		rules := c.String("rules")
+		language := c.String("language")
+		excludeFileStr := c.String("exclude-file")
+
+		zipfs, err2 := filesys.NewZipFSFromLocal(file)
+		if err2 != nil {
+			return err2
+		}
+		filesys.Recursive(rules, filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+			if !strings.HasSuffix(s, ".sf") {
+				return nil
+			}
+			raw, err := os.ReadFile(s)
+			if err != nil {
+				return err
+			}
+			sfrule, err := sfdb.CheckSyntaxFlowRuleContent(string(raw))
+			if err != nil {
+				return err
+			}
+			if sfrule.RuleName == "" {
+				sfrule.RuleName = s
+			}
+			sfrules = append(sfrules, sfrule)
+			return nil
+		}))
+		programs, err := ssaapi.ParseProjectWithFS(zipfs,
+			ssaapi.WithRawLanguage(language),
+			ssaapi.WithUserExcludePatterns(excludeFileStr),
+		)
+		if err != nil {
+			return err
+		}
+		var ruleError error
+		addError := func(err error, ruleName string) {
+			ruleError = utils.JoinErrors(ruleError, fmt.Errorf("execute syntaxRule[%s] fail,reason: %s", ruleName, err))
+		}
+		for _, sfrule := range sfrules {
+			result, err := programs.SyntaxFlowRule(sfrule, ssaapi.QueryWithEnableDebug(true))
+			if err != nil {
+				addError(err, sfrule.RuleName)
+				continue
+			}
+			values := result.GetAlertValues()
+			if values.Len() != 0 {
+				addError(errors.New("alert number is not null"), sfrule.RuleName)
+				result.Show()
+			}
+		}
+		if ruleError != nil {
+			return ruleError
+		}
+		return nil
+	},
+}
+
+type Program interface {
+	GetLanguage() ssaconfig.Language
+	GetProgramName() string
+}
+
+var ssaProgram = &cli.Command{
+	Name:      "ssa-program",
+	Aliases:   []string{"ssa-prog"},
+	Usage:     "List or query SSA programs in database",
+	UsageText: `yak ssa-program [program-regexp...] [--database <db>]`,
+	Description: `Without arguments, list all programs in current database.
+With one or more arguments, treat them as regexp patterns and print matched program names.`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "database",
+			Usage: "SSA database path",
+		},
+	},
+	Action: func(c *cli.Context) error {
+
+		if databaseRaw := c.String("database"); databaseRaw != "" {
+			if err := consts.SetGormSSAProjectDatabaseByInfo(databaseRaw); err != nil {
+				return utils.Errorf("set database by info %s failed: %v", databaseRaw, err)
+			}
+		}
+
+		showProgram := func(name string, progs []*ssaapi.Program) {
+			fmt.Printf("Program match: %s\n", name)
+			if len(progs) == 0 {
+				fmt.Printf("\tno program found\n")
+				return
+			}
+			for _, p := range progs {
+				fmt.Printf("\t[%6s]:\t%s \n",
+					p.GetLanguage(),
+					p.GetProgramName(),
+				)
+			}
+		}
+
+		if len(c.Args()) == 0 {
+			// list all program names
+			fmt.Printf("All Programs in database:\n")
+			progs := ssaapi.LoadProgramRegexp(".*")
+			showProgram(".*", progs)
+		}
+
+		for _, name := range c.Args() {
+			regMatch := fmt.Sprintf("%s", name)
+			ret := ssaapi.LoadProgramRegexp(regMatch)
+			// show: name -> []{}
+			showProgram(name, ret)
+		}
+		return nil
+	},
+}
+
+var ssaCompile = &cli.Command{
+	Name:      "ssa-compile",
+	Aliases:   []string{"ssa"},
+	Usage:     "Compile project to SSA and save program",
+	UsageText: `yak ssa-compile (--target <path> | --config <json>) [--program <name>] [options]`,
+	Description: `Compile source code into SSA program and save it to database.
+Compile stage is shared with code-scan (same auto-detect + script compile pipeline).
+When --syntaxflow is provided, a follow-up SyntaxFlowQuery is executed for quick manual verification.
+
+Large projects: tune SSACompile JSON (compile_concurrency, exclude_files, peephole_size, incremental flags);
+use log=info for [ssa.compile.summary] and log=debug for per-phase timings (ssa.compile.phase enter …).`,
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "log", Usage: "log level: debug, info, warn, error"},
+		cli.StringFlag{
+			Name:  "config,c",
+			Usage: "JSON configuration file path (compile options)",
+		},
+		cli.StringFlag{
+			Name:  "language,l",
+			Usage: "source language (auto-detect when omitted)",
+		},
+		cli.StringFlag{
+			Name:  "target,t",
+			Usage: `target source file/directory`,
+		},
+		cli.StringFlag{
+			Name:  "program,p",
+			Usage: `program name to save in database`,
+		},
+		cli.StringFlag{
+			Name:  "entry",
+			Usage: "entry file(s), comma-separated",
+		},
+		cli.StringFlag{
+			Name:  "syntaxflow,sf",
+			Usage: "run SyntaxFlow after compile: inline code, .sf/.syntaxflow file, or directory",
+		},
+		cli.StringFlag{
+			Name:  "database,db",
+			Usage: "SSA database path",
+		},
+		cli.StringFlag{
+			Name:  "database-dialect,db-dialect",
+			Usage: "database dialect for gorm, support: mysql, sqlite3(default)",
+		},
+		cli.BoolFlag{
+			Name:  "database-debug,dbdebug",
+			Usage: "enable database debug mode",
+		},
+		cli.BoolFlag{
+			Name:  "syntaxflow-debug,sfdebug",
+			Usage: "enable syntax flow debug mode",
+		},
+		cli.BoolFlag{
+			Name: "no-override", Usage: "do not delete existing program before compile",
+		},
+		cli.BoolFlag{
+			Name: "re-compile", Usage: "allow recompiling an existing program name",
+		},
+		cli.BoolFlag{
+			Name: "dot", Usage: "print dot graph in syntaxflow query result",
+		},
+		cli.BoolFlag{
+			Name: "with-code,code", Usage: "show code context in syntaxflow query result",
+		},
+		cli.BoolFlag{
+			Name:  "no-frontend",
+			Usage: `disable frontend metadata integration`,
+		},
+		cli.StringFlag{
+			Name:  "exclude-file",
+			Usage: `exclude files by glob, e.g. targets/*, vendor/*`,
+		},
+
+		cli.StringFlag{
+			Name:  "debug",
+			Usage: "enable pprof/debug output: specify a directory path; creates structured output with ssadb.db, log, report, cmd.txt, and pprof subdirectories",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if ret, err := log.ParseLevel(c.String("log")); err == nil {
+			log.SetLevel(ret)
+		}
+
+		if debugDir := c.String("debug"); debugDir != "" {
+			cleanup, err := setupDebugDir(c, debugDir)
+			if err != nil {
+				return utils.Errorf("setup debug dir failed: %v", err)
+			}
+			defer cleanup()
+		}
+
+		configFilePath := c.String("config")
+		databaseFileRaw := c.String("database")
+		databaseDialect := c.String("database-dialect")
+		noOverride := c.Bool("no-override")
+		syntaxFlow := c.String("syntaxflow")
+		dbDebug := c.Bool("database-debug")
+		sfDebug := c.Bool("syntaxflow-debug")
+		showDot := c.Bool("dot")
+		withCode := c.Bool("with-code")
+
+		// set database
+		if databaseDialect != "" {
+			// if set dialect, open gorm and set db
+			if databaseFileRaw == "" {
+				return utils.Errorf("database path is required when using database dialect")
+			}
+			db, err := gorm.Open(databaseDialect, databaseFileRaw)
+			if err != nil {
+				return utils.Errorf("open database failed: %v", err)
+			}
+			consts.SetGormSSAProjectDatabase(db)
+		}
+		// if not set dialect, bind the current process to the target SSA database path
+		if databaseDialect == "" && databaseFileRaw != "" {
+			consts.SetSSADatabaseInfo(databaseFileRaw)
+			if err := consts.SetGormSSAProjectDatabaseByInfo(databaseFileRaw); err != nil {
+				return utils.Errorf("open database failed: %v", err)
+			}
+		}
+
+		var (
+			compileConfig *ssaCliConfig
+			err           error
+		)
+		if configFilePath != "" {
+			compileConfig, err = parseConfigFileWithCliFlagOverride(c)
+		} else {
+			compileConfig, err = parseCompileConfigFromCli(c)
+		}
+		if err != nil {
+			return err
+		}
+		defer compileConfig.DeferFunc()
+		if compileConfig.GetCompileMemory() || compileConfig.GetSyntaxFlowMemory() {
+			log.Warn("ssa-compile does not support memory mode, ignore memory-related settings")
+			if err := compileConfig.Config.Update(
+				ssaconfig.WithCompileMemoryCompile(false),
+				ssaconfig.WithSyntaxFlowMemory(false),
+			); err != nil {
+				return utils.Errorf("normalize compile config failed: %v", err)
+			}
+		}
+		log.Infof("[ssa-compile] mode: compile only; optional --syntaxflow runs SyntaxFlowQuery for manual rule verification")
+		logCompileStageMessage("ssa-compile", compileConfig)
+
+		programName := compileConfig.GetProgramName()
+		reCompile := compileConfig.GetCompileReCompile()
+		targetPath := compileConfig.GetCodeSourceLocalFileOrURL()
+
+		// check program name duplicate
+		if programName != "" {
+			if prog, err := ssadb.GetProgram(programName, ssa.Application); prog != nil && err == nil {
+				if !reCompile {
+					return utils.Errorf(
+						"program name %v existed in this database, please use `re-compile` flag to re-compile or change program name",
+						programName,
+					)
+				}
+			}
+			if slices.Contains(ssadb.AllProgramNames(ssadb.GetDB()), programName) {
+				if !reCompile {
+					return utils.Errorf(
+						"program name %v existed in other database, please use `re-compile` flag to re-compile or change program name",
+						programName,
+					)
+				}
+			}
+		}
+
+		if !noOverride && programName != "" {
+			ssadb.DeleteProgram(ssadb.GetDB(), programName)
+		} else if noOverride && programName != "" {
+			log.Warnf("no-override flag is set, will not delete existed program: %v", programName)
+		}
+
+		if targetPath != "" {
+			log.Infof("start to compile file: %v", targetPath)
+		}
+		if programName != "" {
+			log.Infof("compile save to database with program name: %v", programName)
+		}
+		progs, err := getProgram(context.Background(), compileConfig)
+		if err != nil {
+			if targetPath != "" {
+				return utils.Errorf("parse project [%v] failed: %v", targetPath, err)
+			}
+			return err
+		}
+		if len(progs) <= 0 {
+			if targetPath != "" {
+				return utils.Errorf("parse project [%v] failed: no program compiled", targetPath)
+			}
+			return utils.Errorf("parse project failed: no program compiled")
+		}
+		programName = progs[0].GetProgramName()
+		log.Infof("finished compiling..., results: %v", len(progs))
+		if syntaxFlow != "" {
+			log.Infof("[ssa-compile] syntaxflow stage: execute via SyntaxFlowQuery (single program, interactive output)")
+			syntaxFlows, isPath, err := loadSyntaxFlowInputs(syntaxFlow)
+			if err != nil {
+				return err
+			}
+			if isPath {
+				if len(syntaxFlows) == 0 {
+					return utils.Errorf("no .sf/.syntaxflow rule found in path: %s", syntaxFlow)
+				}
+				for _, sf := range syntaxFlows {
+					if err := SyntaxFlowQuery(programName, sf, dbDebug, sfDebug, showDot, withCode); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			log.Warn("Deprecated: syntax flow query language will be removed in ssa sub-command, please use `ssa-query(in short: sf/syntaxFlow)` instead")
+			return SyntaxFlowQuery(programName, syntaxFlow, dbDebug, sfDebug, showDot, withCode)
+		}
+		return nil
+	},
+}
+
+func loadSyntaxFlowInputs(input string) ([]string, bool, error) {
+	if input == "" {
+		return nil, false, nil
+	}
+
+	if utils.IsFile(input) {
+		raw, err := os.ReadFile(input)
+		if err != nil {
+			return nil, true, utils.Wrapf(err, "read syntaxflow file %s failed", input)
+		}
+		return []string{string(raw)}, true, nil
+	}
+
+	if utils.IsDir(input) {
+		var flows []string
+		err := filepath.Walk(input, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info == nil || info.IsDir() {
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext != ".sf" && ext != ".syntaxflow" {
+				return nil
+			}
+			contentRaw, err := os.ReadFile(path)
+			if err != nil {
+				return utils.Wrapf(err, "read syntaxflow file %s failed", path)
+			}
+			if len(contentRaw) <= 0 {
+				return nil
+			}
+			flows = append(flows, string(contentRaw))
+			return nil
+		})
+		if err != nil {
+			return nil, true, utils.Wrapf(err, "read syntaxflow dir %s failed", input)
+		}
+		return flows, true, nil
+	}
+
+	// 不是现有路径，按内联语法流代码处理。
+	return nil, false, nil
+}
+
+var syntaxFlowCreate = &cli.Command{
+	Name:    "syntaxflow-create",
+	Aliases: []string{"create-sf", "csf"},
+	Usage:   "create syntaxflow template file",
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "language,l"},
+		cli.StringFlag{Name: "keyword"},
+		cli.BoolFlag{Name: "is-vuln,vuln,v", Usage: "set the current SyntaxFlow Rule is a vuln (in desc)"},
+		cli.BoolFlag{Name: "audit-suggestion,audit,a", Usage: "set the current SyntaxFlow Rule is a suggestion"},
+		cli.BoolFlag{Name: "sec-config,security-config,s", Usage: "set the current SyntaxFlow Rule is a suggestion"},
+		cli.StringFlag{Name: "output,o,f", Usage: `set output filename`},
+	},
+	Action: func(c *cli.Context) error {
+		var buf bytes.Buffer
+
+		var typeStrs []string
+
+		switch {
+		case c.Bool("is-vuln"):
+			typeStrs = append(typeStrs, "vuln")
+		case c.Bool("audit-suggestion"):
+			typeStrs = append(typeStrs, "audit")
+		case c.Bool("security-config"):
+			typeStrs = append(typeStrs, "sec-config")
+		}
+
+		if len(typeStrs) <= 0 {
+			typeStrs = append(typeStrs, "audit")
+		}
+
+		buf.WriteString("desc(\n  ")
+		buf.WriteString("title: 'checking []',\n  ")
+		buf.WriteString("type: " + strings.Join(typeStrs, "|") + "\n)\n\n")
+		buf.WriteString("// write your SyntaxFlow Rule, like:\n")
+		buf.WriteString("//     DocumentBuilderFactory.newInstance()...parse(* #-> * as $source) as $sink; // find some call chain for parse\n")
+		buf.WriteString("//     check $sink then 'find sink point' else 'No Found' // if not found sink, the rule will stop here and report error\n")
+		buf.WriteString("//     alert $source // record $source\n\n\n")
+		buf.WriteString("// the template is generate by yak.ssa.syntaxflow command line\n")
+
+		filename := c.String("output")
+
+		if l := c.String("language"); filename != "" && l != "" {
+			l = strings.TrimSpace(strings.ToLower(l))
+			dirname, filename := filepath.Split(filename)
+			if !strings.HasPrefix(filename, l+"-") {
+				filename = l + "-" + filename
+			}
+			filename = filepath.Join(dirname, filename)
+		}
+
+		if filename == "" {
+			fmt.Println(buf.String())
+			return nil
+		}
+		if !strings.HasSuffix(filename, ".sf") {
+			filename += ".sf"
+		}
+		return os.WriteFile(filename, buf.Bytes(), 0o666)
+	},
+}
+
+var syntaxFlowExport = &cli.Command{
+	Name:    "syntaxflow-export",
+	Aliases: []string{"sf-export", "esf"},
+	Usage:   "export SyntaxFlow rule to file system",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "output,o",
+			Usage: "output file path",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if c.String("output") == "" {
+			return utils.Error("output file is required")
+		}
+		local := filesys.NewLocalFs()
+		results, _ := io.ReadAll(sfdb.ExportDatabase())
+		if len(results) <= 0 {
+			return utils.Error("no rule found")
+		}
+		return local.WriteFile(c.String("output"), results, 0o666)
+	},
+}
+
+var syntaxFlowImport = &cli.Command{
+	Name:    "syntaxflow-import",
+	Usage:   "import SyntaxFlow rule from file system",
+	Aliases: []string{"sf-import", "isf"},
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "file,f,input,i",
+			Usage: "file path",
+		},
+		cli.StringFlag{
+			Name: "format",
+			Usage: `input file format:
+	* json (default: json file)
+	* raw (syntaxflow file)
+		`,
+		},
+	},
+	Action: func(c *cli.Context) error {
+		file := c.String("file")
+		format := c.String("format")
+
+		if file == "" {
+			return utils.Error("file is required")
+		}
+		if format == "" {
+			format = "json"
+		}
+		path, err := os.Open(file)
+		if err != nil {
+			return utils.Wrap(err, "open file failed")
+		}
+		defer path.Close()
+
+		switch format {
+		case "json":
+			err = sfdb.ImportDatabase(path)
+			if err != nil {
+				return err
+			}
+		case "raw":
+			rfs := filesys.NewRelLocalFs(file)
+			err := sfbuildin.SyncRuleFromFileSystem(rfs, false, func(process float64, ruleName string) {
+				log.Infof("sync input rule: %s, process: %f", ruleName, process)
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+}
+
+var syncRule = &cli.Command{
+	Name:  "sync-rule",
+	Usage: "sync rule from embed to database",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "output,o",
+			Usage: "output rule info file path",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		SyncEmbedRule(true)
+		if output := c.String("output"); output != "" {
+			log.Infof("output rule info to %s", output)
+			log.Infof("start to parse rule info")
+			ruleInfos := sfdb.EmbedRuleVersion()
+			jsonData, err := json.MarshalIndent(ruleInfos, "", "  ")
+			if err != nil {
+				log.Infof("Error marshaling ruleInfos: %v", err)
+				return err
+			}
+			os.WriteFile(output, jsonData, 0o666)
+			log.Infof("output rule info to %s done ", output)
+		}
+
+		return nil
+	},
+}
+
+var verifyBuiltinRisk = &cli.Command{
+	Name:      "verify-builtin-risk",
+	Aliases:   []string{"verify-risk", "builtin-risk-check"},
+	Usage:     "verify built-in SyntaxFlow rules' risk types against the risk taxonomy",
+	UsageText: "yak verify-builtin-risk [--dir <rule-dir>] [--taxonomy <taxonomy.json>]",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "dir",
+			Usage: "rule directory containing .sf files",
+			Value: "common/syntaxflow/sfbuildin/buildin",
+		},
+		cli.StringFlag{
+			Name:  "taxonomy",
+			Usage: "risk taxonomy JSON file",
+			Value: "common/syntaxflow/sfrisk/taxonomy.json",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		dir := c.String("dir")
+		taxonomyFile := c.String("taxonomy")
+		data, err := os.ReadFile(taxonomyFile)
+		if err != nil {
+			return utils.Wrapf(err, "read risk taxonomy %s failed (pass --taxonomy)", taxonomyFile)
+		}
+		checker, err := sfrisk.NewChecker(data)
+		if err != nil {
+			return utils.Wrapf(err, "parse risk taxonomy %s failed", taxonomyFile)
+		}
+		result, err := sfbuildin.CheckBuiltinRiskTypes(dir, checker)
+		if err != nil {
+			return utils.Wrapf(err, "check built-in risk types failed")
+		}
+		log.Infof("inspected %d rules (%d libraries), %d alerts, %d risk types",
+			result.RuleCount, result.LibraryCount, result.AlertCount, len(result.CanonicalTypes))
+		if len(result.Violations) > 0 {
+			for _, violation := range result.Violations {
+				println(violation)
+			}
+			return utils.Errorf("built-in risk type check failed with %d violation(s)", len(result.Violations))
+		}
+		return nil
+	},
+}
+
+var syntaxflowFormat = &cli.Command{
+	Name:    "syntaxflow-format",
+	Aliases: []string{"sf-format", "sf-fmt"},
+	Usage:   "format SyntaxFlow rule",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "rule-version-output,o",
+			Usage: "generate rule_versions.json from formatted rules to this file",
+		},
+		cli.StringFlag{
+			Name:  "rule-version-baseline",
+			Usage: "existing rule_versions.json used as the version baseline (defaults to --rule-version-output)",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if len(c.Args()) == 0 {
+			log.Errorf("syntaxflow-format: no file provided")
+		}
+
+		var errors error
+		format := func(fileName string) error {
+			// Check if the file has .sf extension
+			if !strings.HasSuffix(fileName, ".sf") {
+				log.Infof("syntaxflow-format: skipping file %s (not a .sf file)", fileName)
+				return nil
+			}
+			raw, err := os.ReadFile(fileName)
+			if err != nil {
+				log.Errorf("failed to read file %s: %v", fileName, err)
+				return err
+			}
+			rule, err := sfvm.FormatRule(string(raw))
+			if err != nil {
+				err = utils.Errorf("failed parse format file %s: %v", fileName, err)
+				log.Errorf("%v", err)
+				errors = utils.JoinErrors(errors, err)
+				return err
+			}
+
+			// check format rule
+			if _, err := sfvm.CompileRule(rule); err != nil {
+				err = utils.Errorf("failed check format file %s: %v\nformat rule: \n%s", fileName, err, rule)
+				log.Errorf("%v", err)
+				errors = utils.JoinErrors(errors, err)
+				return err
+			}
+
+			err = os.WriteFile(fileName, []byte(rule), 0o666)
+			if err != nil {
+				log.Errorf("failed to write file %s: %v", fileName, err)
+				return err
+			}
+			return nil
+		}
+
+		for _, path := range c.Args() {
+			if utils.IsFile(path) {
+				log.Infof("syntaxflow-format: processing file %s", path)
+				format(path)
+			} else if utils.IsDir(path) {
+				log.Infof("syntaxflow-format: processing directory %s", path)
+				filesys.Recursive(path, filesys.WithFileSystem(filesys.NewLocalFs()), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+					log.Infof("syntaxflow-format: processing file %s", s)
+					return format(s)
+				}))
+			} else {
+				log.Errorf("syntaxflow-format: file %s not found", path)
+			}
+		}
+
+		if output := c.String("rule-version-output"); output != "" && errors == nil {
+			var dirs []string
+			for _, path := range c.Args() {
+				if utils.IsDir(path) {
+					dirs = append(dirs, path)
+				}
+			}
+			if len(dirs) == 0 {
+				return utils.Error("--rule-version-output requires at least one directory argument")
+			}
+			// The baseline carries the previous rule versions. Without it every rule
+			// looks "new" and gets re-versioned to today, rewriting the whole table
+			// for no reason, so refuse instead of silently bumping everything.
+			baseline := c.String("rule-version-baseline")
+			if baseline == "" {
+				baseline = output
+			}
+			if !utils.IsFile(baseline) {
+				return utils.Errorf("rule version baseline not found: %s (pass --rule-version-baseline to point at the existing rule_versions.json)", baseline)
+			}
+			ruleInfos, err := sfbuildin.GenerateRuleVersionsFromLocalFS(dirs, baseline)
+			if err != nil {
+				return err
+			}
+			jsonData, err := json.MarshalIndent(ruleInfos, "", "  ")
+			if err != nil {
+				return err
+			}
+			if old, err := os.ReadFile(output); err == nil && bytes.Equal(old, jsonData) {
+				log.Infof("syntaxflow-format: rule versions unchanged, skip writing %s", output)
+			} else {
+				if err := os.WriteFile(output, jsonData, 0o666); err != nil {
+					return err
+				}
+				log.Infof("syntaxflow-format: rule versions written to %s", output)
+			}
+		}
+		return errors
+	},
+}
+
+var syntaxFlowSave = &cli.Command{
+	Name:    "syntaxflow-save",
+	Aliases: []string{"save-syntaxflow", "ssf", "sfs"},
+	Usage:   "save SyntaxFlow rule to database",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "filesystem,f",
+			Usage: "file system for MVP",
+		},
+		cli.StringFlag{
+			Name: "rule,r",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		count := 0
+		err := filesys.Recursive(c.String("filesystem"), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+			count++
+			if count > 50 {
+				return utils.Error("too many files")
+			}
+			// size > 2M will be ignored
+			if info.Size() > 2*1024*1024 {
+				return utils.Errorf("file %v size too large", s)
+			}
+			return nil
+		}))
+		if err != nil {
+			return utils.Wrap(err, "read mvp file system failed")
+		}
+
+		memfs := filesys.NewVirtualFs()
+		local := filesys.NewLocalFs()
+		err = filesys.Recursive(c.String("filesystem"), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+			raw, err := local.ReadFile(s)
+			if err != nil {
+				return nil
+			}
+			memfs.AddFile(s, string(raw))
+			return nil
+		}))
+		if err != nil {
+			return err
+		}
+
+		contentRaw, _ := local.ReadFile(c.String("rule"))
+		if len(contentRaw) > 0 {
+			err = sfdb.ImportValidRule(memfs, c.String("rule"), string(contentRaw))
+			if err != nil {
+				log.Warnf("import rule failed: %v", err)
+			}
+			return nil
+		}
+
+		entrys, err := utils.ReadDir(c.String("rule"))
+		if err != nil {
+			return err
+		}
+		for _, entry := range entrys {
+			contentRaw, _ := local.ReadFile(entry.Path)
+			if len(contentRaw) <= 0 {
+				continue
+			}
+			err = sfdb.ImportValidRule(memfs, entry.Path, string(contentRaw))
+			if err != nil {
+				log.Warnf("import rule failed: %v", err)
+				continue
+			}
+		}
+		return nil
+	},
+}
+
+var ssaRisk = &cli.Command{
+	Name:      "ssa-risk",
+	Aliases:   []string{"ssa-risk", "sr"},
+	Usage:     "View and filter risk report",
+	UsageText: `yak ssa-risk --input <report.json> [--severity <level>] [--rule <keyword>] [--with-code]`,
+	Description: `Read risk report JSON (typically generated by code-scan) and print a readable summary.
+Use --severity and --rule to filter output.`,
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "input,i",
+			Usage: "risk report JSON file path",
+		},
+		cli.StringFlag{
+			Name:  "program,p",
+			Usage: "program name in database (reserved for future online export mode)",
+		},
+		// 	cli.StringFlag{
+		// 		Name: "format",
+		// 		Usage: `output format:
+		// * sarif - SARIF format output
+		// * irify - IRify format (truncated file content)
+		// * irify-full - IRify format with full file content
+		// * irify-react-report - IRify React report format
+		// 	`,
+		// 	},
+		// TODO: 更详细的过滤器可能要和risk filter对接
+		cli.StringFlag{
+			Name:  "severity",
+			Usage: "filter by severity level (critical, high, middle, low)",
+		},
+		cli.StringFlag{
+			Name:  "rule",
+			Usage: "filter by rule name (partial match)",
+		},
+		cli.BoolFlag{
+			Name:  "with-code",
+			Usage: "include code fragments in output",
+		},
+	},
+	Action: func(c *cli.Context) (e error) {
+		input := c.String("input")
+		program := c.String("program")
+
+		showAll := func(content []byte) error {
+			var report sfreport.Report
+			if err := json.Unmarshal(content, &report); err != nil {
+				return utils.Wrap(err, "failed to parse JSON file")
+			}
+
+			// format := sfreport.ReportTypeFromString(c.String("format"))
+			severityFilter := c.String("severity")
+			ruleFilter := c.String("rule")
+			withCode := c.Bool("with-code")
+			return outputConsole(os.Stdout, &report, severityFilter, ruleFilter, withCode)
+		}
+
+		if input != "" {
+			if !utils.IsFile(input) {
+				return utils.Errorf("input file not found: %v", input)
+			}
+
+			content, err := os.ReadFile(input)
+			if err != nil {
+				return utils.Wrap(err, "failed to read input file")
+			}
+
+			// 检查文件是否为空
+			if len(content) == 0 {
+				fmt.Println("Input file is empty (no security risks found)")
+				fmt.Println("This usually means no security risks were detected during the scan")
+				return nil
+			}
+
+			// 检查文件是否包含有效的 JSON
+			if !json.Valid(content) {
+				fmt.Printf("Input file contains invalid JSON\n")
+				fmt.Printf("File content: %s\n", string(content))
+				return utils.Errorf("input file contains invalid JSON")
+			}
+
+			// 尝试解析 JSON 以检查结构
+			var testReport sfreport.Report
+			if err := json.Unmarshal(content, &testReport); err != nil {
+				fmt.Printf("Input file is not a valid risk report JSON\n")
+				fmt.Printf("Parse error: %v\n", err)
+				return utils.Wrap(err, "failed to parse JSON file")
+			}
+
+			return showAll(content)
+		} else if program != "" {
+			config, err := parseSFScanConfigFromCli(c)
+			if err != nil {
+				log.Errorf("parse config failed: %s", err)
+				return err
+			}
+			defer config.DeferFunc()
+
+			ctx := context.Background()
+			_ = ctx
+			// prog, err := getProgram(ctx, config)
+			// if err != nil {
+			// 	log.Errorf("get program failed: %s", err)
+			// 	return err
+			// }
+
+			// ruleFilter := &ypb.SyntaxFlowRuleFilter{
+			// 	Language:          []string{prog.GetLanguage()},
+			// 	FilterLibRuleKind: yakit.FilterLibRuleFalse,
+			// }
+
+			var content []byte
+			// riskCh, err := scan(ctx, prog.GetProgramName(), ruleFilter, true)
+			if err != nil {
+				log.Errorf("scan failed: %s", err)
+				// log.Infof("you can use `yak ssa-risk -p %s --task-id \"%s\" -o xxx`", prog.GetProgramName(), taskId)
+				return err
+			}
+			opt := []sfreport.Option{}
+			if c.Bool("with-file-content") {
+				opt = append(opt, sfreport.WithFileContent(true))
+			}
+			if c.Bool("with-dataflow-path") {
+				opt = append(opt, sfreport.WithDataflowPath(true))
+			}
+
+			// 创建一个缓冲区来捕获ShowRisk的输出
+			// var buffer bytes.Buffer
+			// ShowRisk(config.Format, riskCh, &buffer, opt...)
+			// content = buffer.Bytes()
+
+			return showAll(content)
+		}
+
+		return nil
+	},
+}
+
+var ssaCodeScan = &cli.Command{
+	Name:      "code-scan",
+	Aliases:   []string{"codescan,sfscan"},
+	Usage:     "Scan code with source/struct/ssa SyntaxFlow rules",
+	UsageText: `yak code-scan (--target <path> | --program <name> | --config <json>) [options]`,
+	Description: `Recommended scanning command for CI and batch jobs.
+code-scan is scan-only: both --target and --program run source, struct, and ssa.
+--target inspects live local files, compiles (struct at compile time), reloads IR, then SSA.
+--program does not compile: source from IrSource, struct inside one application/library, then SSA.
+Exports structured report (sarif/irify).`,
+	Flags: []cli.Flag{
+		// Input {{{
+		// config file (when specified, use config-scan mode)
+		cli.StringFlag{
+			Name:  "config,c",
+			Usage: "JSON configuration file path (recommended for CI and complex scans)",
+		},
+		// program name
+		cli.StringFlag{
+			Name:  "program,p",
+			Usage: "existing program name in SSA database (scan only, no compile)",
+		},
+		// target path
+		cli.StringFlag{
+			Name:  "target,t",
+			Usage: "live source path: inspect local files, compile+struct, reload, then SSA",
+		},
+
+		cli.StringFlag{
+			Name:  "language,l",
+			Usage: "source language (auto-detect when omitted)",
+		},
+
+		cli.BoolFlag{
+			Name:  "memory,mem",
+			Usage: "run scan in memory mode (results not persisted)",
+		},
+		cli.StringFlag{
+			Name:  "database,db",
+			Usage: "SSA database path",
+		},
+		// }}}
+
+		// result show option
+		// cli.BoolFlag{
+		// 	Name:  "code,show-code",
+		// 	Usage: "show code",
+		// },
+
+		// Rule {{{
+
+		// rule filter
+		cli.StringFlag{
+			Name:  "rule-keyword,rk,kw",
+			Usage: `filter rules by keyword`,
+		},
+
+		// rule group filter
+		cli.StringSliceFlag{
+			Name:  "rule-group,rg",
+			Usage: `filter rules by group name (can be used multiple times)`,
+		},
+		// }}}
+
+		// output {{{
+		cli.StringFlag{
+			Name:  "output,o",
+			Usage: "output file path (extension auto-appended by --format)",
+		},
+		cli.StringFlag{
+			Name: "format",
+			Usage: `output file format:
+	* sarif 
+	* irify (default) (can config with --with-file-content and --with-dataflow-path)
+	`,
+			// * irify-full (with all info)
+			// * irify-react-report (save database and generate react report in IRify frontend)
+			// 	`,
+		},
+
+		cli.BoolFlag{
+			Name:  "with-file-content",
+			Usage: "include full file content in the output (only for irify format)",
+		},
+		cli.BoolFlag{
+			Name:  "with-dataflow-path",
+			Usage: "include dataflow path in the output (only for irify format)",
+		},
+		// }}}
+
+		cli.StringFlag{
+			Name:  "log-level,loglevel",
+			Usage: `set log level, default is info, optional value: debug, info, warn, error`,
+		},
+
+		cli.DurationFlag{
+			Name:  "rule-timeout",
+			Usage: "per-rule wall-clock budget (e.g. 5m, 4h); a pathological rule is bailed at the budget instead of hanging the scan. default 4h (loose backstop so slow rules surface real perf bugs, not masked); 0 disables",
+			Value: 4 * time.Hour,
+		},
+
+		cli.Int64Flag{
+			Name:  "rule-work-limit",
+			Usage: "per-rule total-work budget: max fanout elements (per <typeName>/<getReturns>/.../dataflow source/descent node) one rule may process across all opcodes; a heavy rule is bailed at the budget (partial results) instead of accumulating an unbounded edge graph that OOMs on large projects. default 50000 (validated on dotCMS/core: default-concurrency scan finishes in ~2m with ~4GB peak RSS); 0 disables (only --rule-timeout applies)",
+			Value: ssaconfig.DefaultScanRuleWorkLimit,
+		},
+
+		cli.StringFlag{
+			Name:  "exclude-file",
+			Usage: `exclude files by glob, e.g. targets/*, vendor/*`,
+		},
+
+		cli.BoolFlag{
+			Name: "no-save-risk",
+			Usage: "do not persist SyntaxFlow risks or audit result data; risks are still written to " +
+				"--output/report callbacks and scan task status is still recorded",
+		},
+
+		cli.StringFlag{
+			Name:  "syntaxflow,sf",
+			Usage: "custom rules: inline syntaxflow, .sf/.syntaxflow file, or directory",
+		},
+
+		cli.StringSliceFlag{
+			Name:  "mode",
+			Usage: "product scan stages, stacked: source, struct, ssa. Repeat or comma-separate, e.g. --mode source --mode struct. code-scan defaults to all three; the ScanProject primitive defaults to compile-only when no mode is given",
+		},
+
+		cli.StringFlag{
+			Name:  "debug",
+			Usage: "enable pprof/debug output: specify a directory path; creates structured output with ssadb.db, log, report, cmd.txt, and pprof subdirectories",
+		},
+	},
+	Action: func(c *cli.Context) (e error) {
+		defer func() {
+			log.Infof("code scan done")
+			if err := recover(); err != nil {
+				log.Errorf("code scan failed: %s", err)
+				utils.PrintCurrentGoroutineRuntimeStack()
+				log.Infof("please use yak `ssa-risk` can export rest result")
+				e = utils.Errorf("code scan failed: %s", err)
+			}
+		}()
+		ctx := context.Background()
+
+		if debugDir := c.String("debug"); debugDir != "" {
+			cleanup, err := setupDebugDir(c, debugDir)
+			if err != nil {
+				return utils.Errorf("setup debug dir failed: %v", err)
+			}
+			defer cleanup()
+		}
+
+		if logLevel := c.String("log-level"); logLevel != "" {
+			level, err := log.ParseLevel(logLevel)
+			if err != nil {
+				log.Warnf("parse log level %s failed: %v, use info level", logLevel, err)
+				level = log.InfoLevel
+			}
+			log.SetLevel(level)
+		}
+
+		// 检查是否指定了 config 文件，如果是则走 config-scan 模式
+		configFilePath := c.String("config")
+		useConfigMode := configFilePath != ""
+
+		if useConfigMode {
+			log.Infof("============= start config-based code scan ==============")
+		} else {
+			log.Infof("============= start to scan code ==============")
+		}
+		log.Infof("[code-scan] mode: scan source/struct/ssa via syntaxflow_scan.ScanProject (-t compiles then reloads; -p does not compile)")
+
+		ruleTimeStart := time.Now()
+		SyncEmbedRule()
+		ruleTime := time.Since(ruleTimeStart)
+		_ = ruleTime
+		log.Infof("sync rule from embed to database success, cost %v", ruleTime)
+
+		if databaseRaw := c.String("database"); databaseRaw != "" {
+			if err := consts.SetGormSSAProjectDatabaseByInfo(databaseRaw); err != nil {
+				return utils.Errorf("set database by info %s failed: %v", databaseRaw, err)
+			}
+		}
+		// Parse configuration
+		var config *ssaCliConfig
+		var err error
+		if useConfigMode {
+			config, err = parseConfigFileWithCliFlagOverride(c)
+		} else {
+			config, err = parseSFScanConfigFromCli(c)
+		}
+
+		if err != nil {
+			log.Errorf("parse config failed: %s", err)
+			return err
+		}
+		// Ensure the file is closed after we're done
+		defer config.DeferFunc()
+		logCompileStageMessage("code-scan", config)
+		log.Infof("[code-scan] scan stage: config-mode=%v report-format=%v output=%q",
+			useConfigMode, config.Format, config.GetOutputFile(),
+		)
+
+		log.Infof("================= get or parse rule ================")
+
+		opt := []sfreport.Option{}
+		if c.Bool("with-file-content") {
+			opt = append(opt, sfreport.WithFileContent(true))
+		}
+		if c.Bool("with-dataflow-path") {
+			opt = append(opt, sfreport.WithDataflowPath(true))
+		}
+		reportInstance, err := sfreport.ConvertSyntaxFlowResultToReport(config.Format, opt...)
+		if err != nil {
+			log.Errorf("create report instance failed: %s", err)
+			return err
+		}
+		reportInstance.SetWriter(config.OutputWriter)
+
+		scanOpt := make([]ssaconfig.Option, 0)
+		if config != nil && config.Config != nil {
+			if raw, jsonErr := config.Config.ToJSONRaw(); jsonErr == nil && len(raw) > 0 {
+				scanOpt = append(scanOpt, ssaconfig.WithJsonRawConfig(raw))
+			}
+		}
+		ruleSource := "database builtin rules (with filter)"
+		customRuleCount := 0
+		if path := c.String("syntaxflow"); path != "" {
+			syntaxFlows, isPath, err := loadSyntaxFlowInputs(path)
+			if err != nil {
+				return err
+			}
+			if isPath {
+				for _, sf := range syntaxFlows {
+					scanOpt = append(scanOpt, ssaconfig.WithRuleInputRaw(sf))
+				}
+				ruleSource = fmt.Sprintf("custom rules from path: %s", path)
+				customRuleCount = len(syntaxFlows)
+			} else {
+				scanOpt = append(scanOpt, ssaconfig.WithRuleInputRaw(path))
+				ruleSource = "inline syntaxflow expression"
+				customRuleCount = 1
+			}
+		}
+		log.Infof("[code-scan] rule source: %s (custom-rule-count=%d)", ruleSource, customRuleCount)
+
+		// code-scan is the human-facing scan command, so an omitted --mode keeps
+		// scanning everything. The ScanProject primitive itself treats an empty
+		// mode list as compile-only for reuse-driven callers.
+		modes := c.StringSlice("mode")
+		if len(modes) == 0 {
+			modes = []string{syntaxflow_scan.SourceMode, syntaxflow_scan.StructMode, syntaxflow_scan.SSAMode}
+		}
+		scanOpt = append(scanOpt, syntaxflow_scan.WithMode(modes...))
+
+		scanOpt = append(scanOpt,
+			syntaxflow_scan.WithReporter(reportInstance),
+			syntaxflow_scan.WithProcessRuleDetail(true),
+			syntaxflow_scan.WithStageCallback(func(stage syntaxflow_scan.ProductStage, overall, progress float64, info *syntaxflow_scan.RuleProcessInfoList) {
+				log.Infof("[code-scan] %s (%s) stage=%.0f%% overall=%.0f%%",
+					stage.DisplayName(), stage, progress*100, overall*100)
+			}),
+		)
+
+		if useConfigMode {
+			// config-scan 模式：不使用规则过滤（配置文件中已经指定了规则）
+			// 注意：不使用 WithRuleFilterLanguage 进行数据库级别的语言过滤
+			// 因为这会排除 general 语言的通用规则（如"检测通用硬编码凭据"）
+			// 语言过滤在运行时由 Query 函数处理，会自动包含 general 语言的规则
+			scanOpt = append(scanOpt,
+				ssaconfig.WithRuleFilterLibRuleKind("noLib"), // 不包含辅助规则
+				ssaconfig.WithSyntaxFlowMemory(config.GetSyntaxFlowMemory()),
+			)
+			if config != nil && config.Config != nil {
+				if ruleFilter := config.Config.GetRuleFilter(); ruleFilter != nil {
+					scanOpt = append(scanOpt, ssaconfig.WithRuleFilter(ruleFilter))
+				}
+			}
+		} else {
+			// 普通模式：使用命令行参数的规则过滤
+			ruleFilter := &ypb.SyntaxFlowRuleFilter{
+				Keyword:           c.String("rule-keyword"),
+				FilterLibRuleKind: filterLibRuleFalse,
+			}
+			// Handle rule group filtering
+			if groupNames := c.StringSlice("rule-group"); len(groupNames) > 0 {
+				ruleFilter.GroupNames = groupNames
+			}
+			scanOpt = append(scanOpt,
+				ssaconfig.WithRuleFilter(ruleFilter),
+				ssaconfig.WithSyntaxFlowMemory(c.Bool("memory")),
+			)
+		}
+
+		// Per-rule wall-clock budget (default 4h via the flag Value). Bounds
+		// pathological heavy rules — e.g. dataflow(include=...) matching tens of
+		// thousands of sources on a large project — so they are bailed at the
+		// budget instead of hanging the scan. --rule-timeout 0 disables.
+		scanOpt = append(scanOpt, ssaconfig.WithScanRuleTimeout(c.Duration("rule-timeout")))
+
+		// Per-rule total-work budget: max fanout elements (per
+		// <typeName>/<getReturns>/.../dataflow source/dataflow descent node)
+		// processed in one rule, across all opcodes. Bounds the within-opcode
+		// fanout that the wall-clock budget only catches after the fact, so heavy
+		// rules bail at N operations (partial results) instead of doing tens of
+		// millions of per-element MergeAnchor(Clone)+AppendPredecessor ops that
+		// hang for hours. Default 200k (tune via --rule-work-limit); 0 disables
+		// (only --rule-timeout applies).
+		scanOpt = append(scanOpt, ssaconfig.WithScanRuleWorkLimit(c.Int64("rule-work-limit")))
+
+		scanOpt = append(scanOpt,
+			syntaxflow_scan.WithProcessCallback(func(taskID, status string, progress float64, info *syntaxflow_scan.RuleProcessInfoList) {
+				// Minimal header always shown
+				log.Infof("[Task %s]", taskID)
+				log.Infof("\tstatus=%s progress=%.2f%%", status, progress*100.0)
+
+				if info == nil {
+					return
+				}
+				log.Infof("\tFailed=%d Skipped=%d Success=%d Finished=%d Total=%d Risk=%d",
+					info.FailedQuery, info.SkippedQuery, info.SuccessQuery,
+					info.FinishedQuery, info.TotalQuery, info.RiskCount,
+				)
+
+				if len(info.Rules) == 0 {
+					return
+				}
+
+				var runningRules []*syntaxflow_scan.RuleProcessInfo
+				for _, rule := range info.Rules {
+					if !rule.Finished {
+						runningRules = append(runningRules, rule)
+					}
+				}
+
+				var b bytes.Buffer
+				b.WriteString("\tRules:\n")
+				for _, rule := range info.Rules {
+					var duration string
+					if rule.StartTime > 0 {
+						durationSec := time.Since(time.Unix(rule.StartTime, 0)).Seconds()
+						duration = fmt.Sprintf("duration=%.1fs", durationSec)
+					} else {
+						duration = "duration=unknown"
+					}
+
+					statusIndicator := "RUNNING"
+					if rule.Finished {
+						statusIndicator = "DONE"
+					}
+
+					b.WriteString(fmt.Sprintf("  - [%s] [%6.2f%%]: [%s/%s] %s status=%s\n",
+						statusIndicator, rule.Progress*100, rule.ProgramName, rule.RuleName,
+						duration, rule.Info,
+					))
+				}
+				log.Info(b.String())
+
+				if len(runningRules) > 0 {
+					log.Debugf("\t=== DEBUG: %d rule(s) still running ===", len(runningRules))
+					for _, rule := range runningRules {
+						var durationSec float64
+						if rule.StartTime > 0 {
+							durationSec = time.Since(time.Unix(rule.StartTime, 0)).Seconds()
+						}
+						log.Debugf("\t  -> RUNNING: %s/%s (progress=%.2f%%, running for %.1fs, info: %s)",
+							rule.ProgramName, rule.RuleName, rule.Progress*100, durationSec, rule.Info)
+					}
+				}
+			}),
+		)
+
+		projectResult, err := syntaxflow_scan.ScanProject(ctx, scanOpt...)
+		if err != nil {
+			log.Errorf("scan failed: %s", err)
+			return err
+		}
+		for _, outcome := range projectResult.Stages {
+			log.Infof("[code-scan] stage %s (%s) status=%s duration_ms=%d rules=%d risks=%d",
+				outcome.Stage.DisplayName(), outcome.Stage, outcome.Status,
+				outcome.DurationMs, outcome.RuleCount, outcome.RiskCount)
+		}
+		return nil
+	},
+}
+
+func formatDuration(d time.Duration) string {
+	if d == 0 {
+		return "0.00ns"
+	}
+	units := []time.Duration{time.Hour, time.Minute, time.Second, time.Millisecond, time.Microsecond, time.Nanosecond}
+	names := []string{"h", "m", "s", "ms", "us", "ns"}
+
+	for i, u := range units {
+		if d >= u {
+			val := float64(d) / float64(u)
+			return fmt.Sprintf("%4.2f%s", val, names[i])
+		}
+	}
+	// fallback (shouldn't normally be reached)
+	return fmt.Sprintf("%.2fns", float64(d)/float64(time.Nanosecond))
+}
+
+var syntaxFlowEvaluate = &cli.Command{
+	Name:    "syntaxflow-evaluate",
+	Aliases: []string{"sf-evaluate"},
+	Usage:   "evaluate SyntaxFlow rule quality and provide score",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "target,t",
+			Usage: "target file or directory to evaluate",
+		},
+		cli.StringFlag{
+			Name:  "output,o",
+			Usage: "output file for evaluation result (json format)",
+		},
+		cli.BoolFlag{
+			Name:  "verbose,v",
+			Usage: "verbose output with detailed problems",
+		},
+		cli.BoolFlag{
+			Name:  "json",
+			Usage: "output in JSON format",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		target := c.String("target")
+		output := c.String("output")
+		verbose := c.Bool("verbose")
+		jsonOutput := c.Bool("json")
+
+		if target == "" {
+			return utils.Error("target file or directory is required")
+		}
+
+		// Check if target exists
+		if !utils.IsFile(target) && !utils.IsDir(target) {
+			return utils.Errorf("target file or directory not found: %v", target)
+		}
+
+		results := make(map[string]*sfanalysis.SyntaxFlowRuleAnalyzeResult)
+
+		// Process single file or directory
+		if utils.IsFile(target) {
+			if !strings.HasSuffix(target, ".sf") {
+				return utils.Error("target file must be a .sf file")
+			}
+
+			content, err := os.ReadFile(target)
+			if err != nil {
+				return utils.Errorf("failed to read file %s: %v", target, err)
+			}
+			fileName := filepath.Base(target)
+
+			report := sfanalysis.Analyze(context.Background(), string(content), sfanalysis.WithProfile(sfanalysis.ProfileQuality))
+			result := report.Quality
+			if result == nil {
+				result = &sfanalysis.SyntaxFlowRuleAnalyzeResult{Score: sfanalysis.MinScore, MaxScore: sfanalysis.MaxScore}
+			}
+			results[fileName] = result
+		} else {
+			// Process directory
+			err := filesys.Recursive(target, filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+				if !strings.HasSuffix(s, ".sf") {
+					return nil
+				}
+
+				content, err := os.ReadFile(s)
+				if err != nil {
+					log.Errorf("failed to read file %s: %v", s, err)
+					return nil
+				}
+				fileName := filepath.Base(s)
+				report := sfanalysis.Analyze(context.Background(), string(content), sfanalysis.WithProfile(sfanalysis.ProfileQuality))
+				result := report.Quality
+				if result == nil {
+					result = &sfanalysis.SyntaxFlowRuleAnalyzeResult{Score: sfanalysis.MinScore, MaxScore: sfanalysis.MaxScore}
+				}
+				results[fileName] = result
+				return nil
+			}))
+			if err != nil {
+				return utils.Errorf("failed to process directory: %v", err)
+			}
+		}
+
+		if len(results) == 0 {
+			return utils.Error("no .sf files found to evaluate")
+		}
+
+		// Output results
+		if jsonOutput || output != "" {
+			// JSON output
+			jsonData, err := json.MarshalIndent(results, "", "  ")
+			if err != nil {
+				return utils.Errorf("failed to marshal results to JSON: %v", err)
+			}
+
+			if output != "" {
+				err = os.WriteFile(output, jsonData, 0o666)
+				if err != nil {
+					return utils.Errorf("failed to write output file: %v", err)
+				}
+				log.Infof("Evaluation results written to %s", output)
+			} else {
+				fmt.Println(string(jsonData))
+			}
+		} else {
+			// Human-readable output
+			for fileName, result := range results {
+				fmt.Printf("\n=== %s ===\n", fileName)
+				fmt.Printf("得分: %d/%d\n", result.Score, result.MaxScore)
+				grade := sfanalysis.GetGrade(result.Score)
+				fmt.Printf("等级: %s (%s)\n", grade, sfanalysis.GetGradeDescription(grade))
+
+				// 始终显示问题概览
+				if len(result.Problems) > 0 {
+					errorCount := 0
+					warningCount := 0
+					infoCount := 0
+
+					for _, problem := range result.Problems {
+						switch problem.Severity {
+						case sfanalysis.Error:
+							errorCount++
+						case sfanalysis.Warning:
+							warningCount++
+						case sfanalysis.Info:
+							infoCount++
+						}
+					}
+
+					fmt.Printf("问题概览: ")
+					if errorCount > 0 {
+						fmt.Printf("%d个错误 ", errorCount)
+					}
+					if warningCount > 0 {
+						fmt.Printf("%d个警告 ", warningCount)
+					}
+					if infoCount > 0 {
+						fmt.Printf("%d个建议 ", infoCount)
+					}
+					fmt.Printf("\n")
+
+					// 简要显示主要问题
+					fmt.Printf("主要问题:\n")
+					for i, problem := range result.Problems {
+						if i >= 3 && !verbose { // 非详细模式只显示前3个问题
+							fmt.Printf("  ... (还有 %d 个问题，使用 -v 查看详情)\n", len(result.Problems)-3)
+							break
+						}
+						fmt.Printf("  • [%s] %s\n", problem.Severity, problem.Description)
+					}
+				} else {
+					fmt.Printf("未发现问题\n")
+				}
+
+				// 详细模式显示完整信息
+				if verbose && len(result.Problems) > 0 {
+					fmt.Printf("\n详细问题信息:\n")
+					for i, problem := range result.Problems {
+						fmt.Printf("  %d. [%s] %s\n", i+1, problem.Severity, problem.Description)
+						if problem.Suggestion != "" {
+							fmt.Printf("     建议: %s\n", problem.Suggestion)
+						}
+						if problem.Range != nil {
+							fmt.Printf("     位置: 第%d行第%d列 - 第%d行第%d列\n",
+								problem.Range.StartLine, problem.Range.StartColumn,
+								problem.Range.EndLine, problem.Range.EndColumn)
+						}
+						fmt.Printf("\n")
+					}
+				}
+			}
+
+			// Summary
+			if len(results) > 1 {
+				fmt.Printf("\n=== 总结 ===\n")
+				total := 0
+				for _, result := range results {
+					total += result.Score
+				}
+				average := float64(total) / float64(len(results))
+				fmt.Printf("平均得分: %.1f/100\n", average)
+				fmt.Printf("评估文件数: %d\n", len(results))
+			}
+		}
+
+		return nil
+	},
+}
+
+var ssaQuery = &cli.Command{
+	Name:      "ssa-query",
+	Aliases:   []string{"sf", "syntaxFlow"},
+	Usage:     "Run SyntaxFlow query against existing SSA program",
+	UsageText: `yak ssa-query --program <name> --syntaxflow <rule|file|dir> [options]`,
+	Description: `Use this command for manual rule verification and interactive debugging.
+Unlike code-scan, this command runs query-style output rather than batch report pipeline.`,
+	Flags: []cli.Flag{
+		cli.StringFlag{Name: "log", Usage: "log level: debug, info, warn, error"},
+		cli.StringFlag{
+			Name:  "program,p",
+			Usage: `program name in SSA database`,
+		},
+		cli.StringFlag{
+			Name:  "syntaxflow,sf",
+			Usage: "syntaxflow input: inline code, .sf/.syntaxflow file, or directory",
+		},
+		cli.StringFlag{
+			Name:  "database,db",
+			Usage: "SSA database path",
+		},
+		cli.StringFlag{
+			Name:  "database-dialect,db-dialect",
+			Usage: "database dialect for gorm, support: mysql, sqlite3(default)",
+		},
+		cli.BoolFlag{
+			Name:  "database-debug,dbdebug",
+			Usage: "enable database debug mode",
+		},
+		cli.BoolFlag{
+			Name:  "syntaxflow-debug,sfdebug",
+			Usage: "enable syntax flow debug mode",
+		},
+		cli.BoolFlag{
+			Name: "dot", Usage: "print dot graph in query result",
+		},
+		cli.BoolFlag{
+			Name: "with-code,code", Usage: "show code context in query result",
+		},
+		cli.StringFlag{
+			Name: "sarif,sarif-export,o", Usage: "export matched results to SARIF file",
+		},
+		cli.BoolFlag{
+			Name: "save,s", Usage: "save the risk to the database",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if ret, err := log.ParseLevel(c.String("log")); err == nil {
+			log.SetLevel(ret)
+		}
+		log.Infof("[ssa-query] mode: query existing program(s) via SyntaxFlowQuery (manual testing and rule debugging)")
+		programName := c.String("program")
+		databaseFileRaw := c.String("database")
+		databaseDialect := c.String("database-dialect")
+		dbDebug := c.Bool("database-debug")
+		sfDebug := c.Bool("syntaxflow-debug")
+		syntaxFlow := c.String("syntaxflow")
+		showDot := c.Bool("dot")
+		withCode := c.Bool("with-code")
+		saverisk := c.Bool("save")
+
+		// set database
+		if databaseDialect != "" {
+			// if set dialect, open gorm and set db
+			if databaseFileRaw == "" {
+				return utils.Errorf("database path is required when using database dialect")
+			}
+			db, err := gorm.Open(databaseDialect, databaseFileRaw)
+			if err != nil {
+				return utils.Errorf("open database failed: %v", err)
+			}
+			consts.SetGormSSAProjectDatabase(db)
+		} else if databaseFileRaw != "" {
+			// set database path
+			if utils.GetFirstExistedFile(databaseFileRaw) == "" {
+				// no compile ,database not existed
+				return utils.Errorf("database file not found: %v use default database", databaseFileRaw)
+			}
+			consts.SetGormSSAProjectDatabaseByInfo(databaseFileRaw)
+		}
+
+		sarifFile := c.String("sarif")
+		if sarifFile != "" {
+			if filepath.Ext(sarifFile) != ".sarif" {
+				sarifFile += ".sarif"
+			}
+		}
+
+		haveSarifRequired := false
+		if sarifFile != "" {
+			haveSarifRequired = true
+		}
+		var results []*ssaapi.SyntaxFlowResult
+		// one callback serves both query output and SARIF export. It used to be
+		// assigned again further down (for positional rules / directories),
+		// which silently dropped every collected result and produced an empty
+		// SARIF file.
+		sarifCallback := func(result *ssaapi.SyntaxFlowResult) {
+			if result == nil || result.IsLib() {
+				return
+			}
+			values := result.GetAlertValues()
+			if values.Len() != 0 {
+				result.Show()
+				if saverisk {
+					result.Save(schema.SFResultKindQuery)
+				}
+			}
+			if haveSarifRequired {
+				// SARIF conversion consumes built risk objects (YieldRisk);
+				// query-mode results only carry alert values until CreateRisk.
+				if result.RiskCount() == 0 {
+					_ = result.CreateRisk()
+				}
+				results = append(results, result)
+			}
+		}
+
+		defer func() {
+			if len(results) > 0 && sarifFile != "" {
+				log.Infof("fetch result: %v, exports sarif to %v", len(results), sarifFile)
+				sarifReport, err := sfreport.ConvertSyntaxFlowResultsToSarif(results...)
+				if err != nil {
+					log.Errorf("convert SARIF failed: %v", err)
+					return
+				}
+				if err := publishReportFile(sarifFile, func(path string) error {
+					return sarifReport.WriteFile(path)
+				}); err != nil {
+					log.Errorf("write SARIF failed: %v", err)
+				}
+			}
+		}()
+
+		if syntaxFlow != "" {
+			syntaxFlows, isPath, err := loadSyntaxFlowInputs(syntaxFlow)
+			if err != nil {
+				return err
+			}
+			if isPath {
+				if len(syntaxFlows) == 0 {
+					return utils.Errorf("no .sf/.syntaxflow rule found in path: %s", syntaxFlow)
+				}
+				for _, sf := range syntaxFlows {
+					if err := SyntaxFlowQuery(programName, sf, dbDebug, sfDebug, showDot, withCode, sarifCallback); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			return SyntaxFlowQuery(programName, syntaxFlow, dbDebug, sfDebug, showDot, withCode, sarifCallback)
+		}
+
+		var dirChecking []string
+		handleBySyntaxFlowContent := func(syntaxFlow string) error {
+			err := SyntaxFlowQuery(programName, syntaxFlow, dbDebug, sfDebug, showDot, withCode, sarifCallback)
+			if err != nil {
+				return err
+			}
+			fmt.Println()
+			return nil
+		}
+
+		handleByFilename := func(filename string) error {
+			log.Infof("start to use SyntaxFlow rule: %v", filename)
+			raw, err := os.ReadFile(filename)
+			if err != nil {
+				return utils.Wrapf(err, "read %v failed", filename)
+			}
+			return handleBySyntaxFlowContent(string(raw))
+		}
+
+		var errs []error
+		var cmdArgs []string = c.Args()
+		for _, originName := range cmdArgs {
+			name := utils.GetFirstExistedFile(originName)
+			if name == "" {
+				infos, _ := utils.ReadDir(originName)
+				if len(infos) > 0 {
+					dirChecking = append(dirChecking, originName)
+					continue
+				}
+
+				if filepath.IsAbs(originName) {
+					log.Warnf("cannot find rule as %v", originName)
+				} else {
+					absName, _ := filepath.Abs(originName)
+					if absName != "" {
+						log.Warnf("cannot find rule as %v(abs: %v)", originName, absName)
+					} else {
+						log.Warnf("cannot find rule as %v", originName)
+					}
+				}
+				continue
+			}
+			err := handleByFilename(name)
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		for _, dir := range dirChecking {
+			log.Infof("start to read directory: %v", dir)
+			err := filesys.Recursive(dir, filesys.WithRecursiveDirectory(true), filesys.WithFileStat(func(s string, info fs.FileInfo) error {
+				fileExt := strings.ToLower(filepath.Ext(s))
+				if strings.HasSuffix(fileExt, ".sf") {
+					err := handleByFilename(s)
+					if err != nil {
+						errs = append(errs, err)
+					}
+				}
+				return nil
+			}))
+			if err != nil {
+				log.Warnf("read directory [%v] failed: %v", dir, err)
+			}
+		}
+
+		if len(cmdArgs) <= 0 {
+			prog, err := ssaapi.FromDatabase(programName)
+			if err != nil {
+				log.Errorf("load program [%v] from database failed: %v", programName, err)
+				return err
+			}
+
+			// use database
+			db := consts.GetGormProfileDatabase()
+			expected := []string{""}
+			expected = append(expected, string(prog.GetLanguage()))
+			db = bizhelper.ExactQueryStringArrayOr(db, "language", expected)
+			for result := range sfdb.YieldSyntaxFlowRules(db, context.Background()) {
+				err := handleBySyntaxFlowContent(result.Content)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+
+		if len(errs) > 0 {
+			var buf bytes.Buffer
+			for i, e := range errs {
+				buf.WriteString("  ")
+				buf.WriteString(fmt.Sprintf("%-2d: ", i+1))
+				buf.WriteString(e.Error())
+				buf.WriteByte('\n')
+			}
+			return utils.Errorf("many error happened: \n%v", buf.String())
+		}
+
+		return nil
+	},
+}
+
+// filterLibRuleFalse mirrors yakit.FilterLibRuleFalse without importing the
+// gRPC/DB facade into the slim SSA CLI.
+const filterLibRuleFalse = "noLib"
+
+var ssacBaseCommands = []*cli.Command{
+	// program manage
+	ssaRemove,  // remove program from database
+	ssaCompile, // compile program
+	ssaProgram,
+
+	// rule manage
+	syntaxFlowCreate,   // create rule template
+	syntaxflowFormat,   //  format syntaxflow rule
+	syntaxFlowSave,     // save rule to database
+	syntaxFlowEvaluate, // evaluate rule quality
+	syntaxFlowExport,   // export rule to file
+	syntaxFlowImport,   // import rule from file
+	syncRule,           // sync rule from embed to database
+	verifyBuiltinRisk,  // verify builtin rule risk types from local files
+	// risk manage
+	ssaRisk, // export risk report
+
+	staticCheck,
+	ssaQuery, // rule scan target from database
+
+	// all in one
+	ssaCodeScan, // compile and scan and export report (CLI args or config file)
+}
+
+// SSACompilerCommands is the full SSA CLI command set. AI-dependent commands
+// are appended by ssacli_ai.go in the default build; the ssa_only profile
+// leaves extraSSACommands empty so the slim binary never imports the AI tree.
+var SSACompilerCommands = append([]*cli.Command{}, ssacBaseCommands...)
+
+func init() {
+	SSACompilerCommands = append(SSACompilerCommands, extraSSACommands...)
+}
+
+// SyntaxFlowQuery 函数用于执行语法流查询
+func SyntaxFlowQuery(
+	programName string, // 程序名称
+	syntaxFlow string, // 语法流
+	dbDebug, sfDebug, showDot, withCode bool, // 是否开启数据库调试、语法流调试、显示dot、显示代码
+	callbacks ...func(*ssaapi.SyntaxFlowResult), // 回调函数
+) error {
+	// 捕获panic
+	defer func() {
+		if err := recover(); err != nil {
+			utils.PrintCurrentGoroutineRuntimeStack()
+		}
+	}()
+
+	// 检查程序名称是否为空
+	if programName == "" {
+		return utils.Error("program name is required when using syntax flow query language")
+	}
+	// program from database
+	prog, err := ssaapi.FromDatabase(programName)
+	if err != nil {
+		log.Errorf("load program [%v] from database failed: %v", programName, err)
+	}
+	// Overlay programs must be queried through their merged dual-source
+	// instance; the raw program only carries the diff layer's IR.
+	queryTarget, qtErr := ssaapi.NewProgramFromDB(programName)
+	if qtErr != nil || queryTarget == nil {
+		queryTarget = prog
+	}
+	if dbDebug && prog != nil {
+		prog.DBDebug()
+	}
+	opt := make([]ssaapi.QueryOption, 0)
+	if sfDebug {
+		opt = append(opt, ssaapi.QueryWithEnableDebug())
+	}
+	var execError error
+	result, err := queryTarget.SyntaxFlowWithError(syntaxFlow, opt...)
+	if err != nil {
+		var otherErrs []string
+		if result != nil && len(result.GetErrors()) > 0 {
+			otherErrs = utils.StringArrayFilterEmpty(utils.RemoveRepeatStringSlice(result.GetErrors()))
+		}
+		execError = utils.Wrapf(err, "prompt error: \n%v", strings.Join(otherErrs, "\n  "))
+	}
+	if result == nil {
+		return execError
+	}
+
+	for _, c := range callbacks {
+		c(result)
+	}
+
+	log.Infof("syntax flow query result:")
+	result.Show(
+		sfvm.WithShowAll(sfDebug),
+		sfvm.WithShowCode(withCode),
+		sfvm.WithShowDot(showDot),
+	)
+	return execError
+}
+
+func outputJSON(writer io.Writer, report *sfreport.Report) error {
+	jsonData, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return utils.Wrap(err, "failed to marshal JSON")
+	}
+	_, err = writer.Write(jsonData)
+	return err
+}
+
+func outputSARIF(writer io.Writer, report *sfreport.Report) error {
+	fmt.Fprintf(writer, "SARIF format output not fully implemented yet.\n")
+	fmt.Fprintf(writer, "Please use 'irify' or 'irify-full' format for now.\n")
+	return outputJSON(writer, report)
+}
+
+func outputConsole(writer io.Writer, report *sfreport.Report, severityFilter, ruleFilter string, withCode bool) error {
+	filteredRisks := filterRisks(report.Risks, severityFilter, ruleFilter)
+
+	fmt.Fprintf(writer, "=== Scan Report Summary ===\n")
+	fmt.Fprintf(writer, "Scan Time: %s\n", report.ReportTime.Format("2006-01-02T15:04:05-07:00"))
+	fmt.Fprintf(writer, "Program: %s\n", report.ProgramName)
+	fmt.Fprintf(writer, "Language: %s\n", report.ProgramLang)
+	fmt.Fprintf(writer, "Files Scanned: %d\n", report.FileCount)
+	fmt.Fprintf(writer, "Lines of Code: %d\n", report.CodeLineCount)
+	fmt.Fprintf(writer, "Risks Found: %d\n", len(filteredRisks))
+	fmt.Fprintf(writer, "\n")
+
+	fmt.Fprintf(writer, "=== Risk Details ===\n")
+	riskCount := 0
+	for hash, risk := range filteredRisks {
+		riskCount++
+		fmt.Fprintf(writer, "Risk ID: %s\n", hash)
+		fmt.Fprintf(writer, "Title: %s\n", risk.GetTitleVerbose())
+		fmt.Fprintf(writer, "Severity: %s\n", risk.GetSeverity())
+		fmt.Fprintf(writer, "Location: %s:%d\n", risk.GetCodeSourceURL(), risk.GetLine())
+
+		description := risk.GetDescription()
+		if description != "" {
+			cleanDesc := strings.TrimSpace(description)
+			fmt.Fprintf(writer, "Description: %s\n", cleanDesc)
+		}
+
+		solution := risk.GetSolution()
+		if solution != "" {
+			cleanSolution := strings.TrimSpace(solution)
+			if len(cleanSolution) > 200 {
+				cleanSolution = cleanSolution[:200] + "..."
+			}
+			fmt.Fprintf(writer, "Solution: %s\n", cleanSolution)
+		}
+
+		if withCode {
+			fmt.Fprintf(writer, "Affected Code:\n")
+			codeFragment := risk.GetCodeFragment()
+			if codeFragment != "" {
+				codeLines := strings.Split(codeFragment, "\n")
+				for _, line := range codeLines {
+					fmt.Fprintf(writer, "  %s\n", line)
+				}
+			}
+		}
+
+		fmt.Fprintf(writer, "\n")
+	}
+
+	fmt.Fprintf(writer, "=== Affected Files ===\n")
+	for _, file := range report.File {
+		hasFilteredRisks := false
+		filteredFileRisks := []string{}
+		for _, riskHash := range file.Risks {
+			if _, exists := filteredRisks[riskHash]; exists {
+				hasFilteredRisks = true
+				filteredFileRisks = append(filteredFileRisks, riskHash)
+			}
+		}
+
+		if hasFilteredRisks {
+			fmt.Fprintf(writer, "File: %s\n", file.Path)
+			fmt.Fprintf(writer, "Lines: %d\n", file.LineCount)
+			fmt.Fprintf(writer, "Risk IDs: %s\n", strings.Join(filteredFileRisks, ", "))
+			fmt.Fprintf(writer, "\n")
+		}
+	}
+
+	return nil
+}
+
+func filterRisks(risks map[string]*sfreport.Risk, severityFilter, ruleFilter string) map[string]*sfreport.Risk {
+	filtered := make(map[string]*sfreport.Risk)
+
+	for hash, risk := range risks {
+		if severityFilter != "" && !strings.EqualFold(risk.GetSeverity(), severityFilter) {
+			continue
+		}
+
+		if ruleFilter != "" && !strings.Contains(strings.ToLower(risk.GetRuleName()), strings.ToLower(ruleFilter)) {
+			continue
+		}
+
+		filtered[hash] = risk
+	}
+
+	return filtered
+}

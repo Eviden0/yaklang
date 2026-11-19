@@ -1,0 +1,952 @@
+package ssaconfig
+
+import (
+	"strings"
+	"time"
+
+	"github.com/samber/lo"
+)
+
+// 基础信息配置
+type BaseInfo struct {
+	ProgramNames []string `json:"program_names"`
+	// TODO: set project ID should update config with this project??
+	ProjectID          uint64   `json:"project_id"`
+	ProjectName        string   `json:"project_name"`
+	ProjectDescription string   `json:"project_description"`
+	Language           Language `json:"language"`
+	Tags               []string `json:"tags"`
+}
+
+type ASTSequenceType int
+
+const (
+	// OutOfOrder parses concurrently and delivers each file as it finishes.
+	// Compile results must not depend on source order. A dependency that only
+	// appears when files are sorted is a bug in the frontend, not a reason to
+	// buffer every AST until the input order can be restored.
+	OutOfOrder ASTSequenceType = iota
+)
+
+// --- 基础信息配置 Get/Set 方法 ---
+
+func (c *Config) GetProjectID() uint64 {
+	if c == nil || c.BaseInfo == nil {
+		return 0
+	}
+	return c.BaseInfo.ProjectID
+}
+
+func (c *Config) GetProgramName() string {
+	if c == nil || c.BaseInfo == nil || len(c.BaseInfo.ProgramNames) == 0 {
+		return ""
+	}
+	return c.BaseInfo.ProgramNames[0]
+}
+
+func (c *Config) GetLatestProgramName() string {
+	if c == nil || c.BaseInfo == nil || len(c.BaseInfo.ProgramNames) == 0 {
+		return ""
+	}
+	return c.BaseInfo.ProgramNames[len(c.BaseInfo.ProgramNames)-1]
+}
+
+func (c *Config) GetProgramNames() []string {
+	if c == nil || c.BaseInfo == nil {
+		return nil
+	}
+	return c.BaseInfo.ProgramNames
+}
+
+func (c *Config) GetProjectName() string {
+	if c == nil || c.BaseInfo == nil {
+		return ""
+	}
+	return c.BaseInfo.ProjectName
+}
+
+func (c *Config) GetProjectDescription() string {
+	if c == nil || c.BaseInfo == nil {
+		return ""
+	}
+	return c.BaseInfo.ProjectDescription
+}
+
+func (c *Config) GetLanguage() Language {
+	if c == nil || c.BaseInfo == nil {
+		return ""
+	}
+	return c.BaseInfo.Language
+}
+
+func (c *Config) GetTags() []string {
+	if c == nil || c.BaseInfo == nil {
+		return nil
+	}
+	return c.BaseInfo.Tags
+}
+
+// SetProgramName 设置程序名（单个程序名）
+func (c *Config) SetProgramName(name string) {
+	if c == nil {
+		return
+	}
+	if c.BaseInfo == nil {
+		c.BaseInfo = defaultBaseInfo()
+	}
+	c.BaseInfo.ProgramNames = []string{name}
+}
+
+// --- 基础信息配置 Options ---
+
+// WithProjectID 设置 SSA 项目 ID（导出名为 ssa.withProjectID）
+// 参数:
+//   - projectId: 项目 ID
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withProjectID(1)
+// println(opt)
+// ```
+func WithProjectID(projectId uint64) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Project ID"); err != nil {
+			return err
+		}
+		c.BaseInfo.ProjectID = projectId
+		return nil
+	}
+}
+
+// WithProjectName 设置 SSA 项目名称（导出名为 ssa.withProjectName）
+// 参数:
+//   - name: 项目名称
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withProjectName("my-project")
+// println(opt)
+// ```
+func WithProjectName(name string) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Project Name"); err != nil {
+			return err
+		}
+		c.BaseInfo.ProjectName = name
+		return nil
+	}
+}
+
+// WithProjectTags 设置 SSA 项目标签（导出名为 ssa.withProjectTags）
+// 参数:
+//   - tags: 标签列表
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withProjectTags(["java", "demo"])
+// println(opt)
+// ```
+func WithProjectTags(tags []string) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Project Tags"); err != nil {
+			return err
+		}
+		c.BaseInfo.Tags = tags
+		return nil
+	}
+}
+
+// WithProjectDescription 设置 SSA 项目描述（导出名为 ssa.withProjectDescription）
+// 参数:
+//   - s: 项目描述
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withProjectDescription("a demo project")
+// println(opt)
+// ```
+func WithProjectDescription(s string) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Project Description"); err != nil {
+			return err
+		}
+		c.BaseInfo.ProjectDescription = s
+		return nil
+	}
+}
+
+// WithProgramNames 追加要编译/加载的程序名（导出名为 ssa.withProgramName）
+// 参数:
+//   - programName: 一个或多个程序名
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withProgramName("my-program")
+// println(opt)
+// ```
+func WithProgramNames(programName ...string) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Program Name"); err != nil {
+			return err
+		}
+		c.BaseInfo.ProgramNames = append(c.BaseInfo.ProgramNames, programName...)
+		return nil
+	}
+}
+
+// WithSetProgramName 设置主 program 名称（替换而非追加，导出名为 ssa.withSetProgramName）
+// 用于新编译场景：当 config 从项目 JSON 加载时可能包含旧的 program_names，
+// 调用此选项可强制使用新生成的 program 名称，避免复用数据库中的旧 program
+// 参数:
+//   - name: 新的主程序名
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withSetProgramName("new-program")
+// println(opt)
+// ```
+func WithSetProgramName(name string) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Program Name"); err != nil {
+			return err
+		}
+		c.BaseInfo.ProgramNames = []string{name}
+		return nil
+	}
+}
+
+// WithProgramDescription 设置程序描述（导出名为 ssa.withDescription）
+// 参数:
+//   - description: 程序描述
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withDescription("program description")
+// println(opt)
+// ```
+func WithProgramDescription(description string) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Program Description"); err != nil {
+			return err
+		}
+		c.BaseInfo.ProjectDescription = description
+		return nil
+	}
+}
+
+// WithProjectRawLanguage 以字符串形式设置项目编程语言（导出名为 ssa.withLanguage）
+// 参数:
+//   - language: 语言名称，如 "java"、"yak"、"php"、"golang"
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withLanguage("java")
+// println(opt)
+// ```
+func WithProjectRawLanguage(language string) Option {
+	return func(c *Config) error {
+		if strings.TrimSpace(language) == "" {
+			return nil
+		}
+		if err := c.ensureBase("Project Raw Language"); err != nil {
+			return err
+		}
+		var err error
+		if c.BaseInfo.Language, err = ValidateLanguage(language); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+// WithProjectLanguage 以语言枚举形式设置项目编程语言（导出名为 ssa.withProjectLanguage）
+// 参数:
+//   - language: 语言枚举，如 ssa.Java、ssa.Yak、ssa.PHP
+//
+// 返回值:
+//   - 编译/项目配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withProjectLanguage(ssa.Java)
+// println(opt)
+// ```
+func WithProjectLanguage(language Language) Option {
+	return func(c *Config) error {
+		if err := c.ensureBase("Program Language"); err != nil {
+			return err
+		}
+		c.BaseInfo.Language = language
+		return nil
+	}
+}
+
+// SSACompileConfig controls project-wide SSA compilation (JSON field `SSACompile` on the root config).
+//
+// Large-project notes:
+//   - compile_concurrency: one cap for AST parse workers, declaration
+//     PreHandler, independent compile-unit groups, and opted-in Java
+//     library/method-body drains. Default is machine CPU (GOMAXPROCS-1)
+//     further capped so each worker has at least 256MiB of usable RAM.
+//   - compile_memory_limit: Go soft heap limit. Default is 80% of
+//     cgroup/host RAM. 0 in JSON means that auto value.
+//   - exclude_files / entry_files: primary levers to shrink work.
+//   - peephole_size: splits the virtual FS into multiple compile chunks (multiple programs).
+//   - enable_incremental_compile + base_program_name: incremental / diff workflows.
+//   - memory_compile: memory-only program cache (some CLIs force DB mode).
+//
+// Parsed files are delivered as they finish. There is no input-order or
+// reverse-order mode: both buffered every AST and hid order-dependent builds.
+// Pre-handler pipeline channel sizing is capped in ssareducer.pipeInitBufSize (not proportional to total file count).
+type SSACompileConfig struct {
+	StrictMode   bool     `json:"strict_mode"`
+	PeepholeSize int      `json:"peephole_size"`
+	ExcludeFiles []string `json:"exclude_files"`
+	// DisableDefaultExcludes turns off the built-in default compile exclude
+	// patterns (test fixtures, build outputs, dependency archives, ...).
+	// When true, only ExcludeFiles (user-provided patterns) apply. This is
+	// the escape hatch for embedders/tests that need full-tree scanning.
+	DisableDefaultExcludes   bool          `json:"disable_default_excludes,omitempty"`
+	EntryFiles               []string      `json:"entry_files,omitempty"`
+	ReCompile                bool          `json:"re_compile"`
+	MemoryCompile            bool          `json:"memory_compile"`
+	Concurrency              int           `json:"compile_concurrency"`
+	MemoryLimit              int64         `json:"compile_memory_limit,omitempty"`
+	CompileIrCacheTTL        time.Duration `json:"compile_ir_cache_ttl"`
+	CompileIrCacheMax        int           `json:"compile_ir_cache_max"`
+	FilePerformanceLog       bool          `json:"file_performance_log"`
+	Diagnostics              bool          `json:"diagnostics"`
+	StopOnCliCheck           bool          `json:"stop_on_cli_check"`
+	EnableIncrementalCompile bool          `json:"enable_incremental_compile"`
+	BaseProgramName          string        `json:"base_program_name"`
+	// CompileProjectBytes is runtime-only input for adaptive compile IR cache
+	// tuning. It reflects the total source bytes that will enter the compile
+	// stage and is intentionally excluded from JSON persistence.
+	CompileProjectBytes int64 `json:"-"`
+	// CompileUnitSplit is runtime-only. Unit-split compilation persists IR at
+	// SCC boundaries, so the IR cache must keep reload support instead of using
+	// the resident-only fast path for small projects.
+	CompileUnitSplit bool `json:"-"`
+}
+
+// --- 编译配置 Get/Set 方法 ---
+
+func (c *Config) GetCompileStrictMode() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.StrictMode
+}
+
+func (c *Config) SetCompileStrictMode(strictMode bool) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.StrictMode = strictMode
+}
+
+func (c *Config) GetCompilePeepholeSize() int {
+	if c == nil || c.SSACompile == nil {
+		return 0
+	}
+	return c.SSACompile.PeepholeSize
+}
+
+func (c *Config) SetCompilePeepholeSize(peepholeSize int) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.PeepholeSize = peepholeSize
+}
+
+func (c *Config) GetCompileExcludeFiles() []string {
+	if c == nil || c.SSACompile == nil {
+		return nil
+	}
+	return c.SSACompile.ExcludeFiles
+}
+
+func (c *Config) SetCompileExcludeFiles(excludeFiles []string) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	// 支持逗号分隔多个文件模式
+	allFiles := lo.FlatMap(excludeFiles, func(item string, index int) []string {
+		return strings.Split(item, ",")
+	})
+	c.SSACompile.ExcludeFiles = allFiles
+}
+
+func (c *Config) GetCompileDisableDefaultExcludes() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.DisableDefaultExcludes
+}
+
+func (c *Config) GetCompileEntryFiles() []string {
+	if c == nil || c.SSACompile == nil {
+		return nil
+	}
+	return c.SSACompile.EntryFiles
+}
+
+func (c *Config) SetCompileEntryFiles(entryFiles []string) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	allFiles := lo.FlatMap(entryFiles, func(item string, index int) []string {
+		return strings.Split(item, ",")
+	})
+	c.SSACompile.EntryFiles = allFiles
+}
+
+func (c *Config) GetCompileReCompile() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.ReCompile
+}
+
+func (c *Config) SetCompileReCompile(reCompile bool) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.ReCompile = reCompile
+}
+
+func (c *Config) GetCompileMemory() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.MemoryCompile
+}
+
+func (c *Config) SetCompileMemory(memory bool) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.MemoryCompile = memory
+}
+
+func (c *Config) GetCompileConcurrency() int {
+	if c == nil || c.SSACompile == nil || c.SSACompile.Concurrency <= 0 {
+		return defaultCompileConcurrency()
+	}
+	return c.SSACompile.Concurrency
+}
+
+func (c *Config) SetCompileConcurrency(concurrency int) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.Concurrency = concurrency
+}
+
+func (c *Config) GetCompileMemoryLimit() int64 {
+	if c != nil && c.SSACompile != nil && c.SSACompile.MemoryLimit > 0 {
+		return c.SSACompile.MemoryLimit
+	}
+	return DefaultCompileMemoryLimit()
+}
+
+func (c *Config) SetCompileMemoryLimit(limit int64) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.MemoryLimit = limit
+}
+
+func (c *Config) GetCompileIrCacheTTL() time.Duration {
+	if c == nil || c.SSACompile == nil {
+		return 0
+	}
+	return c.SSACompile.CompileIrCacheTTL
+}
+
+func (c *Config) SetCompileIrCacheTTL(ttl time.Duration) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.CompileIrCacheTTL = ttl
+}
+
+func (c *Config) GetCompileIrCacheMax() int {
+	if c == nil || c.SSACompile == nil {
+		return 0
+	}
+	return c.SSACompile.CompileIrCacheMax
+}
+
+func (c *Config) SetCompileIrCacheMax(max int) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.CompileIrCacheMax = max
+}
+
+func (c *Config) GetCompileProjectBytes() int64 {
+	if c == nil || c.SSACompile == nil {
+		return 0
+	}
+	return c.SSACompile.CompileProjectBytes
+}
+
+func (c *Config) SetCompileProjectBytes(size int64) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.CompileProjectBytes = size
+}
+
+func (c *Config) GetCompileUnitSplit() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.CompileUnitSplit
+}
+
+func (c *Config) SetCompileUnitSplit(enable bool) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.CompileUnitSplit = enable
+}
+
+func (c *Config) GetCompileFilePerformanceLog() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.FilePerformanceLog
+}
+
+func (c *Config) SetCompileFilePerformanceLog(enable bool) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.FilePerformanceLog = enable
+}
+
+func (c *Config) GetCompileDiagnostics() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.Diagnostics
+}
+
+func (c *Config) SetCompileDiagnostics(enable bool) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.Diagnostics = enable
+}
+
+// --- 编译配置 Options ---
+
+// WithCompileStrictMode 设置编译严格模式（导出名为 ssa.withStrictMode）
+// 参数:
+//   - strictMode: 是否开启严格模式
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withStrictMode(true)
+// println(opt)
+// ```
+func WithCompileStrictMode(strictMode bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Strict Mode"); err != nil {
+			return err
+		}
+		c.SSACompile.StrictMode = strictMode
+		return nil
+	}
+}
+
+// WithCompilePeepholeSize 设置窥视孔大小，用于将虚拟文件系统切分为多个编译块（导出名为 ssa.withPeepholeSize）
+// 参数:
+//   - peepholeSize: 窥视孔大小
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withPeepholeSize(100)
+// println(opt)
+// ```
+func WithCompilePeepholeSize(peepholeSize int) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Peephole Size"); err != nil {
+			return err
+		}
+		c.SSACompile.PeepholeSize = peepholeSize
+		return nil
+	}
+}
+
+// WithCompileExcludeFiles 设置编译时排除的文件（导出名为 ssa.withExcludeFile / ssa.withDefaultExcludeFunc）
+// 参数:
+//   - excludeFiles: 要排除的文件路径模式，支持逗号分隔多个模式
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withExcludeFile("**/test/**", "**/*.min.js")
+// println(opt)
+// ```
+func WithCompileExcludeFiles(excludeFiles ...string) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Exclude Files"); err != nil {
+			return err
+		}
+		// 支持逗号分隔多个文件模式
+		allFiles := lo.FlatMap(excludeFiles, func(item string, index int) []string {
+			return strings.Split(item, ",")
+		})
+		c.SSACompile.ExcludeFiles = append(c.SSACompile.ExcludeFiles, allFiles...)
+		return nil
+	}
+}
+
+// WithCompileDisableDefaultExcludes 禁用内置默认编译排除项
+//
+// 默认情况下，编译排除匹配器会合并一组内置排除模式（测试代码/fixtures、
+// 构建产物、依赖归档等，见 DefaultCompileExcludePatterns）。设置本选项后，
+// 内置排除项不再生效，仅保留用户通过 withExcludeFile 显式提供的排除模式。
+// 这恢复了内置排除项引入之前的全量扫描行为，供需要完整扫描的嵌入方和测试使用。
+//
+// 参数:
+//   - disable: true 表示禁用内置默认排除项
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withDisableDefaultCompileExcludes(true)
+// println(opt)
+// ```
+func WithCompileDisableDefaultExcludes(disable bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Disable Default Excludes"); err != nil {
+			return err
+		}
+		c.SSACompile.DisableDefaultExcludes = disable
+		return nil
+	}
+}
+
+// WithCompileEntryFiles 设置入口文件
+func WithCompileEntryFiles(entryFiles ...string) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Entry Files"); err != nil {
+			return err
+		}
+		allFiles := lo.FlatMap(entryFiles, func(item string, index int) []string {
+			return strings.Split(item, ",")
+		})
+		c.SSACompile.EntryFiles = append(c.SSACompile.EntryFiles, allFiles...)
+		return nil
+	}
+}
+
+// WithCompileReCompile 设置是否强制重新编译（导出名为 ssa.withReCompile）
+// 参数:
+//   - reCompile: 是否忽略缓存重新编译
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withReCompile(true)
+// println(opt)
+// ```
+func WithCompileReCompile(reCompile bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Re Compile"); err != nil {
+			return err
+		}
+		c.SSACompile.ReCompile = reCompile
+		return nil
+	}
+}
+
+// WithCompileMemoryCompile 设置是否在内存中编译（不落库，导出名为 ssa.withMemory）
+// 参数:
+//   - memoryCompile: 是否使用内存编译，缺省为 true
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withMemory(true)
+// println(opt)
+// ```
+func WithCompileMemoryCompile(memoryCompile ...bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Memory Compile"); err != nil {
+			return err
+		}
+		enable := true
+		if len(memoryCompile) > 0 {
+			enable = memoryCompile[0]
+		}
+		c.SSACompile.MemoryCompile = enable
+		return nil
+	}
+}
+
+// WithCompileConcurrency sets the compile worker cap (ssa.withConcurrency).
+// AST parse, declaration PreHandler, independent unit groups, and opted-in
+// Java library body drains all share this value. 0 or unset uses the
+// machine default from CompileConcurrencyFor.
+func WithCompileConcurrency(concurrency int) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Concurrency"); err != nil {
+			return err
+		}
+		c.SSACompile.Concurrency = concurrency
+		return nil
+	}
+}
+
+// WithCompileMemoryLimit sets the compile soft heap limit in bytes.
+// 0 restores the machine default (80% of cgroup/host RAM).
+func WithCompileMemoryLimit(limit int64) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Memory Limit"); err != nil {
+			return err
+		}
+		c.SSACompile.MemoryLimit = limit
+		return nil
+	}
+}
+
+func WithCompileIrCacheTTL(ttl time.Duration) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile IR Cache TTL"); err != nil {
+			return err
+		}
+		c.SSACompile.CompileIrCacheTTL = ttl
+		return nil
+	}
+}
+
+func WithCompileIrCacheMax(max int) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile IR Cache Max"); err != nil {
+			return err
+		}
+		c.SSACompile.CompileIrCacheMax = max
+		return nil
+	}
+}
+
+// WithCompileFilePerformanceLog 设置是否记录文件级别性能日志（导出名为 ssa.withFilePerformanceLog）
+// 参数:
+//   - enable: 是否开启文件级别性能日志
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withFilePerformanceLog(true)
+// println(opt)
+// ```
+func WithCompileFilePerformanceLog(enable bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile File Performance Log"); err != nil {
+			return err
+		}
+		c.SSACompile.FilePerformanceLog = enable
+		return nil
+	}
+}
+
+// WithCompileDiagnostics enables nested SSA diagnostics TRACE output.
+func WithCompileDiagnostics(enable bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Compile Diagnostics"); err != nil {
+			return err
+		}
+		c.SSACompile.Diagnostics = enable
+		return nil
+	}
+}
+
+// WithStopOnCliCheck 设置当检测到 cli.check() 时快速停止构建
+func WithStopOnCliCheck(stopOnCliCheck bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Stop On Cli Check"); err != nil {
+			return err
+		}
+		c.SSACompile.StopOnCliCheck = stopOnCliCheck
+		return nil
+	}
+}
+
+// --- 增量编译配置 Get/Set 方法 ---
+
+func (c *Config) GetEnableIncrementalCompile() bool {
+	if c == nil || c.SSACompile == nil {
+		return false
+	}
+	return c.SSACompile.EnableIncrementalCompile
+}
+
+func (c *Config) SetEnableIncrementalCompile(enable bool) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.EnableIncrementalCompile = enable
+}
+
+func (c *Config) GetBaseProgramName() string {
+	if c == nil || c.SSACompile == nil {
+		return ""
+	}
+	return c.SSACompile.BaseProgramName
+}
+
+func (c *Config) SetBaseProgramName(baseProgramName string) {
+	if c == nil {
+		return
+	}
+	if c.SSACompile == nil {
+		c.SSACompile = defaultSSACompileConfig()
+	}
+	c.SSACompile.BaseProgramName = baseProgramName
+	// 如果设置了 baseProgramName，自动启用增量编译
+	if baseProgramName != "" {
+		c.SSACompile.EnableIncrementalCompile = true
+	}
+}
+
+// --- 增量编译配置 Options ---
+
+// WithEnableIncrementalCompile 启用增量编译（导出名为 ssa.withEnableIncrementalCompile）
+// 如果启用增量编译但 BaseProgramName 为空，表示这是第一次增量编译（base program）
+// 参数:
+//   - enable: 是否启用增量编译
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withEnableIncrementalCompile(true)
+// println(opt)
+// ```
+func WithEnableIncrementalCompile(enable bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Enable Incremental Compile"); err != nil {
+			return err
+		}
+		c.SSACompile.EnableIncrementalCompile = enable
+		return nil
+	}
+}
+
+// WithBaseProgramName 设置基础程序名称用于差量编译（导出名为 ssa.withBaseProgramName）
+// 设置后会自动启用增量编译
+// 参数:
+//   - baseProgramName: 作为增量编译基线的程序名
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withBaseProgramName("base-program")
+// println(opt)
+// ```
+func WithBaseProgramName(baseProgramName string) Option {
+	return func(c *Config) error {
+		if err := c.ensureSSACompile("Base Program Name"); err != nil {
+			return err
+		}
+		c.SSACompile.BaseProgramName = baseProgramName
+		// 如果设置了 baseProgramName，自动启用增量编译
+		if baseProgramName != "" {
+			c.SSACompile.EnableIncrementalCompile = true
+		}
+		return nil
+	}
+}

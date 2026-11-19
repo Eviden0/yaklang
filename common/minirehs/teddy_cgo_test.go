@@ -1,0 +1,282 @@
+//go:build cgo
+
+package minirehs
+
+import (
+	"fmt"
+	"math/rand"
+	"strings"
+	"testing"
+)
+
+// 本文件验证真正的 Teddy SIMD 多字面量预过滤 (native/teddy.c): SIMD 分发结果必须与标量孪生
+// 逐项一致, 且与独立的纯 Go Aho-Corasick (scalarPrefilter) 命中集合完全相等. 预过滤允许假阳、
+// 绝无假阴, 故 Teddy(指纹+confirm) 与 AC 应产出同一精确命中集.
+
+func liFromLiterals(lits []string) *literalIndex {
+	cps := make([]*compiledPattern, 0, len(lits))
+	for i, l := range lits {
+		cps = append(cps, &compiledPattern{id: PatternID(i + 1), idx: i, literals: []string{l}})
+	}
+	return buildLiteralIndex(cps)
+}
+
+func hitSet(hits []litHit) map[litHit]struct{} {
+	m := make(map[litHit]struct{}, len(hits))
+	for _, h := range hits {
+		m[h] = struct{}{}
+	}
+	return m
+}
+
+func assertSameHits(t *testing.T, got, want map[litHit]struct{}, ctx string) {
+	t.Helper()
+	for h := range want {
+		if _, ok := got[h]; !ok {
+			t.Errorf("%s: MISSING hit litID=%d end=%d", ctx, h.litID, h.end)
+		}
+	}
+	for h := range got {
+		if _, ok := want[h]; !ok {
+			t.Errorf("%s: EXTRA hit litID=%d end=%d", ctx, h.litID, h.end)
+		}
+	}
+}
+
+// TestTeddyEnabled 验证字面量长度 >=2 时启用 Teddy, 指纹长度 = min(最短字面量, 4).
+func TestTeddyEnabled(t *testing.T) {
+	cases := []struct {
+		lits []string
+		m    int
+	}{
+		{[]string{"abc", "defg", "hijkl"}, 3},
+		{[]string{"ab", "abcdef"}, 2},
+		{[]string{"abcdef", "ghijkl", "mnopqr"}, 4},
+		{[]string{"swagger-ui.html", "rememberme="}, 4},
+	}
+	for _, c := range cases {
+		pf := newCGOPrefilter(liFromLiterals(c.lits))
+		if pf == nil {
+			t.Fatalf("nil prefilter for %v", c.lits)
+		}
+		if !pf.useTeddy() {
+			t.Errorf("expected Teddy enabled for %v", c.lits)
+		}
+		if pf.builtAC {
+			t.Error("Teddy constructor built an unused AC table")
+		}
+		if pf.teddyM() != c.m {
+			t.Errorf("lits %v: teddyM=%d want %d", c.lits, pf.teddyM(), c.m)
+		}
+		pf.release()
+	}
+
+	// 含长度 1 字面量 -> Teddy 关闭, 走 AC 回退 (仍正确).
+	pf := newCGOPrefilter(liFromLiterals([]string{"a", "bcd"}))
+	if pf == nil {
+		t.Fatal("nil prefilter")
+	}
+	if pf.useTeddy() {
+		t.Errorf("Teddy must be disabled when a length-1 literal exists")
+	}
+	if !pf.builtAC {
+		t.Error("AC fallback table missing")
+	}
+	pf.release()
+}
+
+func randLowerLiteral(r *rand.Rand) string {
+	const alpha = "abcdefghijklmnopqrstuvwxyz0123456789_.-=:/@"
+	n := 2 + r.Intn(7)
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = alpha[r.Intn(len(alpha))]
+	}
+	return string(b)
+}
+
+func TestTeddyLargePrefixIndex(t *testing.T) {
+	lits := []string{"ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefghi", "abcdefghij", "abcdefghijk", "abcdefghijkl", "abcdefghijklm", "abcdefghijklmn", "abcdefghijklmno", "abcdefghijklmnop", "abcdefghijklmnopq", "你好ab"}
+	for i := 0; i < 600; i++ {
+		lits = append(lits, fmt.Sprintf("http/1.1 200 ok\r\nserver: product-%03d.example.com", i))
+	}
+	rng := rand.New(rand.NewSource(4917))
+	for i := 0; i < 400; i++ {
+		lits = append(lits, randLowerLiteral(rng))
+	}
+	li := liFromLiterals(lits)
+	pf := newCGOPrefilter(li)
+	if pf == nil || !pf.indexedConfirm() {
+		t.Fatal("large literal set did not enable the prefix index")
+	}
+	defer pf.release()
+	ref := newScalarPrefilter(li)
+	for i := 0; i < 100; i++ {
+		in := randCorpusWith(rng, lits, 1000)
+		want := hitSet(ref.scanHits(in, &scratch{}))
+		assertSameHits(t, hitSet(pf.scanHits(in, &scratch{})), want, "indexed SIMD")
+		assertSameHits(t, hitSet(pf.scanHitsScalar(in, &scratch{})), want, "indexed scalar")
+	}
+	// Dense outputs force the indexed constructor through exact-size rescan.
+	in := []byte(strings.Repeat("ABCDEFGHIJKLMNOPQ", 3000))
+	assertSameHits(t, hitSet(pf.scanHits(in, &scratch{})), hitSet(ref.scanHits(in, &scratch{})), "indexed dense outputs")
+}
+
+func randCorpusWith(r *rand.Rand, lits []string, n int) []byte {
+	const alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _.-=:/@[]\\^`\n\t"
+	buf := make([]byte, 0, n)
+	for len(buf) < n {
+		if len(lits) > 0 && r.Intn(6) == 0 {
+			lit := lits[r.Intn(len(lits))]
+			for i := 0; i < len(lit); i++ {
+				c := lit[i]
+				if c >= 'a' && c <= 'z' && r.Intn(2) == 0 {
+					c -= 'a' - 'A'
+				}
+				buf = append(buf, c)
+			}
+			continue
+		}
+		if r.Intn(30) == 0 {
+			buf = append(buf, byte(0x80+r.Intn(0x40))) // 非 ASCII 字节
+			continue
+		}
+		buf = append(buf, alpha[r.Intn(len(alpha))])
+	}
+	return buf[:n]
+}
+
+func TestCGOPrefilterASCIIFoldDifferential(t *testing.T) {
+	cases := []struct {
+		name string
+		lits []string
+		data []byte
+	}{
+		{
+			name: "teddy",
+			lits: []string{"api-key", "authorization", "[token]", "zebra"},
+			data: []byte("API-KEY Authorization [TOKEN] ZEBRA [ToKeN] @\\^` { | } ~ \x80\xff"),
+		},
+		{
+			name: "ac-fallback",
+			lits: []string{"a", "z", "[", "_", "`"},
+			data: []byte("AZaz[]_`@\\^ { | } ~ \x80\xff"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			li := liFromLiterals(tc.lits)
+			cpf := newCGOPrefilter(li)
+			if cpf == nil {
+				t.Fatal("nil cgo prefilter")
+			}
+			defer cpf.release()
+			gopf := newScalarPrefilter(li)
+
+			simd := hitSet(cpf.scanHits(tc.data, &scratch{}))
+			scalar := hitSet(cpf.scanHitsScalar(tc.data, &scratch{}))
+			goac := hitSet(gopf.scanHits(tc.data, &scratch{}))
+			assertSameHits(t, simd, scalar, tc.name+" SIMD vs scalar")
+			assertSameHits(t, simd, goac, tc.name+" SIMD vs Go AC")
+		})
+	}
+}
+
+// TestTeddyDifferentialRandom 随机字面量集 + 随机数据: Teddy SIMD == Teddy 标量孪生 == 纯 Go AC.
+func TestTeddyDifferentialRandom(t *testing.T) {
+	r := rand.New(rand.NewSource(0x7EDD7))
+	teddySets, checks := 0, 0
+	for iter := 0; iter < 400; iter++ {
+		nlit := 1 + r.Intn(40)
+		lits := make([]string, 0, nlit)
+		for i := 0; i < nlit; i++ {
+			lits = append(lits, randLowerLiteral(r))
+		}
+		li := liFromLiterals(lits)
+		cpf := newCGOPrefilter(li)
+		if cpf == nil {
+			continue
+		}
+		gopf := newScalarPrefilter(li)
+		if cpf.useTeddy() {
+			teddySets++
+		}
+		for j := 0; j < 12; j++ {
+			size := r.Intn(2048)
+			data := randCorpusWith(r, lits, size)
+			scA, scB, scC := &scratch{}, &scratch{}, &scratch{}
+			simd := hitSet(cpf.scanHits(data, scA))
+			scal := hitSet(cpf.scanHitsScalar(data, scB))
+			goac := hitSet(gopf.scanHits(data, scC))
+			ctx := fmt.Sprintf("iter=%d j=%d teddy=%v m=%d nlit=%d size=%d", iter, j, cpf.useTeddy(), cpf.teddyM(), nlit, size)
+			assertSameHits(t, simd, scal, "simd-vs-scalar "+ctx)
+			assertSameHits(t, simd, goac, "simd-vs-goAC "+ctx)
+			checks++
+			if t.Failed() {
+				t.Fatalf("DIVERGE %s\nlits=%v\ndata=%q", ctx, lits, data)
+			}
+		}
+		cpf.release()
+	}
+	t.Logf("teddy differential: %d checks, teddy-enabled sets=%d (all consistent)", checks, teddySets)
+	if teddySets < 50 {
+		t.Fatalf("too few Teddy-enabled sets (%d)", teddySets)
+	}
+}
+
+// TestTeddyRealTrafficVsGoAC 用真实 MITM 规则提取的字面量 + 真实流量, 对照 Teddy 与纯 Go AC.
+func TestTeddyRealTrafficVsGoAC(t *testing.T) {
+	patterns, _ := compilableMITMPatterns(t)
+	cfg := newDefaultConfig()
+	var lits []string
+	for _, p := range patterns {
+		expr := buildExprWithFlags(p)
+		ls := extractRequiredLiteralsApprox(expr, cfg.minLiteralLen)
+		lits = append(lits, ls...)
+	}
+	if len(lits) == 0 {
+		t.Skip("no literals extracted")
+	}
+	li := liFromLiterals(lits)
+	cpf := newCGOPrefilter(li)
+	if cpf == nil {
+		t.Fatal("nil prefilter")
+	}
+	defer cpf.release()
+	gopf := newScalarPrefilter(li)
+	t.Logf("real literals=%d teddy=%v m=%d", len(li.literals), cpf.useTeddy(), cpf.teddyM())
+
+	records, _ := loadCorpus(t)
+	for i, rec := range records {
+		scA, scB := &scratch{}, &scratch{}
+		teddy := hitSet(cpf.scanHits(rec, scA))
+		goac := hitSet(gopf.scanHits(rec, scB))
+		assertSameHits(t, teddy, goac, fmt.Sprintf("record#%d", i))
+		if t.Failed() {
+			t.FailNow()
+		}
+	}
+}
+
+// TestTeddyLowEntropyPrefixGate guards the exact two-byte prefix check used
+// before confirm. A long repeated byte sequence must not hide a real match at
+// its tail, and SIMD/scalar/Go AC must continue to report the same hit set.
+func TestTeddyLowEntropyPrefixGate(t *testing.T) {
+	li := liFromLiterals([]string{"akia", "api-key", "secret_access_key", "sk-"})
+	cpf := newCGOPrefilter(li)
+	if cpf == nil || !cpf.useTeddy() {
+		t.Fatal("expected Teddy-enabled prefilter")
+	}
+	defer cpf.release()
+	gopf := newScalarPrefilter(li)
+	data := append([]byte(strings.Repeat("a", 256*1024)), []byte("__API-KEY__")...)
+
+	simd := hitSet(cpf.scanHits(data, &scratch{}))
+	scalar := hitSet(cpf.scanHitsScalar(data, &scratch{}))
+	goac := hitSet(gopf.scanHits(data, &scratch{}))
+	assertSameHits(t, simd, scalar, "low-entropy SIMD vs scalar")
+	assertSameHits(t, simd, goac, "low-entropy SIMD vs Go AC")
+	if len(simd) != 1 {
+		t.Fatalf("expected exactly one api-key hit, got %v", simd)
+	}
+}

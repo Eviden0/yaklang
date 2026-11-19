@@ -1,0 +1,562 @@
+package ssaapi
+
+import (
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	sf "github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+	"github.com/yaklang/yaklang/common/utils"
+)
+
+type sfCheck struct {
+	contextResult *sf.SFFrameResult
+	config        *sf.Config
+	vm            *sf.SyntaxFlowVirtualMachine
+
+	matchItem []*checkItem
+	untilItem []*checkItem
+
+	// compiledFrames memoizes sub-rule text -> compiled frame within this
+	// sfCheck (see compiledFrame). dataflow include=/exclude= sub-rules are
+	// recompiled once per sfCheck without this; the same text appears across
+	// every rule in a scan, so this avoids the regexp-compile allocation that
+	// showed up at ~10GB on large projects.
+	compiledFrames map[string]*sf.SFFrame
+
+	// beforeMergeHook runs on a child SFFrameResult before MergeByResult (e.g. dataflow
+	// only_reachable post-mode pruning include-rule captures). parent is the accumulated
+	// context result before this child merge.
+	beforeMergeHook func(parent *sf.SFFrameResult, child *sf.SFFrameResult)
+
+	// originalSnapshot captures the contextResult's named-symbol state at the
+	// first AppendItems that adds a real item (before any path/query runs for
+	// this check). clearup uses it to decide whether a child result produced NEW
+	// named output (merge) or only re-contains inherited parent vars + magic
+	// vars (skip — the Opt A 463GB saving). Snapshotting once (not per-path) is
+	// what makes the across-path case correct: a key merged by path 1 is NOT in
+	// this snapshot, so path 2's re-bind is correctly seen as new and merged.
+	//
+	// O3: the snapshot is built lazily on the first AppendItems that adds an
+	// item, NOT eagerly at CreateCheck. Empty checks (no include/exclude/until/
+	// hook sub-rules, e.g. the unconditionally-created untilCheck/hookRunner in
+	// DataFlowWithSFConfig) never build a snapshot — they never call check()/
+	// clearup, so the eager build was pure waste (43M TakeSymbolSnapshot calls /
+	// 42GB on hadoop). Building at first AppendItems is safe because AppendItems
+	// always runs before any descent for this check, and the sibling checks
+	// (untilCheck/hookRunner) are each given their items before the descent
+	// starts, so each captures its own pre-descent parent state.
+	originalSnapshot     *sf.SymbolSnapshot
+	originalSnapshotOnce sync.Once
+
+	// fastMatchMu guards fastMatchIDs, which memoizes symbol -> id set for the
+	// simple `* & $source` / `<self> & $source` fast path.
+	fastMatchMu  sync.Mutex
+	fastMatchIDs map[string]map[int64]struct{}
+}
+
+type checkItem struct {
+	*sf.RecursiveConfigItem
+	frame *sf.SFFrame
+	// matchCache memoizes per-node until/hook match results (keyed by SSA
+	// node ID) so the same node is not re-queried via a full SF sub-query
+	// when it appears in multiple descent paths. CheckUntil is the hot
+	// path: 156 sources each with deep descents call CheckUntil per node,
+	// and the same node recurs across sources. Without this cache every
+	// node visit ran a full QuerySyntaxflow, consuming 24.79% of CPU.
+	matchCache sync.Map
+}
+
+// appendSubRuleFromNativeParam adds one include/exclude/hook/until sub-rule from a native-call param if non-empty.
+func appendSubRuleFromNativeParam(check *sfCheck, params *sf.NativeCallActualParams, paramKey string, cfgKey sf.RecursiveConfigKey) {
+	if check == nil || params == nil {
+		return
+	}
+	if rule := params.GetString(paramKey); rule != "" {
+		check.AppendItems(&sf.RecursiveConfigItem{
+			Key:            string(cfgKey),
+			Value:          rule,
+			SyntaxFlowRule: true,
+		})
+	}
+}
+
+func recursiveCheckKeyLabel(key string) string {
+	switch key {
+	case sf.RecursiveConfig_Include, sf.RecursiveConfig_Exclude, sf.RecursiveConfig_Until, sf.RecursiveConfig_Hook:
+		return string(key)
+	default:
+		return "unknown"
+	}
+}
+
+func CreateCheck(
+	contextResult *sf.SFFrameResult,
+	config *sf.Config,
+	configItems ...*sf.RecursiveConfigItem,
+) *sfCheck {
+	res := &sfCheck{
+		contextResult: contextResult,
+		config:        config,
+		vm:            sf.NewSyntaxFlowVirtualMachine(),
+		matchItem:     make([]*checkItem, 0, len(configItems)),
+	}
+	contextResult.AlertSymbolTable.Delete(sf.RecursiveMagicVariable)
+	contextResult.SymbolTable.Delete(sf.RecursiveMagicVariable)
+	// Snapshot is built lazily on the first AppendItems that adds a real item
+	// (see originalSnapshot field comment); it must reflect the parent state
+	// before this check's own descent, which AppendItems precedes.
+	res.vm.SetConfig(config)
+	res.AppendItems(configItems...)
+	return res
+}
+
+func (c *sfCheck) Empty() bool {
+	return len(c.matchItem) == 0 && len(c.untilItem) == 0
+}
+
+func (c *sfCheck) SetBeforeMergeHook(f func(parent *sf.SFFrameResult, child *sf.SFFrameResult)) {
+	c.beforeMergeHook = f
+}
+
+// ensureOriginalSnapshot builds the parent-symbol snapshot once, on the first
+// call that actually adds a sub-rule item. It runs under config.Mutex so the
+// snapshot reflects a consistent parent state. Empty checks that never get a
+// real item never build a snapshot (O3: 43M wasted TakeSymbolSnapshot calls on
+// hadoop came from eagerly snapshoting every CreateCheck, including empty ones).
+func (c *sfCheck) ensureOriginalSnapshot() {
+	if c == nil || c.contextResult == nil || c.config == nil {
+		return
+	}
+	c.originalSnapshotOnce.Do(func() {
+		c.config.Mutex.Lock()
+		defer c.config.Mutex.Unlock()
+		c.originalSnapshot = sf.TakeSymbolSnapshot(c.contextResult.SymbolTable)
+	})
+}
+
+func (c *sfCheck) AppendItems(items ...*sf.RecursiveConfigItem) {
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		frame, err := c.compiledFrame(item.Value)
+		if err != nil {
+			keyName := recursiveCheckKeyLabel(item.Key)
+			// 暴露编译错误，添加到结果中以便前端可以获取
+			errorMsg := utils.Errorf("SyntaxFlow compile error for %s rule [%s]: %v", keyName, item.Value, err).Error()
+			log.Errorf(errorMsg)
+			if c.contextResult != nil {
+				c.contextResult.Errors = append(c.contextResult.Errors, errorMsg)
+			}
+			continue
+		}
+		checkItem := &checkItem{
+			RecursiveConfigItem: item,
+			frame:               frame,
+		}
+		switch item.Key {
+		case sf.RecursiveConfig_Include, sf.RecursiveConfig_Exclude:
+			c.matchItem = append(c.matchItem, checkItem)
+		case sf.RecursiveConfig_Until, sf.RecursiveConfig_Hook:
+			c.untilItem = append(c.untilItem, checkItem)
+		}
+		// A real sub-rule item was added; build the parent snapshot lazily (once).
+		c.ensureOriginalSnapshot()
+	}
+}
+
+// compiledFrame returns a compiled *sf.SFFrame for the given sub-rule text,
+// memoized within this sfCheck. dataflow(include=/exclude=) sub-rules are
+// appended once per native-call sfCheck but the SAME text (e.g.
+// `* & $params as $__next__`) is recompiled across every rule in a scan —
+// driving regexp compile to ~10GB on large projects. Memoizing per-sfCheck
+// (a) dedupes when the same text is appended more than once, and
+// (b) bounds the VM's `s.frames` slice (vm.go Compile appends without limit).
+// Lifetime is the sfCheck's (one dataflow native call), so no unbounded
+// growth and no cross-rule contention.
+func (c *sfCheck) compiledFrame(text string) (*sf.SFFrame, error) {
+	if c.compiledFrames != nil {
+		if f, ok := c.compiledFrames[text]; ok {
+			return f, nil
+		}
+	}
+	frame, err := c.vm.Compile(text)
+	if err != nil {
+		return nil, err
+	}
+	if c.compiledFrames == nil {
+		c.compiledFrames = make(map[string]*sf.SFFrame, 4)
+	}
+	c.compiledFrames[text] = frame
+	return frame, nil
+}
+
+func CreateCheckFromNativeCallParam(
+	sfResult *sf.SFFrameResult,
+	config *sf.Config,
+	params *sf.NativeCallActualParams,
+) *sfCheck {
+
+	check := CreateCheck(sfResult, config)
+	// Order preserved: exclude / include (path match) before hook / until (walk).
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamExclude, sf.RecursiveConfig_Exclude)
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamInclude, sf.RecursiveConfig_Include)
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamHook, sf.RecursiveConfig_Hook)
+	appendSubRuleFromNativeParam(check, params, NativeCall_DataflowParamUntil, sf.RecursiveConfig_Until)
+
+	return check
+}
+
+func (r *sfCheck) CheckMatch(path sf.Values) bool {
+	if r.Empty() {
+		return true
+	}
+	ret := true
+	r.check(path, r.matchItem, func(key string, match bool) bool {
+		switch key {
+		case sf.RecursiveConfig_Include:
+			if !match {
+				// RecursiveConfig_Include: If match, continue; if not, stop.
+				ret = false
+				return false // stop
+			}
+		case sf.RecursiveConfig_Exclude:
+			if match {
+				// RecursiveConfig_Exclude: If match, stop; if not, continue.
+				ret = false
+				return false // stop
+			}
+		}
+		return true // continue
+	})
+	return ret
+}
+func (r *sfCheck) CheckUntil(path sf.Values) bool {
+	if r.Empty() {
+		return false
+	}
+	until := false
+	r.check(path, r.untilItem, func(key string, match bool) bool {
+		switch key {
+		case sf.RecursiveConfig_Until:
+			if match {
+				// RecursiveConfig_Until: If match, stop; if not, continue.
+				until = true
+				return false // stop
+			}
+		case sf.RecursiveConfig_Hook:
+			// RecursiveConfig_Hook: Always continue.
+		}
+		return true // continue
+	})
+	return until
+}
+func (r *sfCheck) check(
+	path sf.Values,
+	items []*checkItem,
+	fn func(string, bool) bool,
+) {
+	opt := []QueryOption{
+		QueryWithVM(r.vm),
+		QueryWithInitVar(r.contextResult.SymbolTable),
+		QueryWithValues(path),
+	}
+	// Propagate the per-rule total-work budget into the sub-query so dataflow
+	// include/exclude/hook/until sub-rules share the parent's fanout budget
+	// (cumulative across the whole rule, not just the top-level opcodes). The
+	// budget is on r.config (the frame's sfvm.Config); nil when no budget is
+	// set (QueryWithWorkBudget is a no-op then).
+	if budget := r.config.GetWorkBudget(); budget != nil {
+		opt = append(opt, QueryWithWorkBudget(budget))
+	}
+	// The parent named-symbol state was snapshotted once at CreateCheck
+	// (r.originalSnapshot); clearup uses it to detect the child's NEW named
+	// output. No per-path re-snapshot — re-snapshotting per path is what made
+	// Opt A over-skip (a key merged by an earlier path looked "inherited" to a
+	// later path, so the later path's re-bind of it was skipped).
+	cacheKey := extractCheckNodeId(path)
+	for _, it := range items {
+		if match, ok := r.fastPathMatch(it, path); ok {
+			if !fn(it.Key, match) {
+				return
+			}
+			continue
+		}
+		if cacheKey != "" {
+			if cached, ok := it.matchCache.Load(cacheKey); ok {
+				if !fn(it.Key, cached.(bool)) {
+					return
+				}
+				continue
+			}
+		}
+		res, err := it.check(path, opt...)
+		if err != nil {
+			log.Errorf("check path value %v fail: %v", path.String(), err)
+			continue
+		}
+
+		match := isMatch(res)
+		r.clearup(res.GetSFResult())
+		if cacheKey != "" {
+			it.matchCache.Store(cacheKey, match)
+		}
+		if !fn(it.Key, match) {
+			return
+		}
+	}
+}
+
+// fastPathMatch short-circuits the most common dataflow include/exclude
+// sub-rules (`* & $source`, `<self> & $source`, and their $sink variants) by
+// checking path-node ids against the already-bound symbol set. This avoids a
+// full SyntaxFlow sub-query per enumerated path, which dominated the heavy
+// log-forging / path-traversal rules. Returns ok=false for anything it cannot
+// prove equivalent, so semantics always fall back to the full query.
+func (r *sfCheck) fastPathMatch(item *checkItem, path sf.Values) (bool, bool) {
+	if r == nil || item == nil || item.Value == "" {
+		atomic.AddInt64(&fastPathMatchCounter.fallback, 1)
+		return false, false
+	}
+	text := strings.TrimSpace(item.Value)
+	var sym string
+	switch text {
+	case "* & $source", "<self> & $source", "*& $source", "* &$source", "<self>& $source", "<self> &$source":
+		sym = "source"
+	case "* & $sink", "<self> & $sink", "*& $sink", "* &$sink", "<self>& $sink", "<self> &$sink":
+		sym = "sink"
+	default:
+		atomic.AddInt64(&fastPathMatchCounter.fallback, 1)
+		if os.Getenv("YAK_SSA_FAST_MATCH_DEBUG") != "" && atomic.AddInt64(&fastPathFallbackLogCount, 1) <= 20 {
+			log.Infof("fast-path fallback text: %q", text)
+		}
+		return false, false
+	}
+	ids := r.fastMatchSymbolIDs(sym)
+	if len(ids) == 0 {
+		// Unbound/empty symbol: the full sub-query would also produce no match,
+		// but fall back to preserve exact semantics.
+		atomic.AddInt64(&fastPathMatchCounter.fallback, 1)
+		return false, false
+	}
+	matched := false
+	path.Recursive(func(op sf.ValueOperator) error {
+		if id, ok := op.(interface{ GetId() int64 }); ok {
+			if _, ok := ids[id.GetId()]; ok {
+				matched = true
+				return utils.Error("abort")
+			}
+		}
+		return nil
+	})
+	atomic.AddInt64(&fastPathMatchCounter.hit, 1)
+	return matched, true
+}
+
+func (r *sfCheck) fastMatchSymbolIDs(name string) map[int64]struct{} {
+	if r == nil || r.contextResult == nil || name == "" {
+		return nil
+	}
+	r.fastMatchMu.Lock()
+	defer r.fastMatchMu.Unlock()
+	if r.fastMatchIDs == nil {
+		r.fastMatchIDs = make(map[string]map[int64]struct{})
+	}
+	if set, ok := r.fastMatchIDs[name]; ok {
+		return set
+	}
+	vals, ok := r.contextResult.SymbolTable.Get(name)
+	if !ok {
+		r.fastMatchIDs[name] = nil
+		return nil
+	}
+	set := make(map[int64]struct{}, len(vals))
+	for _, op := range vals {
+		if id, ok := op.(interface{ GetId() int64 }); ok {
+			if id.GetId() > 0 {
+				set[id.GetId()] = struct{}{}
+			}
+		}
+	}
+	r.fastMatchIDs[name] = set
+	return set
+}
+
+// extractCheckNodeId builds a cache key from the path values.
+// The path is a sequence of SSA nodes (e.g. A -> B -> C -> D -> E); using
+// only the first node's ID as the cache key is incorrect because two
+// different paths sharing the same first node but diverging later would
+// collide and return stale results. Instead, we collect the IDs of ALL
+// nodes in the path and join them into a string key, so the cache is
+// keyed by the full path identity.
+func extractCheckNodeId(path sf.Values) string {
+	var sb strings.Builder
+	path.Recursive(func(op sf.ValueOperator) error {
+		if v, ok := op.(interface{ GetId() int64 }); ok {
+			if i := v.GetId(); i > 0 {
+				if sb.Len() > 0 {
+					sb.WriteByte(',')
+				}
+				sb.Write(strconv.AppendInt(nil, i, 10))
+			}
+		}
+		return nil
+	})
+	return sb.String()
+}
+
+func (item *checkItem) check(value sf.Values, opt ...QueryOption) (*SyntaxFlowResult, error) {
+	if item.frame == nil {
+		return nil, utils.Errorf("syntaxflow frame is nil")
+	}
+
+	var res *SyntaxFlowResult
+	var err error
+	opt = append(opt, QueryWithFrame(item.frame))
+	res, err = QuerySyntaxflow(opt...)
+	if err != nil {
+		return nil, utils.Errorf("syntaxflow rule exec fail: %v", err)
+	}
+	return res, nil
+}
+
+func (r *sfCheck) clearup(sfres *sf.SFFrameResult) {
+	if sfres == nil {
+		return
+	}
+	r.sanitizeChildResult(sfres)
+	r.runBeforeMergeHook(sfres)
+	// CheckMatch/CheckUntil only consume isMatch(res) (a bool); the merge into
+	// the shared contextResult is a side effect. Child queries inherit the parent
+	// SymbolTable (QueryWithInitVar), so the child result re-contains every
+	// parent var; merging re-runs MergeValues on those inherited keys once per
+	// path × per source — the #1 alloc driver on large projects (MergeValues
+	// ~463GB / 27% of alloc_space).
+	//
+	// Skip the symbol/alert merge when the child produced no NEW named output:
+	// no new named key, AND no new value (by dedupKey) for an existing key.
+	// r.originalSnapshot was taken ONCE at CreateCheck (before any path), so a
+	// key/value merged by an earlier path is NOT in the snapshot — a later path's
+	// re-bind of it is correctly seen as NEW and merged (this is the Opt A
+	// over-skip fix; the per-path re-snapshot treated earlier paths' merges as
+	// "inherited" and skipped later paths' re-binds, losing them). A child that
+	// only re-contains inherited parent vars (unchanged) + magic ($__) vars has
+	// no new named output → skip (the 463GB saving). Errors/CheckParams always
+	// propagate.
+	r.config.Mutex.Lock()
+	mergeable := r.originalSnapshot.HasNewNamedValue(sfres)
+	if mergeable {
+		clearupMergeSkipCounter.addMerge()
+		r.contextResult.MergeByResultLocked(sfres)
+	} else {
+		clearupMergeSkipCounter.addSkip()
+		r.contextResult.MergeByResultMetaLocked(sfres)
+	}
+	r.config.Mutex.Unlock()
+}
+
+// clearupMergeSkipCounter is a test-only counter for how many clearup calls
+// skipped vs performed the symbol merge. Production code never reads it; the
+// atomic ops are the only cost (one per clearup, negligible vs the merge work).
+// Tests read it to assert Opt A actually skips the useless merges deterministically
+// (alloc-profile-based assertions are too noisy on small synthetic inputs).
+var clearupMergeSkipCounter mergeSkipCounter
+
+// fastPathMatchCounter counts fast-path hits vs fallbacks so tests and the
+// scan summary can prove the simple include/exclude short-circuit is active.
+type fastPathMatchStats struct {
+	hit      int64
+	fallback int64
+}
+
+var fastPathMatchCounter fastPathMatchStats
+var fastPathFallbackLogCount int64
+
+// FastPathMatchStats returns the process-wide fast-path hit/fallback counts.
+// Exposed for tests and optional scan-summary telemetry.
+func FastPathMatchStats() (hits, fallbacks int64) {
+	return atomic.LoadInt64(&fastPathMatchCounter.hit),
+		atomic.LoadInt64(&fastPathMatchCounter.fallback)
+}
+
+type mergeSkipCounter struct {
+	skip  int64
+	merge int64
+}
+
+func (m *mergeSkipCounter) addSkip()  { atomic.AddInt64(&m.skip, 1) }
+func (m *mergeSkipCounter) addMerge() { atomic.AddInt64(&m.merge, 1) }
+
+// ResetClearupMergeCounters zeros the test-only counters. Returns previous values.
+func ResetClearupMergeCounters() (skip, merge int64) {
+	prevSkip := atomic.SwapInt64(&clearupMergeSkipCounter.skip, 0)
+	prevMerge := atomic.SwapInt64(&clearupMergeSkipCounter.merge, 0)
+	return prevSkip, prevMerge
+}
+
+// ClearupMergeCounters returns the current test-only (skip, merge) counts.
+func ClearupMergeCounters() (skip, merge int64) {
+	return atomic.LoadInt64(&clearupMergeSkipCounter.skip), atomic.LoadInt64(&clearupMergeSkipCounter.merge)
+}
+
+func (r *sfCheck) sanitizeChildResult(sfres *sf.SFFrameResult) {
+	r.config.Mutex.Lock()
+	sfres.AlertSymbolTable.Delete(sf.RecursiveMagicVariable)
+	sfres.SymbolTable.Delete(sf.RecursiveMagicVariable)
+	r.config.Mutex.Unlock()
+}
+
+func (r *sfCheck) runBeforeMergeHook(sfres *sf.SFFrameResult) {
+	if r.beforeMergeHook == nil {
+		return
+	}
+	// Run hook outside config lock:
+	// hook logic may trigger CFG/reachability helpers that re-enter VM/config paths and
+	// attempt to lock the same mutex again. Holding the lock here can deadlock (non-reentrant mutex).
+	r.beforeMergeHook(r.contextResult, sfres)
+}
+
+func (r *sfCheck) mergeChildResult(sfres *sf.SFFrameResult) {
+	r.config.Mutex.Lock()
+	r.contextResult.MergeByResultLocked(sfres)
+	r.config.Mutex.Unlock()
+}
+
+func isMatch(result *SyntaxFlowResult) bool {
+	if result == nil {
+		return false
+	}
+
+	effectiveVarNum := 0
+	matchedSingle := false
+	if vars := result.GetAllVariable(); vars != nil {
+		vars.ForEach(func(key string, value any) {
+			// Ignore VM internal temporary symbols when deciding include/exclude/until match.
+			if strings.HasPrefix(key, "__") && key != sf.RecursiveMagicVariable {
+				return
+			}
+			effectiveVarNum++
+			if num, ok := value.(int); ok && num != 0 {
+				matchedSingle = true
+			}
+		})
+	}
+
+	if effectiveVarNum == 0 {
+		// check un-name value
+		if len(result.GetUnNameValues()) != 0 {
+			return true
+		}
+	} else if effectiveVarNum == 1 {
+		return matchedSingle
+	} else {
+		// multiple variable, check magic variable
+		if len(result.GetValues(sf.RecursiveMagicVariable)) != 0 {
+			return true
+		}
+	}
+	return false
+}

@@ -1,0 +1,235 @@
+package ssaapi
+
+import (
+	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/omap"
+)
+
+func (v *Value) LoadFullUseDefChain() *Value {
+	v.GetTopDefs()
+	v.GetBottomUses()
+	return v
+}
+
+func (v Values) FullUseDefChain(h func(*Value)) {
+	for _, val := range v {
+		h(val.LoadFullUseDefChain())
+	}
+}
+
+func (i Values) AppendEffectOn(vs *Value) Values {
+	for _, node := range i {
+		node.AppendEffectOn(vs)
+	}
+	return i
+}
+
+func (i Values) AppendDependOn(v *Value) Values {
+	for _, node := range i {
+		node.AppendDependOn(v)
+	}
+	return i
+}
+
+type ContextID string
+
+var (
+	ANALYZE_RUNTIME_CTX_TOPDEF_CALL_ENTRY             ContextID = "call_entry"
+	ANALYZE_RUNTIME_CTX_TOPDEF_CALL_ENTRY_TRACE_INDEX ContextID = "call_entry_trace_idx"
+)
+
+func NewRuntimeContext() *omap.OrderedMap[ContextID, *Value] {
+	return omap.NewEmptyOrderedMap[ContextID, *Value]()
+}
+
+// GetContextValue can handle context
+func (v *Value) GetContextValue(i ContextID) (*Value, bool) {
+	if v.runtimeCtx == nil {
+		v.runtimeCtx = NewRuntimeContext()
+	}
+	return v.runtimeCtx.Get(i)
+}
+
+func (v *Value) SetContextValue(i ContextID, values *Value) *Value {
+	if v.runtimeCtx == nil {
+		v.runtimeCtx = NewRuntimeContext()
+	}
+	v.runtimeCtx.Set(i, values)
+	return v
+}
+
+// maxDataflowEdgesPerValue caps the DependOn/EffectOn edge count stored on a
+// single *Value. The edge graph is built by saveDataflowPath purely for path
+// DISPLAY (GetDependOn/GetEffectOn -> PrevDataflowPath); it's best-effort UI
+// data, not the taint result. On a heavy rule a single hub value (e.g. a
+// widely-used param) can accumulate millions of edges, which is what made
+// SafeMapWithKey.Set the #1 LIVE allocator (3.6GB inuse on javacms-core,
+// retained for the whole rule because Opt C only clears between rules). Capping
+// per-value bounds the live graph regardless of rule duration; the first
+// maxDataflowEdgesPerValue edges are kept (enough for path display), the rest
+// are dropped. The taint match/alert result is unaffected (it's computed from
+// the opcode value-sets, not the edge graph).
+const maxDataflowEdgesPerValue = 256
+
+func (i *Value) AppendDependOn(v *Value) (ret *Value) {
+	ret = i
+	if i == nil {
+		return i
+	}
+	if v == nil {
+		return
+	}
+	if i.GetUID() == v.GetUID() {
+		return
+	}
+	if i.hasDependOn(v) {
+		return
+	}
+	// Bound the edge graph: once this value's DependOn is full, stop adding
+	// (path display truncates; taint result unaffected). See maxDataflowEdgesPerValue.
+	if i.DependOn != nil && i.DependOn.Count() >= maxDataflowEdgesPerValue {
+		return
+	}
+	i.setDependOn(v)
+	// v.setEffectOn(i) would add the reverse edge; bound it too.
+	if v.EffectOn == nil || v.EffectOn.Count() < maxDataflowEdgesPerValue {
+		v.setEffectOn(i)
+	}
+	return i
+}
+
+func (i *Value) AppendEffectOn(v *Value) (ret *Value) {
+	ret = i
+	if i == nil {
+		return i
+	}
+	if v == nil {
+		return
+	}
+	if i.GetUID() == v.GetUID() {
+		return
+	}
+	if i.hasEffectOn(v) {
+		return
+	}
+	if i.EffectOn != nil && i.EffectOn.Count() >= maxDataflowEdgesPerValue {
+		return
+	}
+	i.setEffectOn(v)
+	if v.DependOn == nil || v.DependOn.Count() < maxDataflowEdgesPerValue {
+		v.setDependOn(i)
+	}
+	return i
+}
+
+func (i *Value) RemoveDependOn(vs ...*Value) {
+	if i == nil {
+		return
+	}
+	for _, v := range vs {
+		if v == nil {
+			continue
+		}
+		if i.GetUID() == v.GetUID() {
+			continue
+		}
+		if i.hasDependOn(v) {
+			i.deleteDependOn(v)
+		} else {
+			continue
+		}
+	}
+	return
+}
+
+func (i *Value) RemoveEffectOn(vs ...*Value) {
+	if i == nil {
+		return
+	}
+	for _, v := range vs {
+		if v == nil {
+			continue
+		}
+		if i.GetUID() == v.GetUID() {
+			continue
+		}
+		if i.hasEffectOn(v) {
+			i.deleteEffectOn(v)
+		} else {
+			continue
+		}
+	}
+	return
+}
+
+// valueMergeKey scopes an instruction id to its owning program. Instruction
+// ids are assigned per program, so base-layer and diff-layer values in an
+// incremental overlay query collide on the bare id; merging them would drop
+// one finding and make results depend on traversal order.
+type valueMergeKey struct {
+	Program string
+	ID      int64
+}
+
+func valueMergeKeyOf(v *Value) valueMergeKey {
+	return valueMergeKey{Program: v.GetProgramName(), ID: v.GetId()}
+}
+
+func MergeValues(allVs ...Values) Values {
+	tmp := omap.NewEmptyOrderedMap[valueMergeKey, *Value]()
+	templateValue := make(Values, 0)
+	checkAndMerge := func(v *Value) {
+		if utils.IsNil(v) {
+			return
+		}
+		// template value will not merge, this value create in query Runtime
+		if v.GetId() == -1 {
+			templateValue = append(templateValue, v)
+			return
+		}
+		key := valueMergeKeyOf(v)
+		if existValue, exist := tmp.Get(key); exist {
+			sfvm.MergeAnchor(v, existValue)
+
+			// merge v to exist value
+			if v.EffectOn != nil {
+				v.EffectOn.ForEach(func(key int64, effect *Value) bool {
+					effect.RemoveDependOn(v)
+					existValue.AppendEffectOn(effect)
+					return true
+				})
+			}
+
+			if v.DependOn != nil {
+				v.DependOn.ForEach(func(key int64, depend *Value) bool {
+					depend.RemoveEffectOn(v)
+					existValue.AppendDependOn(depend)
+					return true
+				})
+			}
+			for _, pred := range v.Predecessors {
+				existValue.Predecessors = utils.AppendSliceItemWhenNotExists(existValue.Predecessors, pred)
+			}
+			return
+		}
+		// set v is exist
+		tmp.Set(key, v)
+	}
+
+	for _, vs := range allVs {
+		for _, v := range vs {
+			checkAndMerge(v)
+		}
+	}
+	values := append(tmp.Values(), templateValue...)
+	return values
+}
+
+func (actx *AnalyzeContext) CovertShadowValue(v *Value) *Value {
+	progOverLay := actx.config.programOverLay
+	if progOverLay == nil {
+		return v
+	}
+	return progOverLay.Relocate(v)
+}

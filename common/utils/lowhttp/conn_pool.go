@@ -1,0 +1,1152 @@
+package lowhttp
+
+import (
+	"bufio"
+	"bytes"
+	"container/list"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/yaklang/yaklang/common/utils/lowhttp/httpctx"
+
+	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/netx"
+	utls "github.com/yaklang/yaklang/common/third_party/utls"
+	"github.com/yaklang/yaklang/common/utils"
+)
+
+var (
+	H2 = "h2"
+	H1 = "http/1.1"
+)
+
+var (
+	// Per-host idle cap raised from 2 to 8: AI audit workloads run 5+ concurrent
+	// streams against a single gateway host, and a cap of 2 forced the pool to
+	// close and re-dial (full TLS handshake) most connections after every burst.
+	DefaultLowHttpConnPool = NewHttpConnPool(context.Background(), 100, 8)
+	errServerClosedIdle    = errors.New("conn pool: server closed idle connection")
+)
+
+func NewHttpConnPool(ctx context.Context, idleCount int, perHostCount int) *LowHttpConnPool {
+	pool := &LowHttpConnPool{
+		maxIdleConn:        idleCount,
+		maxIdleConnPerHost: perHostCount,
+		connCount:          0,
+		idleConnTimeout:    90 * time.Second,
+		idleConnMap:        make(map[string][]*persistConn),
+		keepAliveTimeout:   30 * time.Second,
+		ctx:                ctx,
+		debugNotify:        make(chan struct{}, 1),
+	}
+	pool.h2Pool = NewH2ConnPool(ctx, idleCount, pool.idleConnTimeout, pool.keepAliveTimeout)
+	if idleCount > 0 {
+		pool.connSem = make(chan struct{}, idleCount)
+	}
+	return pool
+}
+
+type LowHttpConnPool struct {
+	idleConnMux        sync.Mutex                // 空闲连接访问锁
+	maxIdleConn        int                       // 最大总连接
+	maxIdleConnPerHost int                       // 单host最大连接
+	connCount          int                       // 已有连接计数器
+	idleConnMap        map[string][]*persistConn // 空闲连接
+	idleConnTimeout    time.Duration             // 连接过期时间
+	// idleLRU            connLRU                   // 连接池 LRU
+	keepAliveTimeout time.Duration
+	ctx              context.Context
+	connSem          chan struct{}
+
+	// H2 连接独立管理：多路复用特性使得单连接承载所有并发 stream，
+	// Idle connections are bounded independently of active multiplexed streams.
+	h2Pool *H2ConnPool
+
+	// debug: 每 5s 打印连接池状态；通过 EnableConnPoolDebug(true) 开启。
+	debugEnabled int32         // atomic bool (1 = on). controls the printer goroutine.
+	debugRunning int32         // atomic bool (1 = running). permits restart after disable.
+	debugNotify  chan struct{} // wakes the printer immediately on enable/disable.
+}
+
+func (l *LowHttpConnPool) HostConnFull(key *connectKey) bool {
+	l.idleConnMux.Lock()
+	defer l.idleConnMux.Unlock()
+	return len(l.idleConnMap[key.hash()]) >= l.maxIdleConnPerHost
+}
+
+func (l *LowHttpConnPool) clear() {
+	if l == nil {
+		return
+	}
+	l.idleConnMux.Lock()
+	for _, pcs := range l.idleConnMap {
+		for _, pc := range pcs {
+			err := l.removeConnLocked(pc, true)
+			if err != nil {
+				log.Warnf("lowhttp conn pool clear failed when calling removeConnLocked: %v", err)
+			}
+		}
+	}
+	l.idleConnMux.Unlock()
+
+	// Clear H2 connections via the standalone H2ConnPool.
+	l.h2Pool.Clear()
+}
+
+// Clear clears all connections in the pool (public method)
+func (l *LowHttpConnPool) Clear() {
+	l.clear()
+}
+
+func (l *LowHttpConnPool) contextDone() bool {
+	select {
+	case <-l.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+var (
+	getIdleConnRequiredCounter = new(int64)
+	getIdleConnFinishedCounter = new(int64)
+)
+
+func addGetIdleConnRequiredCounter() {
+	result := atomic.AddInt64(getIdleConnRequiredCounter, 1)
+	_ = result
+	log.Infof("get idle conn start counter: %d", result)
+}
+
+func addGetIdleConnFinishedCounter() {
+	result := atomic.AddInt64(getIdleConnFinishedCounter, 1)
+	_ = result
+	log.Infof("get idle conn finished counter: %d", result)
+}
+
+// 取出一个空闲连接
+// want 检索一个可用的连接，并且把这个连接从连接池中取出来
+func (l *LowHttpConnPool) getIdleConn(ctx context.Context, key *connectKey, opts ...netx.DialXOption) (net.Conn, error) {
+	//addGetIdleConnRequiredCounter()
+	if err := requestContextError(ctx); err != nil {
+		return nil, err
+	}
+	if l.contextDone() {
+		return nil, utils.Error("lowhttp: context done")
+	}
+
+	l.startDebugPrinter()
+
+	// H2 connections are managed by the standalone H2ConnPool and do not
+	// consume the H1 semaphore.
+	if key.scheme == H2 {
+		return l.h2Pool.GetOrCreate(ctx, key, opts)
+	}
+
+	// 尝试获取复用连接（H1）
+	if oldPc, ok := l.getFromConn(key); ok {
+		if err := requestContextError(ctx); err != nil {
+			oldPc.closeConn(err)
+			return nil, err
+		}
+		//addGetIdleConnFinishedCounter()
+		return oldPc, nil
+	}
+	// 没有复用连接则新建一个连接
+	if err := l.acquireConnSlot(ctx); err != nil {
+		return nil, err
+	}
+	pConn, err := newPersistConn(ctx, key, l, opts...)
+	if err != nil {
+		l.releaseConnSlot()
+		if ctxErr := requestContextError(ctx); ctxErr != nil {
+			return nil, ctxErr
+		}
+		// try get idle conn
+		if oldPc, ok := l.getFromConn(key); ok {
+			if ctxErr := requestContextError(ctx); ctxErr != nil {
+				oldPc.closeConn(ctxErr)
+				return nil, ctxErr
+			}
+			//addGetIdleConnFinishedCounter()
+			return oldPc, nil
+		}
+		return nil, err
+	}
+	if err := requestContextError(ctx); err != nil {
+		pConn.closeConn(err)
+		return nil, err
+	}
+	//addGetIdleConnFinishedCounter()
+	return pConn, nil
+}
+
+func requestContextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
+func (l *LowHttpConnPool) acquireConnSlot(ctx context.Context) error {
+	if l == nil || l.connSem == nil {
+		return requestContextError(ctx)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case l.connSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-l.ctx.Done():
+		return utils.Error("lowhttp: conn pool context done")
+	}
+}
+
+func (l *LowHttpConnPool) releaseConnSlot() {
+	if l == nil || l.connSem == nil {
+		return
+	}
+	select {
+	case <-l.connSem:
+	default:
+	}
+}
+
+func (l *LowHttpConnPool) getFromConn(key *connectKey) (oldPc *persistConn, getConn bool) {
+	if l.contextDone() {
+		return nil, false
+	}
+	l.idleConnMux.Lock()
+	defer l.idleConnMux.Unlock()
+
+	var oldTime time.Time
+	if l.idleConnTimeout > 0 {
+		oldTime = time.Now().Add(-l.idleConnTimeout)
+	}
+
+	// 从连接池中取出一个连接
+	connList, ok := l.idleConnMap[key.hash()]
+	if !ok { // if not get return
+		return
+	}
+
+	for len(connList) > 0 {
+		oldPc = connList[len(connList)-1]
+
+		// getFromConn only handles H1; H2 connections are managed in h2ConnMap.
+		// l.idleLRU.remove(oldPc)
+		tooOld := !oldTime.Before(oldPc.idleAt)
+		if !tooOld {
+			oldPc.closeTimer.Stop()
+			connList = connList[:len(connList)-1] // h1 conn need leave conn
+			getConn = true
+			break
+		}
+		oldPc.closeNetConn() // close too old conn
+		connList = connList[:len(connList)-1]
+	}
+
+	// clear empty list
+	if len(connList) > 0 {
+		l.idleConnMap[key.hash()] = connList
+	} else {
+		delete(l.idleConnMap, key.hash())
+	}
+
+	return
+}
+
+func (l *LowHttpConnPool) putIdleConn(pc *persistConn) error {
+	// H2 connections live in h2ConnMap and are never stored in idleConnMap.
+	if pc.IsH2Conn() {
+		return nil
+	}
+	l.idleConnMux.Lock()
+	defer l.idleConnMux.Unlock()
+
+	cacheKeyHash := pc.cacheKey.hash()
+	// 如果超过池规定的单个host可以拥有的最大连接数量则直接放弃添加连接
+	if len(l.idleConnMap[cacheKeyHash]) >= l.maxIdleConnPerHost || l.contextDone() {
+		pc.closeNetConn() // if too many, close it
+		return nil
+	}
+
+	// 添加一个连接到连接池,转化连接状态,刷新空闲时间
+	pc.idleAt = time.Now()
+	if l.idleConnTimeout > 0 && !pc.IsH2Conn() { // 判断空闲时间,若为0则不设限
+		if pc.closeTimer != nil {
+			pc.closeTimer.Reset(l.idleConnTimeout)
+		} else {
+			pc.closeTimer = time.AfterFunc(l.idleConnTimeout, func() {
+				pc.closeConn(utils.Error("lowhttp: idle timeout"))
+			})
+		}
+	}
+	// LRU Evict mechanism is commented out here due to block behaviour when pool is full just block it instead of evict
+	// previous LRU would cause crash since no initialization was performed
+
+	//if l.maxIdleConn > 0 && l.connCount >= l.maxIdleConn { // if conn pool is full, remove oldest
+	//	oldPconn := l.idleLRU.removeOldest()
+	//	err := l.removeConnLocked(oldPconn, !oldPconn.IsH2Conn())
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
+	l.idleConnMap[cacheKeyHash] = append(l.idleConnMap[cacheKeyHash], pc)
+	if !pc.IsH2Conn() {
+		pc.markReused()
+	}
+	return nil
+}
+
+// 在有写锁的环境中从池子里删除一个空闲连接
+func (l *LowHttpConnPool) removeConnLocked(pc *persistConn, needClose bool) error {
+	if pc.closeTimer != nil {
+		pc.closeTimer.Stop()
+	}
+	if needClose {
+		pc.closeNetConn()
+	}
+	key := pc.cacheKey.hash()
+	connList := l.idleConnMap[pc.cacheKey.hash()]
+	switch len(connList) {
+	case 0:
+		return nil
+	case 1:
+		if connList[0] == pc {
+			delete(l.idleConnMap, key)
+		}
+	default:
+		for i, v := range connList {
+			if v != pc {
+				continue
+			}
+			copy(connList[i:], connList[i+1:])
+			l.idleConnMap[key] = connList[:len(connList)-1]
+			break
+		}
+	}
+	return nil
+}
+
+// 长连接
+type persistConn struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	conn     net.Conn // conn本体
+	mu       sync.Mutex
+	p        *LowHttpConnPool // 连接对应的连接池
+	cacheKey *connectKey      // 连接池缓存key
+	isProxy  bool             // 是否使用代理
+	alive    bool             // 存活判断
+	sawEOF   bool             // 连接是否EOF
+
+	idleAt            time.Time                 // 进入空闲的时间
+	closeTimer        *time.Timer               // 关闭定时器
+	dialOption        []netx.DialXOption        // dial 选项
+	br                *bufio.Reader             // from conn
+	bw                *bufio.Writer             // to conn
+	reqCh             chan requestAndResponseCh // 读取管道
+	writeCh           chan writeRequest         // 写入管道
+	writeErrCh        chan error                // 写入错误信号
+	serverStartTimeNs atomic.Int64              // 响应时间 (纳秒时间戳，用于并发安全访问)
+	//numExpectedResponses int                       // 预期的响应数量
+	reused bool  // 是否复用
+	closed error // 连接关闭原因
+
+	inPool bool
+	isIdle bool
+
+	// debug info
+	wPacket []packetInfo
+	rPacket []packetInfo
+
+	// request sequence for per-request timeout guards
+	reqSeq uint64
+	// release conn slot once
+	releaseOnce sync.Once
+}
+
+type requestAndResponseCh struct {
+	reqPacket   []byte
+	ch          chan responseInfo
+	reqInstance *http.Request
+	option      *LowhttpExecConfig
+	writeErrCh  chan error
+	// respCh
+}
+
+type responseInfo struct {
+	resp      *http.Response
+	respBytes []byte
+	err       error
+	info      httpInfo
+}
+
+type httpInfo struct {
+	ServerTime time.Duration
+}
+
+type writeRequest struct {
+	reqPacket   []byte
+	ch          chan error
+	reqInstance *http.Request
+	options     *LowhttpExecConfig
+}
+
+type packetInfo struct {
+	localPort string
+	packet    []byte
+}
+
+type persistConnWriter struct {
+	pc *persistConn
+}
+
+func (w persistConnWriter) Write(p []byte) (n int, err error) {
+	n, err = w.pc.conn.Write(p)
+	return
+}
+
+func (w persistConnWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	n, err = io.Copy(w.pc.conn, r)
+	return
+}
+
+type bodyEOFSignal struct {
+	body         io.ReadCloser
+	mu           sync.Mutex        // guards following 4 fields
+	closed       bool              // whether Close has been called
+	rerr         error             // sticky Read error
+	fn           func(error) error // err will be nil on Read io.EOF
+	earlyCloseFn func() error      // optional alt Close func used if io.EOF not seen
+}
+
+var errReadOnClosedResBody = errors.New("http: read on closed response body")
+
+func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
+	es.mu.Lock()
+	closed, rerr := es.closed, es.rerr
+	es.mu.Unlock()
+	if closed {
+		return 0, errReadOnClosedResBody
+	}
+	if rerr != nil {
+		return 0, rerr
+	}
+
+	n, err = es.body.Read(p)
+	if err != nil {
+		es.mu.Lock()
+		defer es.mu.Unlock()
+		if es.rerr == nil {
+			es.rerr = err
+		}
+		err = es.condfn(err)
+	}
+	return
+}
+
+func (es *bodyEOFSignal) Close() error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	if es.closed {
+		return nil
+	}
+	es.closed = true
+	if es.earlyCloseFn != nil && es.rerr != io.EOF {
+		return es.earlyCloseFn()
+	}
+	err := es.body.Close()
+	return es.condfn(err)
+}
+
+// caller must hold es.mu.
+func (es *bodyEOFSignal) condfn(err error) error {
+	if es.fn == nil {
+		return err
+	}
+	err = es.fn(err)
+	es.fn = nil
+	return err
+}
+
+type dialXResult struct {
+	conn net.Conn
+	err  error
+}
+
+// dialXWithContext lets an individual request stop waiting for connection
+// establishment even though DialX's legacy dialer interface has no context
+// parameter. A connection that completes after cancellation is closed instead
+// of being returned to the pool.
+func dialXWithContext(ctx context.Context, target string, opt ...netx.DialXOption) (net.Conn, error) {
+	if ctx == nil || ctx.Done() == nil {
+		return netx.DialX(target, opt...)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	resultCh := make(chan dialXResult)
+	go func() {
+		conn, err := netx.DialX(target, opt...)
+		result := dialXResult{conn: conn, err: err}
+		select {
+		case resultCh <- result:
+		case <-ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if err := ctx.Err(); err != nil {
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+			return nil, err
+		}
+		return result.conn, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func newPersistConn(requestCtx context.Context, key *connectKey, pool *LowHttpConnPool, opt ...netx.DialXOption) (*persistConn, error) {
+	needProxy := len(key.proxy) > 0
+	opt = append(opt, netx.DialX_WithKeepAlive(pool.keepAliveTimeout))
+	newConn, err := dialXWithContext(requestCtx, key.addr, opt...)
+	if err != nil {
+		return nil, err
+	}
+	persistCtx, cancel := context.WithCancel(context.Background())
+	pc := &persistConn{
+		ctx:        persistCtx,
+		cancel:     cancel,
+		conn:       newConn,
+		mu:         sync.Mutex{},
+		p:          pool,
+		cacheKey:   key,
+		isProxy:    needProxy,
+		sawEOF:     false,
+		idleAt:     time.Time{},
+		closeTimer: nil,
+		dialOption: opt,
+		reqCh:      make(chan requestAndResponseCh, 2),
+		writeCh:    make(chan writeRequest, 2),
+		writeErrCh: make(chan error, 2),
+		// serverStartTimeNs is atomic.Int64, initialized to 0 by default
+		wPacket: make([]packetInfo, 0),
+		rPacket: make([]packetInfo, 0),
+		//numExpectedResponses: 0,
+	}
+
+	pc.br = bufio.NewReader(pc)
+	pc.bw = bufio.NewWriter(persistConnWriter{pc})
+
+	// 启动读取写入循环
+	go pc.writeLoop()
+	go pc.readLoop()
+	return pc, nil
+}
+
+type deadlineExtendingReader struct {
+	conn    net.Conn
+	r       io.Reader
+	timeout time.Duration
+}
+
+func (d *deadlineExtendingReader) Read(p []byte) (int, error) {
+	if d == nil || d.r == nil {
+		return 0, io.EOF
+	}
+	if d.conn != nil && d.timeout > 0 {
+		_ = d.conn.SetReadDeadline(time.Now().Add(d.timeout))
+	}
+	n, err := d.r.Read(p)
+	if n > 0 && d.conn != nil && d.timeout > 0 {
+		_ = d.conn.SetReadDeadline(time.Now().Add(d.timeout))
+	}
+	return n, err
+}
+
+func appendHTTPResponseRest(packet, rest []byte) []byte {
+	if len(rest) == 0 {
+		return packet
+	}
+	combined := make([]byte, len(packet)+len(rest))
+	copy(combined, packet)
+	copy(combined[len(packet):], rest)
+	return combined
+}
+
+func (pc *persistConn) readLoop() {
+	var closeErr error
+	defer func() {
+		pc.closeConn(closeErr)
+	}()
+
+	tryPutIdleConn := func() bool {
+		err := pc.p.putIdleConn(pc)
+		if err != nil {
+			return false
+		}
+		return true
+	}
+
+	var rc requestAndResponseCh
+
+	count := 0
+	alive := true
+	firstAuth := true
+	for alive {
+		if firstAuth {
+			select {
+			case rc = <-pc.reqCh:
+			case <-pc.ctx.Done():
+				if pc.closed != nil {
+					closeErr = pc.closed
+				} else {
+					closeErr = pc.ctx.Err()
+				}
+				return
+			}
+		}
+
+		timeout := 10 * time.Second
+		if rc.option != nil && rc.option.Timeout > 0 {
+			timeout = rc.option.Timeout
+		}
+		seq := atomic.AddUint64(&pc.reqSeq, 1)
+		var hardTimeoutTimer *time.Timer
+		if timeout > 0 && !(rc.option != nil && rc.option.ExtendReadDeadline) {
+			hardTimeoutTimer = time.AfterFunc(timeout, func() {
+				if atomic.LoadUint64(&pc.reqSeq) != seq {
+					return
+				}
+				// Force the ongoing read to stop even if the server keeps streaming.
+				_ = pc.conn.SetReadDeadline(time.Now().Add(-1 * time.Second))
+			})
+		}
+
+		// Watch the per-request context (e.g. the MITM upstream context that
+		// is cancelled when the downstream client disconnects during a
+		// long-lived streaming response). When it is cancelled, close the
+		// upstream connection so the blocking conn.Read returns immediately.
+		// Closing (rather than setting a past read deadline) is required
+		// because deadlineExtendingReader resets the deadline to the future
+		// on every Read, which would defeat a past-deadline approach. Without
+		// this watcher, a streaming response (SSE) blocks forever:
+		// ExtendReadDeadline disables the hard timeout and pc.ctx is derived
+		// from context.Background(), not the request context.
+		var ctxWatcherStop chan struct{}
+		if rc.option != nil && rc.option.Ctx != nil {
+			ctxWatcherStop = make(chan struct{})
+			// Capture this request's context before rc is replaced on connection
+			// reuse; the watcher may still be scheduled after stop is closed.
+			go func(requestCtx context.Context, seq uint64, stop chan struct{}) {
+				select {
+				case <-requestCtx.Done():
+					if atomic.LoadUint64(&pc.reqSeq) != seq {
+						return
+					}
+					_ = pc.conn.Close()
+				case <-stop:
+				}
+			}(rc.option.Ctx, seq, ctxWatcherStop)
+		}
+		stopCtxWatcher := func() {
+			if ctxWatcherStop != nil {
+				close(ctxWatcherStop)
+				ctxWatcherStop = nil
+			}
+		}
+
+		_ = pc.conn.SetReadDeadline(time.Now().Add(timeout))
+		_, err := pc.br.Peek(1)
+		if err != nil {
+			if hardTimeoutTimer != nil {
+				hardTimeoutTimer.Stop()
+			}
+			stopCtxWatcher()
+			if errors.Is(err, io.EOF) {
+				pc.sawEOF = true
+				closeErr = errServerClosedIdle
+			} else {
+				closeErr = connPoolReadFromServerError{err}
+			}
+			return
+		}
+
+		// Atomically read server start time
+		serverStartNs := pc.serverStartTimeNs.Load()
+		var serverTime time.Duration
+		if serverStartNs > 0 {
+			serverTime = time.Since(time.Unix(0, serverStartNs))
+		}
+		info := httpInfo{ServerTime: serverTime}
+
+		var resp *http.Response
+
+		stashRequest := rc.reqInstance
+		if stashRequest == nil {
+			stashRequest = new(http.Request)
+		}
+		// peek is executed, so we can read without timeout
+		// for long time chunked supported
+
+		var respBuffer bytes.Buffer
+		var mirrorWriter io.Writer = &respBuffer
+
+		// Support BodyStreamReaderHandler in connection pool mode
+		var streamWriter io.WriteCloser
+		var streamBodyReaderCh chan io.ReadCloser
+		var streamHandlerDone chan struct{}
+		if rc.option != nil && rc.option.BodyStreamReaderHandler != nil {
+			streamBodyReaderCh = make(chan io.ReadCloser, 1)
+			streamHandlerDone = make(chan struct{})
+			streamReader, sw := utils.NewBufPipe(nil)
+			streamWriter = sw
+
+			go func(reader io.Reader, handler func([]byte, io.ReadCloser)) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Errorf("BodyStreamReaderHandler panic in conn pool: %v", r)
+					}
+					close(streamHandlerDone)
+				}()
+
+				// Parse header and body from stream
+				packetReader := bufio.NewReader(reader)
+				responseHeader := bytes.NewBufferString("")
+
+				for {
+					line, err := utils.BufioReadLine(packetReader)
+					if err != nil {
+						if err != io.EOF {
+							log.Errorf("BodyStreamReaderHandler read response failed in conn pool: %s", err)
+						}
+						break
+					}
+					responseHeader.Write(line)
+					responseHeader.Write([]byte("\r\n"))
+					if len(line) == 0 {
+						// Header finished, now handle body
+						bodyReader, bodyWriter := utils.NewBufPipe(nil)
+						select {
+						case streamBodyReaderCh <- bodyReader:
+						default:
+						}
+						go func() {
+							io.Copy(bodyWriter, packetReader)
+							bodyWriter.Close()
+						}()
+						handler(responseHeader.Bytes(), bodyReader)
+						break
+					}
+				}
+			}(streamReader, rc.option.BodyStreamReaderHandler)
+
+			// Use MultiWriter to write to both respBuffer and streamWriter
+			if rc.option.NoBodyBuffer {
+				mirrorWriter = streamWriter
+			} else {
+				rawWriter := io.Writer(&respBuffer)
+				if rc.option.AutoDetectSSE {
+					rawWriter = &responseRawCaptureWriter{
+						dst:           &respBuffer,
+						req:           stashRequest,
+						autoDetectSSE: true,
+					}
+				}
+				mirrorWriter = io.MultiWriter(rawWriter, streamWriter)
+			}
+		}
+
+		if rc.option != nil && rc.option.networkTraceWriter != nil {
+			mirrorWriter = io.MultiWriter(mirrorWriter, rc.option.networkTraceWriter)
+		}
+		httpResponseReader := io.TeeReader(pc.br, mirrorWriter)
+		if rc.option != nil && rc.option.ExtendReadDeadline {
+			httpResponseReader = &deadlineExtendingReader{
+				conn:    pc.conn,
+				r:       httpResponseReader,
+				timeout: timeout,
+			}
+		}
+		if rc.option != nil && rc.option.DiscardIntermediateResponseBody {
+			borrowCapturedPacket := rc.option.BorrowConnPoolResponsePacket &&
+				rc.option.BodyStreamReaderHandler == nil &&
+				!rc.option.AutoDetectSSE
+			if borrowCapturedPacket {
+				resp, err = utils.ReadHTTPResponseMetadataFromBufioReaderConnWithBorrowedPacketFallback(
+					httpResponseReader,
+					pc.conn,
+					stashRequest,
+					respBuffer.Grow,
+					func(finalPacketSize int) []byte {
+						captured := respBuffer.Bytes()
+						if finalPacketSize <= 0 || finalPacketSize != len(captured) {
+							return nil
+						}
+						return captured
+					},
+					func(finalBodySize int) []byte {
+						captured := respBuffer.Bytes()
+						if finalBodySize < 0 || finalBodySize > len(captured) {
+							return nil
+						}
+						return captured[len(captured)-finalBodySize:]
+					},
+				)
+			} else {
+				resp, err = utils.ReadHTTPResponseMetadataFromBufioReaderConn(httpResponseReader, pc.conn, stashRequest, respBuffer.Grow)
+			}
+		} else {
+			resp, err = utils.ReadHTTPResponseFromBufioReaderConn(httpResponseReader, pc.conn, stashRequest)
+		}
+		if hardTimeoutTimer != nil {
+			hardTimeoutTimer.Stop()
+		}
+		if resp != nil {
+			if utils.HTTPResponseHasDiscardedIntermediateBody(resp) {
+				resp.Body = http.NoBody
+			}
+			resp.Request = nil
+		}
+
+		// Close streamWriter after reading response to signal EOF to the handler
+		if streamWriter != nil {
+			streamWriter.Close()
+		}
+
+		if firstAuth && resp != nil && resp.StatusCode == http.StatusUnauthorized {
+			if authHeader := IGetHeader(resp, "WWW-Authenticate"); len(authHeader) > 0 {
+				if auth := GetHttpAuth(authHeader[0], rc.option); auth != nil {
+					authReq, err := auth.Authenticate(pc.conn, rc.option)
+					if err == nil {
+						pc.writeCh <- writeRequest{
+							reqPacket:   authReq,
+							ch:          rc.writeErrCh,
+							reqInstance: rc.reqInstance,
+							options:     rc.option,
+						}
+					}
+					firstAuth = false
+					// Wait for stream handler to complete before continuing
+					waitStreamHandlerDone(streamHandlerDone, streamBodyReaderCh, 2*time.Second, "conn pool auth retry stream handler")
+					continue
+				}
+			}
+		}
+
+		count++
+		var respClose bool
+		var respPacket = respBuffer.Bytes()
+		if resp != nil {
+			respClose = resp.Close
+		}
+
+		if err != nil || respClose {
+			// Continue reading malformed/connection-close responses, but only
+			// allocate a recovery packet when there are bytes to append.
+			timeout := 5 * time.Second
+			if respClose {
+				timeout = 1 * time.Second
+			}
+			restBytes, _ := utils.ReadUntilStable(pc.br, pc.conn, timeout, 300*time.Millisecond)
+			pc.sawEOF = true
+			if len(restBytes) > 0 {
+				respPacket = appendHTTPResponseRest(respPacket, restBytes)
+				if len(respPacket) > 0 {
+					httpctx.SetBareResponseBytesForce(stashRequest, respPacket)
+					err = nil
+				}
+			}
+		}
+
+		// Wait for stream handler to complete before sending response
+		if rc.option != nil && rc.option.BodyStreamReaderHandler != nil {
+			waitStreamHandlerDone(streamHandlerDone, streamBodyReaderCh, 2*time.Second, "conn pool stream handler")
+		}
+
+		// Stop the per-request context watcher before sending the response:
+		// the read is done, so a late cancel must not perturb the next
+		// iteration's deadline.
+		stopCtxWatcher()
+
+		//pc.mu.Lock()
+		////pc.numExpectedResponses-- // 减少预期响应数量
+		//pc.mu.Unlock()
+
+		select {
+		case rc.ch <- responseInfo{resp: resp, respBytes: respPacket, info: info, err: err}:
+		default:
+			log.Warnf("conn pool response channel not received, drop response for request")
+		}
+		firstAuth = true
+		alive = alive &&
+			!pc.sawEOF &&
+			tryPutIdleConn()
+	}
+}
+
+func (pc *persistConn) writeLoop() {
+	var closeErr error
+	defer func() {
+		pc.closeConn(closeErr)
+	}()
+	for {
+		select {
+		case wr := <-pc.writeCh:
+			currentRPS.Add(1)
+			var err error
+			if wr.options != nil && wr.options.EnableRandomChunked {
+				// 随机分块写入
+				sender, err := wr.options.GetOrCreateChunkSender()
+				if err != nil {
+					closeErr = err
+					return
+				}
+				err = sender.Send(wr.reqPacket, pc.bw)
+			} else {
+				// 正常写入
+				_, err = pc.bw.Write(wr.reqPacket)
+			}
+
+			if err == nil {
+				err = pc.bw.Flush()
+				// Atomically store server start time
+				pc.serverStartTimeNs.Store(time.Now().UnixNano())
+			}
+			if err != nil {
+				closeErr = err
+				return
+			}
+		case <-pc.ctx.Done():
+			return
+		}
+	}
+}
+
+func (pc *persistConn) closeConn(err error) { // when write loop break or read loop break and ideal timeout call
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	select {
+	case <-pc.ctx.Done(): // already closed
+	default:
+		pc.closed = err
+		pc.cancel()
+		pc.removeConn()
+	}
+}
+
+func (pc *persistConn) removeConn() {
+	l := pc.p
+	l.idleConnMux.Lock()
+	defer l.idleConnMux.Unlock()
+	err := l.removeConnLocked(pc, true)
+	if err != nil {
+		log.Error(err)
+	}
+}
+
+func (pc *persistConn) closeNetConn() error {
+	// Cancel context to notify readLoop/writeLoop goroutines to exit
+	// This prevents goroutine leak when connection is closed from pool
+	if pc.cancel != nil {
+		pc.cancel()
+	}
+	err := pc.conn.Close()
+	pc.releaseConnSlot()
+	return err
+}
+
+func (pc *persistConn) releaseConnSlot() {
+	if pc.IsH2Conn() {
+		// H2 connections never acquire a semaphore slot, so there is nothing to release.
+		return
+	}
+	pc.releaseOnce.Do(func() {
+		if pc.p != nil {
+			pc.p.releaseConnSlot()
+		}
+	})
+}
+
+func (pc *persistConn) IsH2Conn() bool {
+	return pc.cacheKey.scheme == H2
+}
+
+// implement net.Conn
+func (pc *persistConn) Close() error {
+	if pc.br == nil {
+		// No readLoop was started (e.g., downgraded H2→H1 conn or bare conn).
+		// Close the underlying connection directly instead of returning to pool,
+		// since a conn without readLoop cannot be safely reused.
+		if pc.conn != nil {
+			_ = pc.conn.Close()
+		}
+		return nil
+	}
+	return pc.p.putIdleConn(pc)
+}
+
+func (pc *persistConn) Read(b []byte) (n int, err error) {
+	n, err = pc.conn.Read(b)
+	if err == io.EOF {
+		pc.sawEOF = true
+	}
+	return
+}
+
+func (pc *persistConn) Write(b []byte) (n int, err error) {
+	return pc.conn.Write(b)
+}
+
+func (pc *persistConn) LocalAddr() net.Addr {
+	return pc.conn.LocalAddr()
+}
+
+func (pc *persistConn) RemoteAddr() net.Addr {
+	return pc.conn.RemoteAddr()
+}
+
+func (pc *persistConn) SetDeadline(t time.Time) error {
+	return pc.conn.SetDeadline(t)
+}
+
+func (pc *persistConn) SetReadDeadline(t time.Time) error {
+	return pc.conn.SetReadDeadline(t)
+}
+
+func (pc *persistConn) SetWriteDeadline(t time.Time) error {
+	return pc.conn.SetWriteDeadline(t)
+}
+
+// markReused 标识此连接已经被复用
+func (pc *persistConn) markReused() {
+	pc.mu.Lock()
+	pc.reused = true
+	pc.mu.Unlock()
+}
+
+func (pc *persistConn) isReused() bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	// H2 connections are now managed by h2ConnEntry, not persistConn.
+	return pc.reused
+}
+
+func (pc *persistConn) shouldRetryRequest(err error) bool {
+	if !pc.isReused() {
+		// 初次连接失败，则不重试
+		return false
+	}
+	var connPoolReadFromServerError connPoolReadFromServerError
+	if errors.As(err, &connPoolReadFromServerError) {
+		// 除了EOF以外的服务器错误，重试
+		return true
+	}
+	// todo 幂等性请求
+	if errors.Is(err, errServerClosedIdle) {
+		// peek 到 EOF 大可能是连接池中的连接已经被服务器关闭，所以尝试重试
+		return true
+	}
+	if errors.Is(err, errH2ConnClosed) {
+		return true
+	}
+	return false // 保守不重试
+}
+
+type connPoolReadFromServerError struct {
+	err error
+}
+
+func (e connPoolReadFromServerError) Unwrap() error { return e.err }
+
+func (e connPoolReadFromServerError) Error() string {
+	return fmt.Sprintf("lowhttp: conn pool failed to read from server: %v", e.err)
+}
+
+type connectKey struct {
+	proxy            []string // 可以使用的代理
+	scheme, addr     string   // 协议和目标地址
+	https            bool
+	gmTls            bool
+	clientHelloSpec  *utls.ClientHelloSpec
+	tlsFingerprint   string
+	http2Fingerprint string
+	sni              string
+	strongHost       string
+}
+
+func (c *connectKey) hash() string {
+	return utils.CalcSha1(c.proxy, c.scheme, c.addr, c.https, c.gmTls, c.clientHelloSpec, c.tlsFingerprint, c.http2Fingerprint, c.sni, c.strongHost)
+}
+
+type connLRU struct {
+	ll *list.List // list.Element.Value type is of *persistConn
+	m  map[*persistConn]*list.Element
+}
+
+// 添加一个新的连接到LRU的双向链表中
+func (cl *connLRU) add(pc *persistConn) {
+	if cl.ll == nil {
+		cl.ll = list.New()
+		cl.m = make(map[*persistConn]*list.Element)
+	}
+	ele := cl.ll.PushFront(pc)
+	if _, ok := cl.m[pc]; ok {
+		panic("persistConn was already in LRU")
+	}
+	cl.m[pc] = ele
+}
+
+// 使用一个连接后移动LRU
+func (cl *connLRU) use(pc *persistConn) {
+	if cl.ll == nil {
+		cl.ll = list.New()
+		cl.m = make(map[*persistConn]*list.Element)
+	}
+	ele, ok := cl.m[pc]
+	if !ok {
+		panic("persistConn is not already in LRU")
+	}
+	cl.ll.MoveToFront(ele)
+}
+
+// 从LRU中取出应该删除的连接
+func (cl *connLRU) removeOldest() *persistConn {
+	ele := cl.ll.Back()
+	pc := ele.Value.(*persistConn)
+	cl.ll.Remove(ele)
+	delete(cl.m, pc)
+	return pc
+}
+
+// 删除一个LRU链表中的元素
+func (cl *connLRU) remove(pc *persistConn) {
+	if ele, ok := cl.m[pc]; ok {
+		cl.ll.Remove(ele)
+		delete(cl.m, pc)
+	}
+}
+
+// 获取缓存的长度.
+func (cl *connLRU) len() int {
+	return len(cl.m)
+}

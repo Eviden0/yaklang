@@ -1,0 +1,364 @@
+package ssaapi
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+
+	"github.com/yaklang/yaklang/common/utils/memedit"
+	"github.com/yaklang/yaklang/common/utils/yakunquote"
+
+	"github.com/samber/lo"
+
+	"github.com/gobwas/glob"
+
+	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+)
+
+var _ sfvm.ValueOperator = (*Value)(nil)
+
+func (v *Value) IsMap() bool {
+	kind := v.GetTypeKind()
+	return kind == ssa.MapTypeKind || kind == ssa.ObjectTypeKind
+}
+
+func (v *Value) IsEmpty() bool {
+	return v == nil
+}
+
+func (v *Value) ShouldUseConditionCandidate() bool {
+	return false
+}
+
+func (v *Value) MergeProvenanceFrom(source sfvm.ValueOperator) {
+	if v == nil || utils.IsNil(source) {
+		return
+	}
+	other, ok := source.(*Value)
+	if !ok || other == nil {
+		return
+	}
+
+	for _, pred := range other.Predecessors {
+		v.Predecessors = utils.AppendSliceItemWhenNotExists(v.Predecessors, pred)
+	}
+	if other.EffectOn != nil {
+		other.EffectOn.ForEach(func(_ int64, effect *Value) bool {
+			effect.RemoveDependOn(other)
+			v.AppendEffectOn(effect)
+			return true
+		})
+	}
+	if other.DependOn != nil {
+		other.DependOn.ForEach(func(_ int64, depend *Value) bool {
+			depend.RemoveEffectOn(other)
+			v.AppendDependOn(depend)
+			return true
+		})
+	}
+}
+
+func (v *Value) GetOpcode() string {
+	return v.getOpcode().String()
+}
+
+func (v *Value) GetBinaryOperator() string {
+	sa := v.GetSSAInst()
+	if utils.IsNil(sa) {
+		return ""
+	}
+	if sa.GetOpcode() == ssa.SSAOpcodeBinOp {
+		binop, ok := ssa.ToBinOp(sa)
+		if !ok {
+			return ""
+		}
+		return string(binop.Op)
+	}
+	return ""
+}
+
+func (v *Value) GetUnaryOperator() string {
+	sa := v.GetSSAInst()
+	if utils.IsNil(sa) {
+		return ""
+	}
+	if sa.GetOpcode() == ssa.SSAOpcodeUnOp {
+		unOp, ok := ssa.ToUnOp(sa)
+		if !ok {
+			return ""
+		}
+		return string(unOp.Op)
+	}
+	return ""
+}
+
+func (v *Value) Recursive(f func(operator sfvm.ValueOperator) error) error {
+	return f(v)
+}
+
+func (v *Value) IsList() bool {
+	return v.GetTypeKind() == ssa.SliceTypeKind
+}
+
+func (v *Value) GetAnchorBitVector() *utils.BitVector {
+	if v == nil || v.anchorBits == nil {
+		return nil
+	}
+	return v.anchorBits
+}
+
+// SetAnchorBitVector stores the anchor bitvector WITHOUT a defensive clone.
+// The stored pointer is used directly to avoid the per-call allocation that
+// dominated GC on large projects (BitVector.Clone was ~15% of allocations from
+// Set alone; the anchor-scope merge/restore paths already Clone before calling,
+// so Set's second clone was pure waste).
+//
+// ANCHOR-BITS INVARIANT (load-bearing for COW in sfvm.mergeAnchorBits): anchor
+// bits are NEVER mutated in place. Every mutation site clones before Or/Set:
+//   - sfvm.mergeAnchorBits 2nd branch: merged := dstBits.Clone() before Or.
+//   - sfvm.applyScopedAnchorBits: merged := localBits.Clone() before Or.
+//   - sfvm.buildSlotAnchorBitVectors: bits = existed.Clone() or NewBitVector.
+//   - sf_cfg_native.go SetAnchorBitVector call sites: op.GetAnchorBitVector().Clone().
+//
+// Because of this invariant, a SHARED bitvector (e.g. another value's
+// GetAnchorBitVector, as stored by mergeAnchorBits' COW first branch) is safe
+// to pass here: any future mutation of the recipient's bits goes through a
+// clone-first path, so the shared source is never corrupted. New call sites
+// that need to mutate bits in place MUST Clone first.
+func (v *Value) SetAnchorBitVector(bits *utils.BitVector) {
+	if v == nil {
+		return
+	}
+	if bits == nil {
+		v.anchorBits = nil
+		return
+	}
+	v.anchorBits = bits
+}
+
+func (v *Value) ExactMatch(ctx context.Context, mod ssadb.MatchMode, want string) (bool, sfvm.Values, error) {
+	value := _SearchValue(v, mod, func(s string) bool { return s == want }, sfvm.WithAnalysisContext_Label("search-exact:"+want))
+	return len(value) > 0, ToSFVMValues(value), nil
+}
+
+func (v *Value) GlobMatch(ctx context.Context, mod ssadb.MatchMode, g string) (bool, sfvm.Values, error) {
+	value := _SearchValue(v, mod, func(s string) bool {
+		return glob.MustCompile(g).Match(s)
+	}, sfvm.WithAnalysisContext_Label("search-glob:"+g))
+	return len(value) > 0, ToSFVMValues(value), nil
+}
+
+func (v *Value) RegexpMatch(ctx context.Context, mod ssadb.MatchMode, re string) (bool, sfvm.Values, error) {
+	value := _SearchValue(v, mod, func(s string) bool {
+		return regexp.MustCompile(re).MatchString(s)
+	}, sfvm.WithAnalysisContext_Label("search-regexp:"+re))
+	return len(value) > 0, ToSFVMValues(value), nil
+}
+
+func (v *Value) CompareString(items *sfvm.StringComparator) (sfvm.Values, []bool) {
+	if v == nil || items == nil {
+		return nil, []bool{false}
+	}
+
+	names := getValueNames(v)
+	names = append(names, yakunquote.TryUnquote(v.String()))
+	return sfvm.ValuesOf(v), []bool{items.Matches(names...)}
+}
+
+func (v *Value) CompareConst(comparator *sfvm.ConstComparator) bool {
+	if v == nil || comparator == nil {
+		return false
+	}
+	return comparator.Matches(v.String())
+}
+
+func (v *Value) CompareOpcode(comparator *sfvm.OpcodeComparator) (sfvm.Values, []bool) {
+	if v == nil || comparator == nil {
+		return nil, []bool{false}
+	}
+	// Hoist the per-value op strings once (was inside the check closure, which
+	// allocated []string{...} + slices.Contains on EVERY comparator call → N
+	// values × K registered binOps = N*K slice allocations, a major GC driver).
+	vOpcode := v.getOpcode()
+	vBinOp := v.GetBinaryOperator()
+	vUnaryOp := v.GetUnaryOperator()
+	checkOp := func(opcode ssa.Opcode) bool { return vOpcode == opcode }
+	checkBinOrUnaryOp := func(op string) bool { return op == vBinOp || op == vUnaryOp }
+	return sfvm.ValuesOf(v), []bool{comparator.AllSatisfy(checkOp, checkBinOrUnaryOp)}
+}
+
+func (v *Value) GetCallActualParams(start int, contain bool) (sfvm.Values, error) {
+	call, isCall := ssa.ToCall(v.getValue())
+	if !isCall {
+		return nil, utils.Errorf("ssa.Value is not a call")
+	}
+
+	rets := make(Values, 0)
+	addvalue := func(id int64) {
+		value, ok := call.GetValueById(id)
+		if !ok {
+			return
+		}
+		ret := v.NewValue(value)
+		ret.AppendPredecessor(v, sfvm.WithAnalysisContext_Label(
+			fmt.Sprintf("actual-args[%d](containRest:%v)", start, contain),
+		))
+		sfvm.MergeAnchor(v, ret)
+		rets = append(rets, ret)
+	}
+	add := func(param []int64) {
+		if len(param) <= start {
+			return
+		}
+		if contain {
+			for i := start; i < len(param); i++ {
+				value := param[i]
+				addvalue(value)
+			}
+		} else {
+			value := param[start]
+			addvalue(value)
+		}
+	}
+	add(call.Args)
+	if utils.IsNil(rets) {
+		return nil, utils.Errorf("ssa.Value no actual params")
+	}
+	return ToSFVMValues(filterValuesByStructBound(valueStructBound(v), rets)), nil
+}
+
+func (v *Value) GetCalled() (sfvm.Values, error) {
+	ret := v.GetCalledBy()
+	ret = filterValuesByStructBound(valueStructBound(v), ret)
+	results := ToSFVMValues(ret)
+	results.AppendPredecessor(v, sfvm.WithAnalysisContext_Label("call"))
+	return results, nil
+}
+
+func (v *Value) GetFields() (sfvm.Values, error) {
+	if v.IsMap() || v.IsObject() {
+		filtered := filterValuesByStructBound(valueStructBound(v), v.GetAllMember())
+		members := lo.Map(filtered, func(item *Value, index int) sfvm.ValueOperator {
+			return item
+		})
+		return sfvm.NewValues(members), nil
+	}
+	return sfvm.NewEmptyValues(), nil
+}
+
+func (v *Value) GetMembersByString(key string) (sfvm.Values, bool) {
+	if v.IsMap() || v.IsList() || v.IsObject() {
+		for _, m := range v.GetMember(v.NewValue(ssa.NewConst(key))) {
+			if m != nil {
+				return sfvm.ValuesOf(m), true
+			}
+		}
+		return nil, false
+	}
+	// return v.GetUsers(), nil
+	return nil, false
+}
+
+func valueStructBound(v *Value) *structBound {
+	if v == nil || v.ParentProgram == nil {
+		return nil
+	}
+	if v.ParentProgram.structScanActive && v.ParentProgram.structBound == nil {
+		return &structBound{files: map[string]struct{}{}} // fail-closed: empty include set rejects all paths
+	}
+	return v.ParentProgram.structBound
+}
+
+func (v *Value) GetSyntaxFlowUse() (sfvm.Values, error) {
+	return ToSFVMValues(filterValuesByStructBound(valueStructBound(v), v.GetUsers())), nil
+}
+func (v *Value) GetSyntaxFlowDef() (sfvm.Values, error) {
+	return ToSFVMValues(filterValuesByStructBound(valueStructBound(v), v.GetOperands())), nil
+}
+func (v *Value) GetSyntaxFlowTopDef(sfResult *sfvm.SFFrameResult, sfConfig *sfvm.Config, config ...*sfvm.RecursiveConfigItem) (sfvm.Values, error) {
+	// DataFlowWithSFConfig 返回 Values，需要转换为 sfvm.ValueOperator
+	return DataFlowWithSFConfig(sfResult, sfConfig, v, TopDefAnalysis, config...), nil
+}
+
+func (v *Value) GetSyntaxFlowBottomUse(sfResult *sfvm.SFFrameResult, sfConfig *sfvm.Config, config ...*sfvm.RecursiveConfigItem) (sfvm.Values, error) {
+	// DataFlowWithSFConfig 返回 Values，需要转换为 sfvm.ValueOperator
+	return DataFlowWithSFConfig(sfResult, sfConfig, v, BottomUseAnalysis, config...), nil
+}
+
+func (v *Value) ListIndex(i int) (sfvm.ValueOperator, error) {
+	if i == 0 {
+		return v, nil
+	}
+	if !v.IsList() {
+		return nil, utils.Error("ssa.Value is not a list")
+	}
+	members := v.GetMember(v.NewValue(ssa.NewConst(i)))
+	for _, member := range members {
+		if member != nil {
+			return member, nil
+		}
+	}
+	return nil, utils.Errorf("ssa.Value %v cannot call by slice, like v[%v]", v.String(), i)
+}
+
+func (v *Value) AppendPredecessor(operator sfvm.ValueOperator, opts ...sfvm.AnalysisContextOption) error {
+	result, ok := operator.(*Value)
+	if !ok {
+		return nil
+	}
+	// Build the analysis context as a stack value (no heap allocation); it is
+	// inlined into the PredecessorValue below. The old code did
+	// `ctx := sfvm.NewDefaultAnalysisContext()` (a heap alloc) on every call,
+	// which was the #1 allocator and drove GC to ~66% of CPU on large projects.
+	ctx := sfvm.AnalysisContext{Step: -1, Label: ""}
+	for _, opt := range opts {
+		opt(&ctx)
+	}
+	// The dedup scan is O(len(Predecessors)) per append, so appending N distinct
+	// nodes to one value is O(N^2) ValueCompare calls. On a large project a single
+	// <typeName> const-value can collect thousands of distinct callers (each a
+	// distinct node, so the scan never finds a match — pure waste), which made
+	// heavy rules spend hours in one AppendPredecessor and hang the scan (see
+	// pprof: AppendPredecessor/ValueCompare dominated). Cap the scan: when a value
+	// already has many predecessors, skip the linear dedup and just append. Dups
+	// beyond the cap are redundant (not incorrect), and this bounds AppendPredecessor
+	// to O(predecessorDedupCap) instead of O(N).
+	const predecessorDedupCap = 256
+	if len(v.Predecessors) <= predecessorDedupCap {
+		for _, pred := range v.Predecessors {
+			if pred == nil || pred.Node == nil {
+				continue
+			}
+			if !ValueCompare(pred.Node, result) {
+				continue
+			}
+			// Info is now a value type (never nil). A predecessor with the default
+			// context {Step:-1, Label:""} matches a new default context.
+			if pred.Info.Label == ctx.Label && pred.Info.Step == ctx.Step {
+				return nil
+			}
+		}
+	}
+	// "Predecessors too many" used to fire a log.Warnf (fmt.Sprintf + IO) on EVERY
+	// append past 30 — for a <typeName> value with thousands of callers that was
+	// thousands of warnings, and the Warnf Sprintf was ~44% of AppendPredecessor's
+	// allocation (AppendPredecessor was ~12% of all allocs). Only log the transition
+	// into the "too many" regime (31) so a pathological value is reported once, not
+	// once per append.
+	if len(v.Predecessors) == 31 {
+		log.Warnf("Value %s Predecessors too many (>=31), further appends skip dedup", v.StringWithRange())
+	}
+	v.Predecessors = append(v.Predecessors, &PredecessorValue{Node: result, Info: ctx})
+	return nil
+}
+
+func (v *Value) FileFilter(path string, match string, rule map[string]string, rule2 []string) (sfvm.Values, error) {
+	return v.ParentProgram.FileFilter(path, match, rule, rule2)
+}
+
+func (v *Value) NewConst(i any, rng ...*memedit.Range) sfvm.ValueOperator {
+	return v.NewConstValue(i, rng...)
+}

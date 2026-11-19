@@ -1,0 +1,29 @@
+package ssaconfig
+
+var Exports = map[string]interface{}{
+	"NewConfig":               New,
+	"ModeAll":                 ModeAll,
+	"ModeProjectCompile":      ModeProjectCompile,
+	"withJsonRawConfig":       WithJsonRawConfig,
+	"withProjectID":           WithProjectID,
+	"withProjectName":         WithProjectName,
+	"withProjectLanguage":     WithProjectLanguage,
+	"withProjectTags":         WithProjectTags,
+	"withProjectDescription":  WithProjectDescription,
+	"withCodeSourceKind":      WithCodeSourceKind,
+	"withCodeSourceLocalFile": WithCodeSourceLocalFile,
+	"withCodeSourceURL":       WithCodeSourceURL,
+	"withCodeSourceBranch":    WithCodeSourceBranch,
+	"withCodeSourceCommit":    WithCodeSourceCommit,
+	"withCodeSourcePath":      WithCodeSourcePath,
+	// Git/SVN 认证配置选项
+	"withCodeSourceAuthKind":       WithCodeSourceAuthKind,
+	"withCodeSourceAuthUserName":   WithCodeSourceAuthUserName,
+	"withCodeSourceAuthPassword":   WithCodeSourceAuthPassword,
+	"withCodeSourceAuthKeyPath":    WithSSAProjectCodeSourceAuthKeyPath,
+	"withCodeSourceAuthKeyContent": WithCodeSourceAuthKeyContent,
+	// Jar 递归解析配置选项
+	"withCodeSourceJarRecursiveParse": WithCodeSourceJarRecursiveParse,
+	// Debug/pprof 配置选项
+	"withDebugDir": WithDebugDir,
+}

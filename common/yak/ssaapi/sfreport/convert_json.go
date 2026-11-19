@@ -1,0 +1,561 @@
+package sfreport
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+
+	"github.com/google/uuid"
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/memedit"
+	"github.com/yaklang/yaklang/common/yak/ssaapi"
+
+	"io"
+)
+
+var _ IReport = (*Report)(nil)
+
+func (r *Report) SetWriter(writer io.Writer) error {
+	if writer == nil {
+		return utils.Errorf("writer is nil")
+	}
+	r.writer = writer
+	return nil
+}
+
+func (r *Report) Save() error {
+	if r == nil {
+		return utils.Errorf("report is nil")
+	}
+	switch r.ReportType {
+	case IRifyReportType, IRifyFullReportType:
+		if r.writer == nil {
+			return nil
+		}
+		// A pending background snapshot would race this final document.
+		if flusher := r.currentFlusher(); flusher != nil {
+			flusher.stopAndWait()
+		}
+		data, err := r.snapshotJSON()
+		if err != nil {
+			return err
+		}
+		// Every save replaces the previous document instead of appending to it,
+		// and a file destination is replaced atomically.
+		return writeReportSnapshot(r.writer, data)
+	case IRifyReactReportType:
+		return r.SaveForIRify()
+	}
+	return utils.Errorf("unsupported report format: %s", r.ReportType)
+}
+
+// snapshotJSON marshals the report as one complete document. The lock keeps a
+// concurrent finding from racing the marshal.
+func (r *Report) snapshotJSON() ([]byte, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return nil, utils.Wrapf(err, "marshal report failed")
+	}
+	return data, nil
+}
+
+func (r *Report) SaveForIRify() error {
+	ssaReport := r.ToSSAProjectReport()
+	// 创建yakit报告实例
+	reportInstance := &schema.Report{}
+	reportInstance.From("ssa-scan")
+	reportInstance.Title(fmt.Sprintf("%s-%s", ssaReport.ProgramName, uuid.NewString()))
+
+	// 生成报告内容
+	err := GenerateYakitReportContent(reportInstance, ssaReport)
+	if err != nil {
+		log.Errorf("generate yakit report content failed: %v", err)
+		return utils.Wrapf(err, "generate yakit report content failed")
+	}
+
+	// 保存报告
+	reportID := reportInstance.SaveForIRify()
+	if reportID == 0 {
+		return utils.Errorf("save report failed")
+	}
+	return nil
+}
+
+func (r *Report) PrettyWrite(w io.Writer) error {
+	jsonData, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(jsonData)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Report) AddSyntaxFlowResult(result *ssaapi.SyntaxFlowResult) bool {
+	if r.ProgramName == "" {
+		r.SetProgramName(result.GetProgramName())
+		r.SetProgramLang(result.GetProgramLang())
+		r.SetFileCount(result.GetFileCount())
+		r.SetCodeLineCount(result.GetLineCount())
+	}
+
+	for risk := range result.YieldRisk() {
+		r.ConvertSSARiskToReport(risk, result)
+	}
+	return true
+}
+
+func (r *Report) AddSyntaxFlowRisks(risks ...*schema.SSARisk) {
+	for _, risk := range risks {
+		r.ConvertSSARiskToReport(risk)
+	}
+}
+
+func (r *Report) ConvertSSARiskToReport(ssarisk *schema.SSARisk, results ...*ssaapi.SyntaxFlowResult) {
+	if r.GetRisk(ssarisk.Hash) != nil {
+		// already exists
+		return
+	}
+
+	// get result
+	var result *ssaapi.SyntaxFlowResult = nil
+	if len(results) > 0 {
+		result = results[0]
+	} else {
+		var err error
+		result, err = ssaapi.LoadResultByID(uint(ssarisk.ResultID))
+		if err != nil {
+			log.Errorf("load result by id %d error: %v", ssarisk.ResultID, err)
+			return
+		}
+	}
+
+	if result == nil {
+		log.Errorf("result is nil for risk %s", ssarisk.Hash)
+		return
+	}
+	// get value
+	value, err := result.GetValue(ssarisk.Variable, int(ssarisk.Index))
+	if err != nil {
+		r.convertSSARiskFromMetadata(ssarisk, result)
+		return
+	}
+
+	// {{ analyze graph
+	// Data flow information is now automatically generated in NewRisk() function
+	// The DataFlowPaths field will contain the complete data flow analysis
+	// }}
+
+	// {{ file
+	// editor
+	editor := value.GetRange().GetEditor()
+	if editor == nil {
+		log.Errorf("editor is nil")
+		return
+	}
+
+	// create risk with detailed structure
+	risk, toAddIrSourceHashes := NewRisk(ssarisk, r, value)
+	r.AddRisks(risk)
+
+	// update RiskNums after adding risk
+	r.RiskNums = len(r.Risks)
+
+	// create report.file
+	file, _ := r.FirstOrCreateFile(editor)
+	if file != nil {
+		file.AddRisk(risk)
+	}
+	// }}
+
+	// add ir source from data flow paths
+	for _, irSourceHash := range toAddIrSourceHashes {
+		file, _ := r.FirstOrCreateFileByHash(irSourceHash)
+		if file != nil {
+			file.AddRisk(risk)
+		}
+	}
+	// {{ rule
+	// create report.rule
+	rule := r.FirstOrCreateRule(result.GetRule())
+	risk.SetRule(rule)
+	rule.AddRisk(risk)
+	// }}
+}
+
+// convertSSARiskFromMetadata adds an SSARisk when the result has risk metadata
+// but no matching alert value (e.g. index/variable drift).
+func (r *Report) convertSSARiskFromMetadata(ssarisk *schema.SSARisk, result *ssaapi.SyntaxFlowResult) {
+	if r == nil || ssarisk == nil || result == nil {
+		return
+	}
+	if r.GetRisk(ssarisk.Hash) != nil {
+		return
+	}
+	risk, _ := NewRisk(ssarisk, r)
+	r.AddRisks(risk)
+	r.RiskNums = len(r.Risks)
+	if file := r.firstOrCreateFileByPath(ssarisk.CodeSourceUrl); file != nil {
+		file.AddRisk(risk)
+	}
+	rule := r.FirstOrCreateRule(result.GetRule())
+	risk.SetRule(rule)
+	rule.AddRisk(risk)
+}
+
+func (r *Report) firstOrCreateFileByPath(path string) *File {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	for _, f := range r.File {
+		if f != nil && f.Path == path {
+			return f
+		}
+	}
+	file := &File{Path: path}
+	r.File = append(r.File, file)
+	return file
+}
+
+func (r *Report) FirstOrCreateRule(rule *schema.SyntaxFlowRule) *Rule {
+	if ret := r.GetRule(rule.RuleName); ret != nil {
+		return ret
+	}
+	ret := NewRule(rule)
+	r.Rules = append(r.Rules, ret)
+	return ret
+}
+
+func (r *Report) FirstOrCreateFile(editor *memedit.MemEditor) (*File, bool) {
+	irsourceHash := strings.TrimSpace(editor.GetIrSourceHash())
+	if irsourceHash == "" {
+		return nil, false
+	}
+	if r.fileByHash != nil {
+		if existing := r.fileByHash[irsourceHash]; existing != nil {
+			return existing, false
+		}
+	}
+	if r.IrSourceHashes == nil {
+		r.IrSourceHashes = make(map[string]struct{})
+	}
+	r.IrSourceHashes[irsourceHash] = struct{}{}
+	ret := NewFile(editor, r)
+	r.File = append(r.File, ret)
+	if r.fileByHash == nil {
+		r.fileByHash = make(map[string]*File)
+	}
+	r.fileByHash[irsourceHash] = ret
+	return ret, true
+}
+
+func (r *Report) FirstOrCreateFileByHash(irSourceHash string) (*File, bool) {
+	irSourceHash = strings.TrimSpace(irSourceHash)
+	if irSourceHash == "" {
+		return nil, false
+	}
+	if r.fileByHash != nil {
+		if existing := r.fileByHash[irSourceHash]; existing != nil {
+			return existing, false
+		}
+	}
+	if r.IrSourceHashes == nil {
+		r.IrSourceHashes = make(map[string]struct{})
+	}
+	r.IrSourceHashes[irSourceHash] = struct{}{}
+	editor, err := ssadb.GetEditorByHash(irSourceHash)
+	if err != nil {
+		log.Errorf("get editor by hash %s error: %v", irSourceHash, err)
+		return nil, false
+	}
+	ret := NewFile(editor, r)
+	r.File = append(r.File, ret)
+	if r.fileByHash == nil {
+		r.fileByHash = make(map[string]*File)
+	}
+	r.fileByHash[irSourceHash] = ret
+	return ret, true
+}
+
+type ImportSSARiskOption func(*ImportSSARiskManager)
+
+type ImportSSARiskManager struct {
+	programName  string
+	db           *gorm.DB
+	ctx          context.Context
+	callback     func(string, float64)
+	saveDataFlow bool
+	saveFile     bool
+
+	saveRiskToCustomDb func(db *gorm.DB, risk *Risk, programName string) (riskHash string, err error)
+}
+
+func WithSaveDataFlow(saveDataFlow bool) ImportSSARiskOption {
+	return func(importManager *ImportSSARiskManager) {
+		importManager.saveDataFlow = saveDataFlow
+	}
+}
+
+func WithSaveFile(saveFile bool) ImportSSARiskOption {
+	return func(importManager *ImportSSARiskManager) {
+		importManager.saveFile = saveFile
+	}
+}
+
+func WithSaveRiskToCustomDb(saveRiskToCustomDb func(
+	db *gorm.DB,
+	risk *Risk,
+	programName string,
+) (riskHash string, err error)) ImportSSARiskOption {
+	return func(importManager *ImportSSARiskManager) {
+		importManager.saveRiskToCustomDb = saveRiskToCustomDb
+	}
+}
+
+func WithDB(db *gorm.DB) ImportSSARiskOption {
+	return func(m *ImportSSARiskManager) {
+		m.db = db
+	}
+}
+
+func WithContext(ctx context.Context) ImportSSARiskOption {
+	return func(m *ImportSSARiskManager) {
+		m.ctx = ctx
+	}
+}
+
+func WithProgramName(programName string) ImportSSARiskOption {
+	return func(m *ImportSSARiskManager) {
+		m.programName = programName
+	}
+}
+
+func WithCallback(callback func(string, float64)) ImportSSARiskOption {
+	return func(m *ImportSSARiskManager) {
+		m.callback = callback
+	}
+}
+
+func (m *ImportSSARiskManager) subProgressCallback(start, end float64) func(string, float64) {
+	return func(msg string, subProgress float64) {
+		if m.callback == nil {
+			return
+		}
+		if subProgress < 0 {
+			subProgress = 0
+		} else if subProgress > 1 {
+			subProgress = 1
+		}
+		global := start + (end-start)*subProgress
+		m.callback(msg, global)
+	}
+}
+
+func NewImportSSARiskManager(opts ...ImportSSARiskOption) *ImportSSARiskManager {
+	m := &ImportSSARiskManager{}
+	for _, opt := range opts {
+		opt(m)
+	}
+	if m.db == nil {
+		m.db = ssadb.GetDB()
+	}
+	return m
+}
+
+// ImportSSARiskFromJSON 从 JSON 报告数据中导入 SSA 风险记录到数据库
+// 导出名为 sfreport.ImportSSARiskFromJSON
+// 参数:
+//   - ctx: 上下文，用于控制取消
+//   - db: 目标数据库连接
+//   - jsonData: 报告 JSON 数据（字节）
+//   - callBacks: 可选的进度回调，参数为 (message, progress)
+//
+// 返回值:
+//   - 错误信息
+//
+// Example:
+// ```
+// // 导入此前导出的 SSA 风险报告（示意性示例）
+// ctx = context.Background()
+// jsonData = file.ReadFile("ssa_report.json")~
+// err = sfreport.ImportSSARiskFromJSON(ctx, db.GetGormProjectDatabase(), jsonData)
+// if err != nil { die(err) }
+// ```
+func ImportSSARiskFromJSON(
+	ctx context.Context,
+	db *gorm.DB,
+	jsonData []byte,
+	callBacks ...func(string, float64),
+) error {
+	opts := []ImportSSARiskOption{
+		WithDB(db),
+		WithContext(ctx),
+		WithSaveFile(true),
+		WithSaveDataFlow(true),
+	}
+	if len(callBacks) > 0 {
+		opts = append(opts, WithCallback(callBacks[0]))
+	}
+	manager := NewImportSSARiskManager(opts...)
+	return manager.SaveToDB(jsonData)
+	return nil
+}
+
+func (m *ImportSSARiskManager) SaveToDB(jsonData []byte) error {
+	var report *Report
+	if err := json.Unmarshal(jsonData, &report); err != nil {
+		return utils.Wrapf(err, "failed to parse JSON data")
+	}
+	return m.SaveReportToDB(report)
+}
+
+func (m *ImportSSARiskManager) SaveReportToDB(report *Report) error {
+	if report == nil {
+		return nil
+	}
+	if m.programName == "" {
+		m.programName = report.ProgramName
+	}
+	if err := m.importRisksFromReport(report, m.subProgressCallback(0, 0.5)); err != nil {
+		return err
+	}
+	if err := m.importFilesFromReport(report, m.subProgressCallback(0.5, 1)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *ImportSSARiskManager) importRisksFromReport(report *Report, cb func(string, float64)) error {
+	if len(report.Risks) == 0 {
+		if cb != nil {
+			cb("No risks to import", 1)
+		}
+		return nil
+	}
+	total := len(report.Risks)
+	count := 0
+	for _, risk := range report.Risks {
+		select {
+		case <-m.ctx.Done():
+			return utils.Error("Import SSARisk from JSON failed: context done")
+		default:
+		}
+		count++
+		progress := float64(count) / float64(total)
+
+		var (
+			riskHash string
+			err      error
+		)
+
+		if m.saveRiskToCustomDb != nil {
+			riskHash, err = m.saveRiskToCustomDb(m.db, risk, m.programName)
+		} else {
+			riskHash, err = risk.SaveToDB(m.db)
+		}
+
+		if err != nil {
+			log.Errorf("Import SSARisk from JSON failed: %v", err)
+			if cb != nil {
+				cb(fmt.Sprintf("Import SSARisk from JSON failed: risk ID :%d ", risk.ID), progress)
+			}
+			continue
+		}
+		// save dataflow
+		if m.saveDataFlow {
+			saver := NewSaveDataFlowCtx(m.db, riskHash)
+			for _, dataFlowPath := range risk.DataFlowPaths {
+				saver.SaveDataFlow(dataFlowPath)
+			}
+		}
+		if cb != nil {
+			cb(fmt.Sprintf("Importing risk %d/%d", count, total), progress)
+		}
+	}
+	return nil
+}
+
+func (m *ImportSSARiskManager) importFilesFromReport(report *Report, cb func(string, float64)) error {
+	if len(report.File) == 0 || !m.saveFile {
+		if cb != nil {
+			cb("No files to import", 1)
+		}
+		return nil
+	}
+	total := len(report.File)
+	for i, file := range report.File {
+		select {
+		case <-m.ctx.Done():
+			return utils.Error("Import Files from JSON failed: context done")
+		default:
+		}
+		if err := file.SaveToDB(m.db, m.programName); err != nil {
+			log.Errorf("Import Files from JSON failed: %v", err)
+		}
+		if cb != nil {
+			progress := float64(i+1) / float64(total)
+			cb(fmt.Sprintf("Importing file %d/%d", i+1, total), progress)
+		}
+	}
+	return nil
+}
+
+// GenerateSSAReportMarkdownForTask 根据扫描任务 ID 在进程内生成 SSA 的 Markdown 报告
+// 导出名为 sfreport.GenerateSSAReportMarkdownForTask，行为对齐 gRPC 的 Yak.GenerateSSAReport
+// 参数:
+//   - taskID: SSA 扫描任务 ID
+//   - reportName: 生成的报告名称
+//
+// 返回值:
+//   - 报告记录的数据库 ID
+//   - 生成的 Markdown 报告内容
+//   - 错误信息
+//
+// Example:
+// ```
+// // 根据已完成的扫描任务生成报告（示意性示例）
+// id, markdown, err = sfreport.GenerateSSAReportMarkdownForTask("task-uuid", "my-report")
+// if err != nil { die(err) }
+// println(markdown)
+// ```
+func GenerateSSAReportMarkdownForTask(taskID, reportName string) (int, string, error) {
+	ctx := context.Background()
+	db := consts.GetGormSSAProjectDataBase()
+	if db == nil {
+		return 0, "", utils.Errorf("ssa project database is nil")
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return 0, "", utils.Errorf("task id is empty")
+	}
+	task, err := schema.GetSyntaxFlowScanTaskById(db, taskID)
+	if err != nil {
+		return 0, "", utils.Wrapf(err, "get syntax flow scan task failed")
+	}
+	ssaReport, err := GenerateSSAProjectReportFromTask(ctx, task)
+	if err != nil {
+		return 0, "", utils.Wrapf(err, "generate ssa project report failed")
+	}
+	reportInstance := &schema.Report{}
+	reportInstance.From("ssa-scan")
+	reportInstance.Title(strings.TrimSpace(reportName))
+	if err := GenerateYakitReportContent(reportInstance, ssaReport); err != nil {
+		return 0, "", utils.Wrapf(err, "generate yakit report content failed")
+	}
+	rid := reportInstance.SaveForIRify()
+	if rid == 0 {
+		return 0, "", utils.Errorf("save report failed")
+	}
+	return rid, schema.JoinReportItemsMarkdown(reportInstance.Items), nil
+}

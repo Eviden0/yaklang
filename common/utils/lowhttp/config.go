@@ -1,0 +1,1115 @@
+package lowhttp
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/yaklang/yaklang/common/netx"
+
+	"github.com/yaklang/yaklang/common/schema"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/log"
+	utls "github.com/yaklang/yaklang/common/third_party/utls"
+	"github.com/yaklang/yaklang/common/utils"
+)
+
+const (
+	defaultWaitTime    = time.Duration(100) * time.Millisecond
+	defaultMaxWaitTime = time.Duration(2000) * time.Millisecond
+)
+
+type RetryHandler func(https bool, retryCount int, req []byte, rsp []byte, retryFunc func(...[]byte))
+type CustomFailureChecker func(https bool, req []byte, rsp []byte, fail func(string))
+
+type LowhttpExecConfig struct {
+	// Response mirror is private and set only by an opt-in context trace.
+	networkTraceWriter io.Writer
+	Host               string
+	Port               int
+	Packet             []byte
+	VerifyCertificate  bool
+	Https              bool
+	//ResponseCallback                 func(response *LowhttpResponse) have same option SaveHTTPFlowHandler
+	Http2                            bool
+	Http3                            bool
+	GmTLS                            bool
+	GmTLSOnly                        bool
+	GmTLSPrefer                      bool
+	GmTLSCipherSuites                []uint16
+	GmTLSDisableCompatMode           bool
+	OverrideEnableSystemProxyFromEnv bool
+	EnableSystemProxyFromEnv         bool
+	ConnectTimeout                   time.Duration
+	Timeout                          time.Duration
+	NoBodyBuffer                     bool
+	RedirectTimes                    int
+	RetryTimes                       int
+	RetryInStatusCode                []int
+	RetryNotInStatusCode             []int
+	RetryHandler                     RetryHandler
+	CustomFailureChecker             CustomFailureChecker
+	RetryWaitTime                    time.Duration
+	RetryMaxWaitTime                 time.Duration
+	JsRedirect                       bool
+	Proxy                            []string
+	ForceLegacyProxy                 bool
+	NoFixContentLength               bool
+	NoReadMultiResponse              bool
+	RedirectHandler                  func(bool, []byte, []byte) bool
+	Session                          string
+	DisableSession                   bool
+	BeforeDoRequest                  func([]byte) []byte
+	Ctx                              context.Context
+	SaveHTTPFlow                     bool
+	SaveHTTPFlowSync                 bool
+	SaveHTTPFlowHandler              []func(*LowhttpResponse)
+	AfterSaveHTTPFlowHandler         []func(*schema.HTTPFlow)
+	UseMITMRule                      bool
+	RequestSource                    string
+	EtcHosts                         map[string]string
+	PreferEtcHostsBeforeProxy        bool
+	DNSServers                       []string
+	RuntimeId                        string
+	FromPlugin                       string
+	WithConnPool                     bool
+	ConnPool                         *LowHttpConnPool
+	NativeHTTPRequestInstance        *http.Request
+	Username                         string
+	Password                         string
+	FixQueryEscape                   bool
+
+	// DiscardIntermediateResponseBody lets an internal transport consumer avoid
+	// retaining a bounded Content-Length body in its temporary http.Response when
+	// it separately captures and reparses the complete response packet.
+	DiscardIntermediateResponseBody bool
+
+	// BorrowConnPoolResponsePacket lets an internal immutable consumer reuse the
+	// connection pool's wire capture as the request context's bare response. It is
+	// only effective with DiscardIntermediateResponseBody on the bounded
+	// Content-Length fast path. Exact single-response wire packets then alias
+	// LowhttpResponse.BareResponse and both views must remain immutable. Responses
+	// with informational prefixes or headers requiring normalization fall back to
+	// an owned context packet.
+	BorrowConnPoolResponsePacket bool
+
+	// BorrowFixedRequestPacket lets an internal immutable caller retain the
+	// input packet and reuse it when CRLF/content-length normalization is an
+	// exact no-op. The default keeps LowhttpResponse.RawRequest independently
+	// owned for backward compatibility.
+	BorrowFixedRequestPacket bool
+
+	// BorrowFixedResponsePacket lets an internal immutable caller reuse the wire
+	// packet when response fixing is a byte-for-byte no-op. The default keeps
+	// LowhttpResponse.RawPacket independently owned for backward compatibility.
+	BorrowFixedResponsePacket bool
+
+	// DefaultBufferSize means unexpected situation's buffer size
+	DefaultBufferSize int
+
+	// MaxContentLength: too large content-length will be ignored(truncated)
+	EnableMaxContentLength bool
+	MaxContentLength       int
+
+	DNSNoCache bool
+
+	// BodyStreamReaderHandler is a callback function to handle the body stream reader
+	BodyStreamReaderHandler func(responseHeader []byte, closer io.ReadCloser)
+	// bodyStreamReaderHandled coordinates the transport-specific stream handler
+	// with HTTPWithoutRedirect's fallback. It keeps the callback exactly-once.
+	bodyStreamReaderHandled *utils.AtomicBool
+	// AutoDetectSSE enables SSE auto-detection by response headers (Content-Type: text/event-stream)
+	// to automatically switch into stream/no-body-buffer mode even when request headers don't include
+	// Accept: text/event-stream.
+	AutoDetectSSE bool
+	// ExtendReadDeadline refreshes read deadline on every read in conn-pool mode,
+	// effectively turning Timeout into an idle-timeout instead of a total-timeout.
+	ExtendReadDeadline bool
+
+	// SNI
+	SNI *string
+
+	// payloads (web fuzzer)
+	Payloads []string
+
+	RandomJA3FingerPrint bool
+	ClientHelloSpec      *utls.ClientHelloSpec
+	TLSFingerprint       string
+	HTTP2Fingerprint     string
+
+	Tags []string
+
+	BeforeCount *int64
+	AfterCount  *int64
+
+	StrongHost string
+
+	Dialer func(duration time.Duration, addr string) (net.Conn, error)
+
+	ExtendDialOption []netx.DialXOption // for test
+
+	// random chunked
+	EnableRandomChunked bool
+	MinChunkedLength    int
+	MaxChunkedLength    int
+	MinChunkDelay       time.Duration
+	MaxChunkDelay       time.Duration
+	ChunkedHandler      ChunkedResultHandler
+	chunkedSender       *RandomChunkedSender
+}
+
+type LowhttpResponse struct {
+	RawPacket []byte
+	// ResponsePacketFixed means RawPacket was produced successfully by FixHTTPResponsePacket.
+	ResponsePacketFixed    bool
+	BareResponse           []byte
+	RedirectRawPackets     []*RedirectFlow
+	PortIsOpen             bool
+	TraceInfo              *LowhttpTraceInfo
+	Url                    string
+	RemoteAddr             string
+	Proxy                  string
+	Https                  bool
+	Http2                  bool
+	RawRequest             []byte
+	Source                 string // 请求源
+	RuntimeId              string
+	FromPlugin             string
+	MultiResponse          bool
+	MultiResponseInstances []*http.Response
+	RequestInstance        *http.Request
+
+	// if TooLarge, the database will drop some response data
+	TooLarge         bool
+	TooLargeLimit    int64
+	ResponseBodySize int64
+
+	// !deprecated
+	// HiddenIndex associate between http_flows and web_fuzzer_response table
+	HiddenIndex string
+
+	// payloads (web fuzzer)
+	Payloads []string
+
+	// custom tags
+	Tags []string
+
+	AfterSaveHTTPFlowHandler []func(*schema.HTTPFlow)
+
+	IsFixContentType        bool
+	OriginContentType       string
+	FixContentType          string
+	IsSetContentTypeOptions bool
+
+	postParts []*multipart.Part
+}
+
+func (f *LowhttpResponse) RemoveColor() {
+	newTags := make([]string, 0, len(f.Tags))
+	for _, i := range f.Tags {
+		if strings.HasPrefix(i, schema.COLORPREFIX) {
+			continue
+		}
+		newTags = append(newTags, i)
+	}
+}
+
+func yakitColor(i string) string {
+	return schema.COLORPREFIX + i
+}
+
+func (r *LowhttpResponse) AddTag(i string) {
+	r.Tags = append(r.Tags, i)
+}
+
+func (r *LowhttpResponse) AddTags(i ...string) {
+	r.Tags = append(r.Tags, i...)
+}
+
+func (r *LowhttpResponse) Red() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("RED"))
+}
+
+func (r *LowhttpResponse) Green() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("GREEN"))
+}
+
+func (r *LowhttpResponse) Blue() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("BLUE"))
+}
+
+func (r *LowhttpResponse) Yellow() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("YELLOW"))
+}
+
+func (r *LowhttpResponse) Orange() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("ORANGE"))
+}
+
+func (r *LowhttpResponse) Purple() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("PURPLE"))
+}
+
+func (r *LowhttpResponse) Cyan() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("CYAN"))
+}
+
+func (r *LowhttpResponse) Grey() {
+	r.RemoveColor()
+	r.AddTag(yakitColor("GREY"))
+}
+
+func (f *LowhttpResponse) ColorSharp(rgbHex string) {
+	f.RemoveColor()
+	f.AddTag(yakitColor(rgbHex))
+}
+
+func (r *LowhttpResponse) GetHeader(key string) string {
+	return GetHTTPPacketHeader(r.RawPacket, key)
+}
+
+func (r *LowhttpResponse) GetHeaders() map[string]string {
+	return GetHTTPPacketHeaders(r.RawPacket)
+}
+
+func (r *LowhttpResponse) GetHeadersFull() map[string][]string {
+	return GetHTTPPacketHeadersFull(r.RawPacket)
+}
+
+func (r *LowhttpResponse) GetContentType() string {
+	return GetHTTPPacketContentType(r.RawPacket)
+}
+
+func (r *LowhttpResponse) GetCookie(key string) string {
+	return GetHTTPPacketCookie(r.RawPacket, key)
+}
+
+func (r *LowhttpResponse) GetBody() []byte {
+	_, body := SplitHTTPPacketFast(r.RawPacket)
+	return body
+}
+
+func (r *LowhttpResponse) GetHost() string {
+	return GetHTTPPacketHeader(r.RawPacket, "Host")
+}
+
+func (r *LowhttpResponse) URL() string {
+	if r.RawRequest == nil {
+		return ""
+	}
+	scheme := "http"
+	if r.Https {
+		scheme = "https"
+	}
+	return GetUrlFromHTTPRequest(scheme, r.RawRequest)
+}
+
+func (r *LowhttpResponse) Json() any {
+	if utils.IContains(r.GetHeader("Content-Type"), "json") {
+		var i any
+		err := json.Unmarshal(r.GetBody(), &i)
+		if err != nil || utils.IsNil(i) {
+			log.Warnf("json unmarshal failed: %s", err)
+			return make(map[string]any)
+		}
+		return i
+	}
+
+	// check body
+	if utils.IsNil(r.GetBody()) {
+		return make(map[string]any)
+	}
+
+	// check is json
+	if _, ok := utils.IsJSON(string(r.GetBody())); ok {
+		var i any
+		err := json.Unmarshal(r.GetBody(), &i)
+		if err != nil || utils.IsNil(i) {
+			log.Warnf("json unmarshal failed: %s", err)
+			return make(map[string]any)
+		}
+		return i
+	}
+
+	return make(map[string]any)
+}
+
+func (r *LowhttpResponse) GetStatusCode() int {
+	return GetStatusCodeFromResponse(r.RawPacket)
+}
+
+func (r *LowhttpResponse) GetDurationFloat() float64 {
+	if r == nil {
+		return 0
+	}
+	if r.TraceInfo == nil {
+		return 0
+	}
+	return float64(r.TraceInfo.GetServerDurationMS()) / float64(1000)
+}
+
+type LowhttpTraceInfo struct {
+	AvailableDNSServers []string
+	// DNS 完整请求时间
+	DNSTime time.Duration
+	// 获取一个连接的耗时
+	ConnTime time.Duration
+	// 服务器处理耗时，计算从连接建立到客户端收到第一个字节的时间间隔
+	ServerTime time.Duration
+	// 完整请求的耗时
+	TotalTime time.Duration
+	// tls 握手耗时
+	TLSHandshakeTime time.Duration
+	// tcp dial 耗时
+	TCPTime time.Duration
+	// 原始 dial trace，保留底层更细的连接耗时与重试信息
+	DialTraceInfo *netx.DialXTraceInfo
+}
+
+func (l *LowhttpTraceInfo) ParseDialXTraceInfo(info *netx.DialXTraceInfo) {
+	if info == nil {
+		return
+	}
+	l.DialTraceInfo = info
+	l.ConnTime, l.TCPTime, l.TLSHandshakeTime = info.Durations()
+}
+
+func (l *LowhttpTraceInfo) GetServerDurationMS() int64 {
+	if l == nil {
+		return 0
+	}
+	return l.ServerTime.Milliseconds()
+}
+
+func newLowhttpResponse(trace *LowhttpTraceInfo) *LowhttpResponse {
+	return &LowhttpResponse{
+		RawPacket:  nil,
+		PortIsOpen: false,
+		TraceInfo:  trace,
+	}
+}
+
+func newLowhttpTraceInfo() *LowhttpTraceInfo {
+	return &LowhttpTraceInfo{}
+}
+
+// NewLowhttpOption create a new LowhttpExecConfig
+func NewLowhttpOption() *LowhttpExecConfig {
+	return &LowhttpExecConfig{
+		Host:                 "",
+		Port:                 0,
+		Packet:               []byte{},
+		Https:                false,
+		Http2:                false,
+		Timeout:              15 * time.Second,
+		ConnectTimeout:       15 * time.Second,
+		RetryTimes:           0,
+		RetryInStatusCode:    []int{},
+		RetryNotInStatusCode: []int{},
+		RetryWaitTime:        defaultWaitTime,
+		RetryMaxWaitTime:     defaultMaxWaitTime,
+		RedirectTimes:        5,
+		Proxy:                nil,
+		RedirectHandler:      nil,
+		SaveHTTPFlow:         consts.GLOBAL_HTTP_FLOW_SAVE.IsSet(),
+		MaxContentLength:     10 * 1024 * 1024, // 10MB roughly
+	}
+}
+
+type LowhttpOpt func(o *LowhttpExecConfig)
+
+func WithNoBodyBuffer(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.NoBodyBuffer = b
+	}
+}
+
+func WithDiscardIntermediateResponseBody(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.DiscardIntermediateResponseBody = b
+	}
+}
+
+func WithBorrowConnPoolResponsePacket(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.BorrowConnPoolResponsePacket = b
+	}
+}
+
+func WithBorrowFixedRequestPacket(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.BorrowFixedRequestPacket = b
+	}
+}
+
+func WithBorrowFixedResponsePacket(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.BorrowFixedResponsePacket = b
+	}
+}
+
+func WithNoReadMultiResponse(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.NoReadMultiResponse = b
+	}
+}
+
+func WithAppendHTTPFlowTag(tag string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Tags = append(o.Tags, tag)
+	}
+}
+
+func WithMaxContentLength(m int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.EnableMaxContentLength = m > 0
+		o.MaxContentLength = m
+	}
+}
+
+func WithETCHosts(hosts map[string]string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.EtcHosts = hosts
+	}
+}
+
+func WithPreferEtcHostsBeforeProxy(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.PreferEtcHostsBeforeProxy = b
+	}
+}
+
+func WithBodyStreamReaderHandler(t func(headerBytes []byte, bodyReader io.ReadCloser)) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.BodyStreamReaderHandler = t
+	}
+}
+
+func WithExtendReadDeadline(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ExtendReadDeadline = b
+	}
+}
+
+func WithAutoDetectSSE(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.AutoDetectSSE = b
+	}
+}
+
+func WithVerifyCertificate(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.VerifyCertificate = b
+	}
+}
+
+func WithGmTLS(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.GmTLS = b
+	}
+}
+
+func WithGmTLSPrefer(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.GmTLSPrefer = b
+	}
+}
+
+func WithGmTLSOnly(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.GmTLSOnly = b
+	}
+}
+
+// WithGmTLSCipherSuite 指定国密 ClientHello 套件（套件 ID 使用 tls.GMTLS_* 常量，可传多个）。
+// 设置后仅协商所列套件，不再使用 netx 默认的 ECC→ECDHE→全套 三轮回退。
+func WithGmTLSCipherSuite(suites ...int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.GmTLSCipherSuites = intsToGMTLSCipherSuites(suites)
+	}
+}
+
+// WithGmTLSDisableCompatMode 关闭国密兼容模式；不传参等价于 true。
+func WithGmTLSDisableCompatMode(disable ...bool) LowhttpOpt {
+	v := true
+	if len(disable) > 0 {
+		v = disable[0]
+	}
+	return func(o *LowhttpExecConfig) {
+		o.GmTLSDisableCompatMode = v
+	}
+}
+
+func intsToGMTLSCipherSuites(suites []int) []uint16 {
+	if len(suites) == 0 {
+		return nil
+	}
+	out := make([]uint16, len(suites))
+	for i, id := range suites {
+		out[i] = uint16(id)
+	}
+	return out
+}
+
+// WithDNSNoCache is not effective
+func WithDNSNoCache(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.DNSNoCache = b
+		log.Debug("WithDNSNoCache is not effective")
+	}
+}
+
+// dnsResolver 指定 nuclei 扫描时使用的自定义 DNS 服务器列表，用于解析目标域名
+//
+// 参数:
+//   - servers: DNS 服务器地址列表（如 ["8.8.8.8", "1.1.1.1"]）
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：使用指定 DNS 服务器解析目标
+// res, err = nuclei.Scan("http://example.com", nuclei.dnsResolver(["8.8.8.8", "1.1.1.1"]))
+// die(err)
+// ```
+func WithDNSServers(servers []string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.DNSServers = servers
+	}
+}
+
+func WithRuntimeId(runtimeId string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RuntimeId = runtimeId
+	}
+}
+
+// fromPlugin 标记本次 nuclei 扫描请求的来源插件名称，便于在结果中追踪请求出处
+//
+// 参数:
+//   - fromPlugin: 来源插件名称
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：标记扫描请求来源插件
+// res, err = nuclei.Scan("http://example.com", nuclei.fromPlugin("my-plugin"))
+// die(err)
+// ```
+func WithFromPlugin(fromPlugin string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.FromPlugin = fromPlugin
+	}
+}
+
+func WithNativeHTTPRequestInstance(req *http.Request) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.NativeHTTPRequestInstance = req
+	}
+}
+
+func WithUsername(username string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Username = username
+	}
+}
+
+func WithPassword(password string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Password = password
+	}
+}
+
+func WithSource(s string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RequestSource = s
+	}
+}
+
+func WithHost(host string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Host = host
+	}
+}
+
+func WithPort(port int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Port = port
+	}
+}
+
+func WithPacketBytes(packet []byte) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Packet = packet
+	}
+}
+
+func WithDefaultBufferSize(size int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.DefaultBufferSize = size
+	}
+}
+
+func WithEnableSystemProxyFromEnv(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.OverrideEnableSystemProxyFromEnv = true
+		o.EnableSystemProxyFromEnv = b
+	}
+}
+
+func WithRequest(packet any) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		switch ret := packet.(type) {
+		case []byte:
+			o.Packet = ret
+			return
+		case string:
+			o.Packet = []byte(ret)
+			return
+		case *http.Request:
+			reqRaw, err := utils.HttpDumpWithBody(ret, true)
+			if err != nil {
+				log.Errorf("parse request failed: %s", err)
+			}
+			o.Packet = reqRaw
+		default:
+			o.Packet = utils.InterfaceToBytes(packet)
+			log.Warnf("any(%v) to request packet: %s", reflect.TypeOf(ret), spew.Sdump(o.Packet))
+		}
+	}
+}
+
+func WithBeforeDoRequest(h func([]byte) []byte) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.BeforeDoRequest = h
+	}
+}
+
+// https 设置 nuclei 扫描是否使用 HTTPS 协议访问目标
+//
+// 参数:
+//   - https: 为 true 时使用 HTTPS 访问目标
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：强制使用 HTTPS 扫描目标
+// res, err = nuclei.Scan("example.com", nuclei.https(true))
+// die(err)
+// ```
+func WithHttps(https bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Https = https
+	}
+}
+
+// http2 设置 nuclei 扫描是否启用 HTTP/2 协议发送请求
+//
+// 参数:
+//   - Http2: 为 true 时启用 HTTP/2
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：使用 HTTP/2 扫描目标
+// res, err = nuclei.Scan("https://example.com", nuclei.http2(true))
+// die(err)
+// ```
+func WithHttp2(Http2 bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Http2 = Http2
+	}
+}
+
+// http3 设置 nuclei 扫描是否启用 HTTP/3 协议发送请求
+//
+// 参数:
+//   - http3: 为 true 时启用 HTTP/3
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：使用 HTTP/3 扫描目标
+// res, err = nuclei.Scan("https://example.com", nuclei.http3(true))
+// die(err)
+// ```
+func WithHttp3(http3 bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Http3 = http3
+	}
+}
+
+func WithTimeout(timeout time.Duration) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Timeout = timeout
+	}
+}
+
+func WithConnectTimeout(timeout time.Duration) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ConnectTimeout = timeout
+	}
+}
+
+func WithConnectTimeoutFloat(i float64) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ConnectTimeout = utils.FloatSecondDuration(i)
+	}
+}
+
+func WithTimeoutFloat(i float64) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Timeout = utils.FloatSecondDuration(i)
+	}
+}
+
+// retry 设置 nuclei 扫描中单个请求失败后的最大重试次数
+//
+// 参数:
+//   - retryTimes: 最大重试次数
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：请求失败时最多重试 3 次
+// res, err = nuclei.Scan("http://example.com", nuclei.retry(3))
+// die(err)
+// ```
+func WithRetryTimes(retryTimes int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RetryTimes = retryTimes
+	}
+}
+
+// WithRetryHandler sets a retry handler function that will be called when a request fails.
+// return true for retry, return false for not retry.
+func WithRetryHandler(retryHandler RetryHandler) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		if !utils.IsNil(retryHandler) {
+			o.RetryHandler = func(https bool, retryCount int, req []byte, rsp []byte, retryFunc func(...[]byte)) {
+				defer func() {
+					if err := recover(); err != nil {
+						log.Errorf("retry handler failed: %v\n%v", err, utils.ErrorStack(err))
+					}
+				}()
+				retryHandler(https, retryCount, req, rsp, retryFunc)
+				return
+			}
+		}
+	}
+}
+
+// WithCustomFailureChecker sets a custom failure checker function that will be called when a request succeeds.
+// The checker can call the fail function with an error message to mark the request as failed.
+func WithCustomFailureChecker(customFailureChecker CustomFailureChecker) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		if !utils.IsNil(customFailureChecker) {
+			o.CustomFailureChecker = func(https bool, req []byte, rsp []byte, fail func(string)) {
+				defer func() {
+					if err := recover(); err != nil {
+						log.Errorf("custom failure checker failed: %v\n%v", err, utils.ErrorStack(err))
+					}
+				}()
+				customFailureChecker(https, req, rsp, fail)
+			}
+		}
+	}
+}
+
+func WithRetryInStatusCode(sc []int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RetryInStatusCode = sc
+	}
+}
+
+func WithRetryNotInStatusCode(sc []int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RetryNotInStatusCode = sc
+	}
+}
+
+func WithRetryWaitTime(retryWaitTime time.Duration) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RetryWaitTime = retryWaitTime
+	}
+}
+
+func WithRetryMaxWaitTime(retryMaxWaitTime time.Duration) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RetryMaxWaitTime = retryMaxWaitTime
+	}
+}
+
+func WithRedirectTimes(redirectTimes int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RedirectTimes = redirectTimes
+	}
+}
+
+func WithJsRedirect(jsRedirect bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.JsRedirect = jsRedirect
+	}
+}
+
+func WithContext(ctx context.Context) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Ctx = ctx
+	}
+}
+
+// proxy 设置 nuclei 扫描时使用的代理服务器，可传入多个代理（依次尝试）
+//
+// 参数:
+//   - proxy: 一个或多个代理地址（如 "http://127.0.0.1:8080"）
+//
+// 返回值:
+//   - 一个 nuclei.Scan 可接收的配置选项
+//
+// Example:
+// ```
+// // 该示例为示意性用法：通过本地代理扫描目标
+// res, err = nuclei.Scan("http://example.com", nuclei.proxy("http://127.0.0.1:8080"))
+// die(err)
+// ```
+func WithProxy(proxy ...string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Proxy = utils.StringArrayFilterEmpty(proxy)
+	}
+}
+
+func WithProxyGetter(getter func() []string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Proxy = utils.StringArrayFilterEmpty(getter())
+	}
+}
+
+func WithForceLegacyProxy(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ForceLegacyProxy = b
+	}
+}
+
+func WithSaveHTTPFlow(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.SaveHTTPFlow = b
+	}
+}
+
+func WithSaveHTTPFlowSync(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.SaveHTTPFlowSync = b
+	}
+}
+
+func WithSaveHTTPFlowHandler(f ...func(*LowhttpResponse)) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		if o.SaveHTTPFlowHandler == nil {
+			o.SaveHTTPFlowHandler = make([]func(*LowhttpResponse), 0, 1)
+		}
+		o.SaveHTTPFlowHandler = append(o.SaveHTTPFlowHandler, f...)
+	}
+}
+
+func WithAfterSaveHTTPFlowHandler(f ...func(*schema.HTTPFlow)) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		if o.AfterSaveHTTPFlowHandler == nil {
+			o.AfterSaveHTTPFlowHandler = make([]func(*schema.HTTPFlow), 0, 1)
+		}
+		o.AfterSaveHTTPFlowHandler = append(o.AfterSaveHTTPFlowHandler, f...)
+	}
+}
+
+func WithUseMITMRule(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.UseMITMRule = b
+	}
+}
+
+func WithNoFixContentLength(noFixContentLength bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.NoFixContentLength = noFixContentLength
+	}
+}
+
+func WithFixQueryEscape(fixQueryEscape bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.FixQueryEscape = fixQueryEscape
+	}
+}
+
+func WithRedirectHandler(redirectHandler func(bool, []byte, []byte) bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RedirectHandler = redirectHandler
+	}
+}
+
+// WithSession 指定 session 标识；cookie jar 在有界 LRU 池中跨请求复用。
+// 调用方仍应在确定不再使用时调用 RemoveCookiejar 或 poc.RemoveSession，
+// 以便及时释放 cookie；池达到容量时会自动淘汰最久未使用的 session。
+func WithSession(session string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Session = session
+	}
+}
+
+// WithDisableSession 为 true 时不自动分配 session，也不启用 cookie jar。
+func WithDisableSession(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.DisableSession = b
+	}
+}
+
+func ConnPool(p *LowHttpConnPool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ConnPool = p
+	}
+}
+
+func WithConnPool(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.WithConnPool = b
+	}
+}
+
+func WithDebugCount(before, after *int64) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.BeforeCount = before
+		o.AfterCount = after
+	}
+}
+
+func WithSNI(sni string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.SNI = &sni
+	}
+}
+
+func WithPayloads(payloads []string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Payloads = payloads
+	}
+}
+
+func WithRandomJA3FingerPrint(b bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.RandomJA3FingerPrint = b
+	}
+}
+
+func WithClientHelloSpec(spec *utls.ClientHelloSpec) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ClientHelloSpec = spec
+	}
+}
+
+func WithTLSFingerprint(name string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.TLSFingerprint = name
+	}
+}
+
+// WithHTTP2Fingerprint selects a built-in HTTP/2 framing fingerprint profile
+// (see AvailableHTTP2Profiles). It is independent of WithTLSFingerprint: the
+// default HTTP/2 framing stays compatible with non-conforming servers unless a
+// profile is requested explicitly.
+func WithHTTP2Fingerprint(name string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.HTTP2Fingerprint = name
+	}
+}
+
+func WithDialer(dialer func(duration time.Duration, addr string) (net.Conn, error)) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.Dialer = dialer
+	}
+}
+
+func WithStrongHostMode(localAddrIP string) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.StrongHost = localAddrIP
+	}
+}
+
+func WithExtendDialXOption(options ...netx.DialXOption) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ExtendDialOption = options
+	}
+}
+
+func WithEnableRandomChunked(enable bool) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.EnableRandomChunked = enable
+	}
+}
+
+func WithRandomChunkedLength(min, max int) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.MinChunkedLength = min
+		o.MaxChunkedLength = max
+	}
+}
+
+func WithRandomChunkedDelay(min, max time.Duration) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.MinChunkDelay = min
+		o.MaxChunkDelay = max
+	}
+}
+
+func WithRandomChunkedHandler(handler ChunkedResultHandler) LowhttpOpt {
+	return func(o *LowhttpExecConfig) {
+		o.ChunkedHandler = handler
+	}
+}
+
+func (o *LowhttpExecConfig) GetOrCreateChunkSender() (*RandomChunkedSender, error) {
+	if o.chunkedSender != nil {
+		// 复用缓存的 sender，但每次都把最新的 ctx / handler 同步进去。
+		// 连接池在重试（shouldRetryRequest）时会重排同一个 writeRequest，
+		// 如果不加刷新，缓存 sender 会沿用创建时固化的 handler，导致分块回调
+		// 被路由到旧的闭包，造成分块重复计数 / 归属错乱。
+		o.chunkedSender.refreshCallbacks(o.Ctx, o.ChunkedHandler)
+		return o.chunkedSender, nil
+	}
+	options := []randomChunkedHTTPOption{
+		_withRandomChunkCtx(o.Ctx),
+		_withRandomChunkChunkLength(o.MinChunkedLength, o.MaxChunkedLength),
+		_withRandomChunkDelay(o.MinChunkDelay, o.MaxChunkDelay),
+		_withRandomChunkResultHandler(o.ChunkedHandler),
+	}
+	sender, err := NewRandomChunkedSender(
+		options...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	o.chunkedSender = sender
+	return sender, nil
+}

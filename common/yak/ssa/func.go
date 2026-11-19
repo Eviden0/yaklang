@@ -1,0 +1,307 @@
+package ssa
+
+import (
+	"fmt"
+
+	"github.com/samber/lo"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/memedit"
+)
+
+func (p *Program) NewFunction(name string) *Function {
+	return p.NewFunctionWithParent(name, nil)
+}
+
+func (p *Program) NewFunctionWithParent(name string, parent *Function) *Function {
+	index := p.Funcs.Len()
+	if index == 0 && name == "" {
+		name = "main"
+	}
+	if name == "" {
+		if parent != nil {
+			name = fmt.Sprintf("%s$%d", parent.GetName(), index)
+		} else {
+			name = fmt.Sprintf("AnonymousFunc-%d", index)
+		}
+	}
+	f := &Function{
+		LazyBuilder: NewLazyBuilder("Function:" + name),
+		anValue:     NewValue(),
+		Params:      make([]int64, 0),
+		hasEllipsis: false,
+		Blocks:      make([]int64, 0),
+		EnterBlock:  0,
+		ExitBlock:   0,
+		ChildFuncs:  make([]int64, 0),
+		FreeValues:  make(map[*Variable]int64),
+		SideEffects: make([]*FunctionSideEffect, 0),
+		builder:     nil,
+	}
+	f.SetName(name)
+	f.SetProgram(p)
+	p.SetVirtualRegister(f)
+
+	if parent != nil {
+		parent.addAnonymous(f)
+		// Pos: parent.CurrentPos,
+		f.SetRange(parent.builder.CurrentRange)
+	} else {
+		// p.Funcs[name] = f
+		if _, ok := p.Funcs.Get(name); ok {
+			log.Debugf("function %s already exists", name)
+			name = fmt.Sprintf("%s$%d", name, index)
+		}
+		p.Funcs.Set(name, f)
+	}
+	// function 's Range is essential!
+	if f.GetRange() == nil {
+		// if editor := p.getCurrentEditor(); editor != nil {
+		// 	f.SetRangeInit(editor)
+		// } else {
+		if f.GetParent() != nil {
+			log.Warnf("the program must contains a editor to init function range: %v", p.Name)
+		}
+		// }
+	}
+
+	enter := f.NewBasicBlock("entry")
+	enter.SetScope(NewScope(f, p.GetProgramName()))
+	f.EnterBlock = enter.GetId()
+	return f
+}
+
+func (f *Function) SetCurrentBlueprint(blueprint *Blueprint) {
+	f.currentBlueprint = blueprint
+}
+
+func (f *Function) GetOrCreateBuilder() *FunctionBuilder {
+	if f == nil {
+		return nil
+	}
+	if f.builder != nil {
+		return f.builder
+	}
+
+	var editor *memedit.MemEditor
+	if prog := f.GetProgram(); prog != nil {
+		editor = prog.GetCurrentEditor()
+	}
+	return NewBuilder(editor, f, nil)
+}
+
+func (f *Function) GetCurrentBlueprint() *Blueprint {
+	return f.currentBlueprint
+}
+func (f *Function) GetType() Type {
+	if f == nil {
+		return defaultAnyType
+	}
+	f.typeMu.RLock()
+	ft := f.Type
+	f.typeMu.RUnlock()
+	if ft != nil {
+		return ft
+	}
+	return defaultAnyType
+}
+
+func (f *Function) AddThrow(vs ...Value) {
+	defer f.markPersistenceDirty()
+	f.Throws = append(f.Throws, lo.Map(vs, func(v Value, _ int) int64 {
+		return v.GetId()
+	})...)
+}
+
+func (f *Function) SetType(t Type) {
+	if utils.IsNil(f) || utils.IsNil(t) {
+		return
+	}
+	defer f.markPersistenceDirty()
+
+	if funTyp, ok := ToFunctionType(t); ok {
+		f.typeMu.Lock()
+		f.Type = funTyp
+		f.typeMu.Unlock()
+		// Final persistence closes the type store before dirty IR. Register
+		// a replacement now so its row exists when that IR is saved.
+		f.anValue.typId = f.anValue.cacheType(funTyp)
+	} else if t.GetTypeKind() == AnyTypeKind {
+		// Assigning AnyType to a function is an expected, benign condition that
+		// fires once per function on large projects (hadoop scan produced ~59k
+		// lines). Demote to debug so it no longer floods the scan log; use
+		// YAK_SSA_LOG_LEVEL=debug to trace it.
+		log.Debugf("skip any type for Function: %v alias: %v", f.name, f.verboseName)
+	} else if t != nil {
+		log.Warnf("ssa.Function type cannot be set type from: %v", t)
+	}
+}
+
+func (f *Function) SetGeneric(b bool) {
+	f.isGeneric = b
+}
+
+func (f *Function) IsGeneric() bool {
+	return f.isGeneric
+}
+
+func (f *Function) GetFunc() *Function {
+	return f
+}
+
+// GetCachedFunc returns self (Function already has the pointer, no cache access needed).
+func (f *Function) GetCachedFunc() *Function {
+	return f
+}
+
+func (f *Function) addAnonymous(anon *Function) {
+	defer f.markPersistenceDirty()
+	defer anon.markPersistenceDirty()
+	f.ChildFuncs = append(f.ChildFuncs, anon.GetId())
+	anon.parent = f.GetId()
+}
+
+func (f *FunctionBuilder) NewParam(name string, pos ...CanStartStopToken) *Parameter {
+	p := NewParam(name, false, f)
+	f.appendParam(p, pos...)
+	return p
+}
+
+func (f *FunctionBuilder) NewParameterMember(name string, obj *Parameter, key Value) *ParameterMember {
+	defer f.Function.markPersistenceDirty()
+	paraMember := NewParamMember(name, f, obj, key)
+	f.ParameterMembers = append(f.ParameterMembers, paraMember.GetId())
+	paraMember.FormalParameterIndex = len(f.ParameterMembers) - 1
+	paraMember.markPersistenceDirty()
+	if f.MarkedThisObject != nil &&
+		obj.GetDefault() != nil &&
+		f.MarkedThisObject.GetId() == obj.GetDefault().GetId() {
+		f.SetMethod(true, obj.GetType())
+	}
+	variable := f.CreateVariable(name)
+	f.AssignVariable(variable, paraMember)
+	return paraMember
+}
+func (f *FunctionBuilder) NewMoreParameterMember(name string, member *ParameterMember, key Value) *ParameterMember {
+	defer f.Function.markPersistenceDirty()
+	paraMember := NewMoreParamMember(name, f, member, key)
+	variable := f.CreateVariable(name)
+	f.AssignVariable(variable, paraMember)
+	f.ParameterMembers = append(f.ParameterMembers, paraMember.GetId())
+	paraMember.FormalParameterIndex = len(f.ParameterMembers) - 1
+	paraMember.markPersistenceDirty()
+	return paraMember
+}
+
+func (f *FunctionBuilder) appendParam(p *Parameter, token ...CanStartStopToken) {
+	defer f.Function.markPersistenceDirty()
+	defer p.markPersistenceDirty()
+	f.Params = append(f.Params, p.GetId())
+	p.FormalParameterIndex = len(f.Params) - 1
+	p.IsFreeValue = false
+	variable := f.CreateVariableForce(p.GetName(), token...)
+	variable.AddRange(f.CurrentRange, false)
+	f.AssignVariable(variable, p)
+}
+
+func (f *Function) ReturnValue() []Value {
+	exitBlock, ok := f.GetBasicBlockByID(f.ExitBlock)
+	if !ok || exitBlock == nil {
+		log.Warnf("function exit block cannot convert to BasicBlock: %v", f.ExitBlock)
+		return nil
+	}
+	ret := exitBlock.LastInst().(*Return)
+	return f.GetValuesByIDs(ret.Results)
+}
+
+func (f *Function) IsMain() bool {
+	return f.GetName() == string(MainFunctionName)
+}
+
+func (f *Function) GetParent() *Function {
+	if f.parent <= 0 {
+		return nil
+	}
+
+	parent, ok := f.GetValueById(f.parent)
+	if !ok || parent == nil {
+		log.Warnf("function parent not found: %v", f.parent)
+		return nil
+	}
+	fu, ok := ToFunction(parent)
+	if ok {
+		return fu
+	}
+	log.Warnf("function parent cannot convert to Function: %v", parent)
+	return nil
+}
+
+// just create a function define, only function parameter type \ return type \ ellipsis
+func NewFunctionWithType(name string, typ *FunctionType) *Function {
+	f := &Function{
+		anValue: NewValue(),
+	}
+	f.SetType(typ)
+	f.SetName(name)
+	f.GetProgram().SetVirtualRegister(f)
+	return f
+}
+
+func (f *Function) functionType() *FunctionType {
+	if f == nil {
+		return nil
+	}
+	f.typeMu.RLock()
+	ft := f.Type
+	f.typeMu.RUnlock()
+	return ft
+}
+
+// AddAnnotationFunc initializes the function type only when annotations need
+// to be attached. Some frontends leave it unset until the deferred body build.
+func (f *Function) AddAnnotationFunc(handlers ...func(Value)) {
+	if f == nil || len(handlers) == 0 {
+		return
+	}
+	f.typeMu.Lock()
+	if f.Type == nil {
+		f.Type = NewFunctionType("", nil, nil, false)
+		f.Type.This = f
+	}
+	f.Type.AddAnnotationFunc(handlers...)
+	f.typeMu.Unlock()
+}
+
+func (f *Function) IsMethod() bool {
+	ft := f.functionType()
+	if ft == nil {
+		return false
+	}
+	ft.receiverMu.RLock()
+	is := ft.IsMethod
+	ft.receiverMu.RUnlock()
+	return is
+}
+
+func (f *Function) SetMethod(is bool, objType Type) {
+	if f == nil {
+		return
+	}
+	f.typeMu.Lock()
+	if f.Type == nil {
+		f.Type = NewFunctionType("", nil, nil, false)
+		f.Type.This = f
+	}
+	ft := f.Type
+	f.typeMu.Unlock()
+	ft.receiverMu.Lock()
+	ft.IsMethod = is
+	ft.ObjectType = objType
+	ft.receiverMu.Unlock()
+}
+
+func (f *Function) SetVerboseName(name string) {
+	// only set once
+	if f.verboseName == "" {
+		f.verboseName = name
+	}
+}

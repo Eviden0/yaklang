@@ -1,0 +1,108 @@
+package ssaapi
+
+import (
+	"github.com/yaklang/yaklang/common/consts"
+
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+)
+
+// save to Profile SSAProgram
+func SaveConfig(c *Config, prog *Program) {
+	if c.databaseKind == ssa.ProgramCacheMemory || c.EnableCache {
+		if c.GetProgramName() != "" {
+			log.Errorf("Compile program cache to memory: %s", c.GetProgramName())
+			SetProgramCache(prog)
+		}
+		return
+	}
+	irProg, err := ssadb.GetProgram(c.GetLatestProgramName(), ssa.Application)
+	if err != nil {
+		log.Errorf("irProg is nil, save config failed: %v", err)
+		return
+	}
+	irProg.Description = c.GetProjectDescription()
+	irProg.Language = c.GetLanguage()
+	irProg.EngineVersion = consts.GetYakVersion()
+	irProg.ConfigInput = c.JSON()
+	irProg.PeepholeSize = c.GetCompilePeepholeSize()
+	// 如果启用了增量编译，设置 IsOverlay = true
+	if c.GetEnableIncrementalCompile() {
+		irProg.IsOverlay = true
+	}
+	if err := ssadb.UpdateProgramWithError(irProg); err != nil {
+		log.Errorf("save config update program failed: name=%s err=%v", irProg.ProgramName, err)
+	}
+}
+
+// recompileProgramLayer 对单个 program 层执行重编译（使用该层自己的 ConfigInput，不会触发 overlay 其它层）。
+func recompileProgramLayer(prog *Program, inputOpt ...ssaconfig.Option) error {
+	if prog == nil {
+		return utils.Error("program is nil")
+	}
+	opt := make([]ssaconfig.Option, 0)
+	// get file system
+	hasFS := false
+	// recompile from info
+	if prog.irProgram != nil {
+		if configInfo := prog.irProgram.ConfigInput; configInfo != "" {
+			opt = append(opt, ssaconfig.WithConfigJson(configInfo)) // this json as first option
+			hasFS = true
+		}
+		opt = append(opt, WithPeepholeSize(prog.irProgram.PeepholeSize))
+	}
+	//TODO: recompile from database
+
+	// check file system
+	if !hasFS {
+		return utils.Errorf("该项目编译时引擎版本过旧，无法重新编译。")
+		// return utils.Errorf("The project compilation engine version is too old to recompile.\n该项目编译时引擎版本过旧，无法重新编译。")
+	}
+
+	layerName := prog.GetProgramName()
+	if layerName == "" && prog.Program != nil {
+		layerName = prog.Program.Name
+	}
+
+	// 检测是否是增量编译的 program
+	// 如果当前 program 是增量编译的，重编译时应该自动启用增量编译，使用当前层 program 作为 base program
+	if prog.IsIncrementalCompile() {
+		log.Infof("检测到增量编译 program，自动启用增量编译，base program: %s", layerName)
+		// 两个标志必须成对出现：enable 声明"参与增量序列"（SaveConfig 据此打
+		// IsOverlay 标、FS 层跳过与 overlay 语义冲突的 flush），base 名指向基座。
+		opt = append(opt, WithEnableIncrementalCompile(true), WithBaseProgramName(layerName))
+		// 增量编译时，不设置 WithProgramName，让调用者通过 inputOpt 传入新的 program name
+		// 这样可以确保每次重新编译都会创建一个新的 diff program，而不是覆盖现有的
+	} else {
+		// 非增量编译时，使用相同的 program name（重新编译会覆盖）
+		opt = append(opt, WithProgramName(layerName))
+	}
+
+	// append other options
+	opt = append(opt, WithLanguage(prog.GetLanguage()))
+	opt = append(opt, WithReCompile(true))
+	opt = append(opt, inputOpt...)
+
+	// parse
+	newProg, err := ParseProject(opt...)
+	_ = newProg
+
+	return err
+}
+
+// 已弃用
+// recompile from Profile SSAProgram
+func (prog *Program) Recompile(inputOpt ...ssaconfig.Option) error {
+	return recompileProgramLayer(prog, inputOpt...)
+}
+
+// Recompile 仅重编译 overlay 的当前层（最上层），不会重编译底层/父层 program。
+func (o *ProgramOverLay) Recompile(inputOpt ...ssaconfig.Option) error {
+	layerProg := o.topProgram()
+	if layerProg == nil {
+		return utils.Error("overlay program has no current layer")
+	}
+	return recompileProgramLayer(layerProg, inputOpt...)
+}

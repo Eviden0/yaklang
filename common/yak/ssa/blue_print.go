@@ -1,0 +1,525 @@
+package ssa
+
+import (
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/memedit"
+)
+
+type BlueprintFieldKind int
+
+// 定义最大继承深度
+const MaxInheritanceDepth = 100
+
+const (
+	// method: static normal magic
+	BluePrintStaticMethod BlueprintFieldKind = iota
+	BluePrintNormalMethod
+	BluePrintMagicMethod
+
+	// member: normal const static
+	BluePrintNormalMember
+	BluePrintConstMember
+	BluePrintStaticMember
+)
+
+type BlueprintModifier int
+
+const (
+	NoneModifier BlueprintModifier = 1 << iota
+	Static
+	Public
+	Protected
+	Private
+	Abstract
+	Final
+	Readonly
+)
+
+type BlueprintKind string
+
+const (
+	BlueprintNone      BlueprintKind = "none"
+	BlueprintClass                   = "class"
+	BlueprintInterface               = "interface"
+
+	//BlueprintObject for object, like new Blueprint
+	BlueprintObject = "object"
+)
+
+func ValidBlueprintKind(str string) BlueprintKind {
+	switch str {
+	case "none":
+		return BlueprintNone
+	case "class":
+		return BlueprintClass
+	case "interface":
+		return BlueprintInterface
+	case "object":
+		return BlueprintObject
+	default:
+		return BlueprintNone
+	}
+}
+
+type BlueprintRelationKind string
+
+// Blueprint is a class blueprint, it is used to create a new class
+type Blueprint struct {
+	id   int64
+	Name string
+
+	Kind         BlueprintKind
+	NormalMethod map[string]*Function
+	StaticMethod map[string]*Function
+	// MagicMethod is a SafeMap so concurrent builders can publish a slot
+	// without a package-level mutex. Callbacks and IR emission must stay
+	// outside SafeMap's lock; ForEach already drops the lock before its callback.
+	MagicMethod *utils.SafeMapWithKey[BlueprintMagicMethodKind, Value]
+
+	NormalMember map[string][]Value
+	StaticMember map[string][]Value
+	ConstValue   map[string][]Value
+
+	CallBack []func()
+
+	// magic method
+	Constructor Value
+	Destructor  Value
+
+	// _container is an inner ssa.Valueorigin cls container
+	_container Value
+
+	Range *memedit.Range
+
+	ParentBlueprints    []*Blueprint
+	InterfaceBlueprints []*Blueprint
+	// full Type Name, insertion order, capped.
+	fullTypeName orderedTypeNames
+
+	// lazy
+	*LazyBuilder
+}
+
+func (b *Blueprint) GetId() int64 {
+	return b.id
+}
+func (b *Blueprint) SetId(id int64) {
+	b.id = id
+}
+
+func NewBlueprint(name string) *Blueprint {
+	class := &Blueprint{
+		id:           -1,
+		Name:         name,
+		Kind:         BlueprintNone,
+		NormalMember: make(map[string][]Value),
+		StaticMember: make(map[string][]Value),
+		ConstValue:   make(map[string][]Value),
+
+		NormalMethod: make(map[string]*Function),
+		StaticMethod: make(map[string]*Function),
+		MagicMethod:  utils.NewSafeMapWithKey[BlueprintMagicMethodKind, Value](),
+
+		LazyBuilder: NewLazyBuilder("Blueprint:" + name),
+	}
+	return class
+}
+
+// ======================= class blueprint=======================
+
+// HasCircularDependency reports whether adding parent as a parent of child would create
+// a cycle. Duplicate adds (child already extends parent) are not cycles.
+func HasCircularDependency(child, parent *Blueprint) bool {
+	if child == nil || parent == nil {
+		return false
+	}
+	if child == parent {
+		return true
+	}
+	// A cycle appears only when the proposed parent already inherits from child.
+	visited := make(map[*Blueprint]bool)
+	return parent.inheritsFromWithVisited(child, visited, 0)
+}
+
+// inheritsFromWithVisited 递归检查当前蓝图是否继承自目标蓝图，
+// 并使用 visited 集合避免重复访问，同时进行深度控制。
+func (c *Blueprint) inheritsFromWithVisited(target *Blueprint, visited map[*Blueprint]bool, currentDepth int) bool {
+	// 深度控制：如果超过最大允许深度，则认为无法找到或存在过深的继承链，直接返回 false
+	if currentDepth > MaxInheritanceDepth {
+		// 可以在这里选择记录一个警告，表示继承链过深
+		log.Warnf("Inheritance chain for blueprint '%s' exceeded max depth of %d. Potential issue or too deep hierarchy.", c.Name, MaxInheritanceDepth)
+		return false
+	}
+
+	// 如果当前蓝图已经访问过，直接返回 false，避免无限递归和重复计算
+	if visited[c] {
+		return false
+	}
+	visited[c] = true // 标记当前蓝图为已访问
+
+	// 如果当前蓝图就是目标蓝图，说明存在继承关系
+	if c == target {
+		return true
+	}
+
+	// 遍历父蓝图，深度递增
+	for _, parent := range c.ParentBlueprints {
+		if parent.inheritsFromWithVisited(target, visited, currentDepth+1) {
+			return true
+		}
+	}
+
+	// 所有路径都探索完毕，没有找到目标蓝图
+	return false
+}
+
+func (c *Blueprint) AddParentBlueprint(parent *Blueprint) {
+	c.addParentBlueprintEx(parent, BlueprintRelationParents)
+}
+
+func (c *Blueprint) AddInterfaceBlueprint(b *Blueprint) {
+	c.addParentBlueprintEx(b, BlueprintRelationInterface)
+}
+
+// AddParentBlueprintRelationOnly records inheritance without copying/linking
+// name-only method slots. Frontends with signature-aware overload resolution
+// use this to avoid treating unrelated overloads as virtual overrides.
+func (c *Blueprint) AddParentBlueprintRelationOnly(parent *Blueprint) {
+	c.addBlueprintRelationOnly(parent, BlueprintRelationParents)
+}
+
+// AddInterfaceBlueprintRelationOnly is the interface counterpart of
+// AddParentBlueprintRelationOnly.
+func (c *Blueprint) AddInterfaceBlueprintRelationOnly(parent *Blueprint) {
+	c.addBlueprintRelationOnly(parent, BlueprintRelationInterface)
+}
+
+func (c *Blueprint) addBlueprintRelationOnly(parent *Blueprint, relation BlueprintRelationKind) bool {
+	if parent == nil || c == nil {
+		return false
+	}
+
+	switch relation {
+	case BlueprintRelationParents:
+		for _, existing := range c.ParentBlueprints {
+			if existing == parent {
+				return false
+			}
+		}
+	case BlueprintRelationInterface:
+		for _, existing := range c.InterfaceBlueprints {
+			if existing == parent {
+				return false
+			}
+		}
+	}
+	if c == parent || c.Name == parent.Name {
+		log.Debugf("skip self blueprint relation: blueprint name=%v relation=%v", c.Name, relation)
+		return false
+	}
+
+	// 使用新的循环依赖检查函数
+	if HasCircularDependency(c, parent) {
+		log.Errorf("BUG!: add parent blueprint error: loop. blueprint name: %v, parent name: %v", c.Name, parent.Name)
+		return false
+	}
+
+	return c.setBlueprintRelation(parent, relation)
+}
+
+func (c *Blueprint) addParentBlueprintEx(parent *Blueprint, relation BlueprintRelationKind) {
+	if !c.addBlueprintRelationOnly(parent, relation) {
+		return
+	}
+
+	for name, f := range parent.NormalMethod {
+		c.RegisterNormalMethod(name, f, false)
+	}
+	for name, f := range parent.StaticMethod {
+		c.RegisterStaticMethod(name, f, false)
+	}
+	if parent.MagicMethod != nil {
+		parent.MagicMethod.ForEach(func(name BlueprintMagicMethodKind, f Value) bool {
+			// RegisterMagicMethod intentionally keeps an existing placeholder in the
+			// map while moving the effective implementation into the dedicated slot.
+			// Inherit that effective implementation so a grandchild does not fall back
+			// to its parent's stale Undefined placeholder.
+			inherited := f
+			switch name {
+			case Constructor:
+				if !utils.IsNil(parent.Constructor) {
+					inherited = parent.Constructor
+				}
+			case Destructor:
+				if !utils.IsNil(parent.Destructor) {
+					inherited = parent.Destructor
+				}
+			}
+			// Keep the historical generic-Blueprint contract: inherited magic
+			// methods become the child's effective constructor/destructor, while
+			// RegisterMagicMethod links them to any child-local map entry. Several
+			// weak-language frontends rely on that conservative call-side-effect
+			// model. Signature-aware frontends can use relation-only inheritance.
+			c.RegisterMagicMethod(name, inherited)
+			return true
+		})
+	}
+	for name, values := range parent.NormalMember {
+		if len(c.NormalMember[name]) > 0 {
+			continue
+		}
+		for _, value := range values {
+			c.RegisterNormalMember(name, value, false)
+		}
+	}
+	for name, values := range parent.StaticMember {
+		if len(c.StaticMember[name]) > 0 {
+			continue
+		}
+		for _, value := range values {
+			c.RegisterStaticMember(name, value, false)
+		}
+	}
+	for name, values := range parent.ConstValue {
+		if len(c.ConstValue[name]) > 0 {
+			continue
+		}
+		for _, value := range values {
+			c.RegisterConstMember(name, value, false)
+		}
+	}
+}
+
+func (c *Blueprint) GetInterfaceBlueprint() []*Blueprint {
+	if c == nil {
+		return nil
+	}
+	return c.InterfaceBlueprints
+}
+
+func (c *Blueprint) GetParentBlueprint() []*Blueprint {
+	if c == nil {
+		return nil
+	}
+	return c.ParentBlueprints
+}
+
+// GetSuperBlueprint only get the first parent blueprint, using for single inheritance
+func (c *Blueprint) GetSuperBlueprint() *Blueprint {
+	if c == nil {
+		return nil
+	}
+	if len(c.ParentBlueprints) > 0 {
+		return c.ParentBlueprints[0]
+	}
+	return nil
+}
+
+func (c *Blueprint) GetAllParentsBlueprint() []*Blueprint {
+	if c == nil {
+		return nil
+	}
+	// 层序遍历
+	visited := make(map[*Blueprint]bool)
+	var allParents []*Blueprint
+	queue := c.GetParentBlueprint()
+
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		if parent == nil || visited[parent] {
+			continue
+		}
+		if visited[parent] {
+			continue
+		}
+
+		visited[parent] = true
+		allParents = append(allParents, parent)
+		queue = append(queue, parent.GetParentBlueprint()...)
+	}
+
+	return allParents
+}
+
+func (c *Blueprint) GetAllInterfaceBlueprints() []*Blueprint {
+	if c == nil {
+		return nil
+	}
+	// 层序遍历
+	visited := make(map[*Blueprint]bool)
+	var allParents []*Blueprint
+	queue := c.GetInterfaceBlueprint()
+
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		if parent == nil || visited[parent] {
+			continue
+		}
+		if visited[parent] {
+			continue
+		}
+
+		visited[parent] = true
+		allParents = append(allParents, parent)
+		queue = append(queue, parent.GetInterfaceBlueprint()...)
+	}
+
+	return allParents
+}
+
+func (c *Blueprint) GetRootParentBlueprints() []*Blueprint {
+	if c == nil {
+		return nil
+	}
+
+	var roots []*Blueprint
+	visited := make(map[*Blueprint]bool)
+	var dfs func(*Blueprint)
+
+	dfs = func(node *Blueprint) {
+		if node == nil || visited[node] {
+			return
+		}
+		visited[node] = true
+
+		parents := node.GetParentBlueprint()
+		if len(parents) == 0 {
+			roots = append(roots, node)
+			return
+		}
+
+		for _, parent := range parents {
+			dfs(parent)
+		}
+	}
+
+	dfs(c)
+	return roots
+}
+
+func (c *Blueprint) GetRootInterfaceBlueprint() []*Blueprint {
+	if c == nil {
+		return nil
+	}
+
+	var roots []*Blueprint
+	visited := make(map[*Blueprint]bool)
+	var dfs func(*Blueprint)
+
+	dfs = func(node *Blueprint) {
+		if node == nil || visited[node] {
+			return
+		}
+		visited[node] = true
+
+		parents := node.GetInterfaceBlueprint()
+		if len(parents) == 0 {
+			roots = append(roots, node)
+			return
+		}
+
+		for _, parent := range parents {
+			dfs(parent)
+		}
+	}
+
+	dfs(c)
+	return roots
+}
+
+func (c *Blueprint) CheckExtendedBy(parentBlueprint *Blueprint) bool {
+	for _, blueprint := range c.ParentBlueprints {
+		if blueprint == parentBlueprint {
+			return true
+		}
+		return blueprint.CheckExtendedBy(parentBlueprint)
+	}
+	return false
+}
+
+func (c *Blueprint) getFieldWithParent(get func(bluePrint *Blueprint) bool, recursiveLevel ...int) bool {
+	currentRecursiveLevel := 0
+	if recursiveLevel != nil {
+		currentRecursiveLevel = recursiveLevel[0]
+	}
+	if currentRecursiveLevel > MaxInheritanceDepth {
+		log.Error("failed to get field from parents, inherit chain too long")
+		return false
+	}
+	// if current class can get this field, just return true
+	if ok := get(c); ok {
+		return true
+	} else {
+		// if current class can't get this field, then check the parent class
+		for _, class := range c.ParentBlueprints {
+			// if parent class can get this field, just return true
+			if ex := class.getFieldWithParent(get, currentRecursiveLevel); ex {
+				return true
+			}
+		}
+	}
+	// not found this field
+	return false
+}
+
+// storeField store static in global container
+func (c *Blueprint) storeField(name string, val Value, _type BlueprintFieldKind) {
+	if utils.IsNil(c._container) || utils.IsNil(c._container.GetFunc()) {
+		return
+	}
+	createVariable := func(builder *FunctionBuilder, variable *Variable) {
+		builder.AssignVariable(variable, val)
+	}
+
+	container := c._container
+	fn := container.GetFunc()
+	unlock := fn.lockEmit()
+	defer unlock()
+	builder := fn.builder
+	createVariable(builder, builder.CreateMemberCallVariable(c._container, builder.EmitConstInstPlaceholder(name)))
+}
+
+// lockEmit serializes emits on this function's builder. The goroutine that
+// already holds it reenters; another goroutine waits. Unlock is the returned
+// function, and only the outermost call releases the mutex.
+func (f *Function) lockEmit() func() {
+	if f == nil {
+		return func() {}
+	}
+	gid := currentGoroutineID()
+	if gid != 0 && f.emitOwner.Load() == gid {
+		f.emitDepth++
+		return func() { f.emitDepth-- }
+	}
+	f.emitMu.Lock()
+	f.emitOwner.Store(gid)
+	f.emitDepth = 1
+	return func() {
+		f.emitDepth--
+		if f.emitDepth == 0 {
+			f.emitOwner.Store(0)
+			f.emitMu.Unlock()
+		}
+	}
+}
+
+func (b *Blueprint) InitializeWithContainer(con Value) error {
+	if b._container != nil {
+		return utils.Errorf("the container is already initialized id:(%v)", b._container.GetId())
+	}
+	b._container = con
+	return nil
+}
+
+func (b *Blueprint) Container() Value {
+	return b._container
+}
+
+func (c *Blueprint) SetKind(kind BlueprintKind) {
+	if c == nil {
+		return
+	}
+	c.Kind = kind
+}

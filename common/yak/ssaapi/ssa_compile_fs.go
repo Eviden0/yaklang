@@ -1,0 +1,1060 @@
+package ssaapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/diagnostics"
+	"github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssareducer"
+)
+
+// defaultFlushCompileUnitThreshold is the default resident instruction
+// count that triggers an immediate FlushCompileUnit mid-batch (mechanism A).
+// Tuned from Hadoop scan data: at 100K, per-batch resident stays bounded
+// at ~70-170K on Hadoop (12,581 Java files).
+const defaultFlushCompileUnitThreshold = 100000
+
+// flushCompileUnitThreshold returns the configured threshold for mid-batch
+// flush. Reads YAK_SSA_FLUSH_COMPILE_UNIT_THRESHOLD; non-positive or
+// unparseable values fall back to defaultFlushCompileUnitThreshold.
+// This is a function (not a package var) to keep tests deterministic
+// and avoid global mutable state pollution.
+func flushCompileUnitThreshold() int {
+	if raw := os.Getenv("YAK_SSA_FLUSH_COMPILE_UNIT_THRESHOLD"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			return v
+		}
+	}
+	return defaultFlushCompileUnitThreshold
+}
+
+// emitCompileScale publishes an early project-size signal after filesystem scan
+// so Legion/Yakit can show compile scale before AST work starts. Line counts are
+// not available yet; files/bytes come from ScanProjectFiles.
+func emitCompileScale(processCallback func(float64, string, ...any), process float64, scanResult *ScanResult) {
+	if processCallback == nil || scanResult == nil {
+		return
+	}
+	files := scanResult.HandlerTotal
+	if scanResult.PreHandlerTotal > files {
+		files = scanResult.PreHandlerTotal
+	}
+	payload := fmt.Sprintf(
+		`ssa-compile-scale:{"total_files":%d,"handler_files":%d,"prehandler_files":%d,"total_bytes":%d}`,
+		files,
+		scanResult.HandlerTotal,
+		scanResult.PreHandlerTotal,
+		scanResult.HandlerBytes,
+	)
+	processCallback(process, payload)
+}
+
+// deferredBuildProcessFraction maps deferred-build progress into the legacy
+// [0.40, 0.88) band. Unit-mode compile runs many batches; each batch must only
+// own its slice of that band. Mapping every batch onto the full 0.40→0.88 range
+// made the first batch report ~87% within milliseconds while most IR work was
+// still ahead (Legion monitor showed a false compile jump).
+func deferredBuildProcessFraction(batchIndex, batchCount, index, total int) float64 {
+	if batchCount <= 0 {
+		batchCount = 1
+	}
+	if batchIndex < 0 {
+		batchIndex = 0
+	}
+	if batchIndex >= batchCount {
+		batchIndex = batchCount - 1
+	}
+	const (
+		bandStart = 0.40
+		bandEnd   = 0.88
+	)
+	bandSpan := bandEnd - bandStart
+	batchSpan := bandSpan / float64(batchCount)
+	batchBase := bandStart + float64(batchIndex)*batchSpan
+	if total <= 0 {
+		return batchBase + batchSpan
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index > total {
+		index = total
+	}
+	process := batchBase + (float64(index)/float64(total))*batchSpan
+	if process > bandEnd {
+		return bandEnd
+	}
+	if process < bandStart {
+		return bandStart
+	}
+	return process
+}
+
+type SaveFolder struct {
+	name string
+	path []string
+}
+
+func buildFileContent(
+	prog *ssa.Program,
+	builder *ssa.FunctionBuilder,
+	fileContent *ssareducer.FileContent,
+	ast ssa.FrontAST,
+	_ bool,
+	_ *diagnostics.Recorder,
+) {
+	path := fileContent.Path
+	fileBuildStart := time.Now()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("parse [%s] error %v  ", path, r)
+			utils.PrintCurrentGoroutineRuntimeStack()
+		}
+		if d := time.Since(fileBuildStart); d > 100*time.Millisecond {
+			log.Debugf("[file build] %s cost %v", path, d)
+		}
+	}()
+
+	if err := prog.Build(ast, fileContent.Editor, builder); err != nil {
+		log.Errorf("parse %#v failed: %v", path, err)
+	} else {
+		// Drop duplicate *MemEditor ref from the slice; IR still holds editors via memedit.Range where needed.
+		fileContent.Editor = nil
+	}
+}
+
+func collectCompileTargets(
+	prog *ssa.Program,
+	fileContents []*ssareducer.FileContent,
+	handlerFileSet map[string]struct{},
+) []*ssareducer.FileContent {
+	targets := make([]*ssareducer.FileContent, 0, len(handlerFileSet))
+	for _, fileContent := range fileContents {
+		if fileContent == nil {
+			continue
+		}
+		if fileContent.Status == ssareducer.FileStatusFsError {
+			log.Errorf("skip file: %s with fs error: %v", fileContent.Path, fileContent.Err)
+			prog.ProcessInfof("skip  file: %s with fs error: %v", fileContent.Path, fileContent.Err)
+			continue
+		}
+
+		if _, needsCompile := handlerFileSet[fileContent.Path]; !needsCompile {
+			if fileContent.Editor != nil {
+				prog.PushEditor(fileContent.Editor)
+				prog.PopEditor(true)
+			}
+			continue
+		}
+
+		if fileContent.Editor == nil {
+			log.Errorf("skip file: %s due to nil editor", fileContent.Path)
+			prog.ProcessInfof("skip  file: %s due to nil editor", fileContent.Path)
+			continue
+		}
+		if prog.ShouldVisit(fileContent.Editor.GetUrl()) {
+			log.Debugf("parse file %s done skip in main build", fileContent.Path)
+			continue
+		}
+
+		targets = append(targets, fileContent)
+	}
+	return targets
+}
+
+// applyIncrementalMetadata 在产物落库前把 config 携带的增量元数据写入 ssa.Program：
+// base 关联、FileHashMap；增量编译但尚无变更记录时补一个空 FileHashMap——
+// 落库层（UpdateToDatabaseWithWG）以 FileHashMap != nil 为打 IsOverlay 标的条件。
+// 两处保存路径（parseProjectWithFSUnits 的 f3 与 legacy 的 f4）共用，勿内联。
+func (c *Config) applyIncrementalMetadata(prog *ssa.Program) {
+	if prog == nil {
+		return
+	}
+	if baseProgramName := c.GetBaseProgramName(); baseProgramName != "" {
+		prog.BaseProgramName = baseProgramName
+	}
+	if len(c.fileHashMap) > 0 {
+		prog.FileHashMap = c.fileHashMap
+	}
+	if c.compileMode() != compileModeFull && prog.FileHashMap == nil {
+		prog.FileHashMap = make(map[string]int)
+	}
+}
+
+func (c *Config) parseProjectWithFSUnits(
+	filesystem filesys_interface.FileSystem,
+	processCallback func(float64, string, ...any),
+) (result *Program, err error) {
+	var calculateTime, preHandlerTime, parseTime, finishTime, saveTime time.Duration
+	overallStart := time.Now()
+	defer func() {
+		log.Debugf("calculate time: %v", calculateTime)
+		log.Debugf("pre-handler time: %v", preHandlerTime)
+		log.Debugf("parse time (unit build): %v", parseTime)
+		log.Debugf("finish time (f4 Finish+metadata): %v", finishTime)
+		log.Debugf("save time: %v", saveTime)
+		log.Debugf("ssa.compile.phase_segments: %v", calculateTime+preHandlerTime+parseTime+finishTime+saveTime)
+		log.Debugf("ssa.compile.wall: %v", time.Since(overallStart))
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			err = utils.JoinErrors(err, utils.Errorf("parse project panic: %v", r))
+			log.Errorf("parse project error: %s", r)
+			utils.PrintCurrentGoroutineRuntimeStack()
+		}
+	}()
+
+	var wg sync.WaitGroup
+	compilePhase := "f0_scan"
+	programName := c.GetProgramName()
+	programPath := c.programPath
+	var processBits atomic.Uint64
+	var progressMu sync.Mutex
+	var lastReportedProcess float64
+	loadProcess := func() float64 { return math.Float64frombits(processBits.Load()) }
+	storeProcess := func(p float64) {
+		for {
+			old := processBits.Load()
+			if p <= math.Float64frombits(old) || processBits.CompareAndSwap(old, math.Float64bits(p)) {
+				return
+			}
+		}
+	}
+	reportProcess := func(p float64, msg string, args ...any) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if p < lastReportedProcess {
+			p = lastReportedProcess
+		} else {
+			lastReportedProcess = p
+		}
+		processCallback(p, msg, args...)
+	}
+	start := time.Now()
+
+	log.Debugf("ssa.compile.phase enter %s", compilePhase)
+	processCallback(0.0, fmt.Sprintf("[%s] parse project in fs: %v, path: %v", compilePhase, filesystem, c.GetCodeSource().ToJSONString()))
+	processCallback(0.0, fmt.Sprintf("[%s] calculate total size of project", compilePhase))
+
+	folder2Save := make([][]string, 0)
+	if programName != "" {
+		folder2Save = append(folder2Save, []string{"/", programName})
+	}
+
+	sourceFilesystem := filesystem
+	filesystem = c.swapLanguageFs(filesystem)
+	scanResult, err := ScanProjectFiles(ScanConfig{
+		ProgramName:     programName,
+		ProgramPath:     programPath,
+		FileSystem:      filesystem,
+		ExcludeFunc:     c.excludeMatcher,
+		CheckLanguage:   c.checkLanguage,
+		CheckPreHandler: c.checkLanguagePreHandler,
+		Context:         c.ctx,
+	})
+	if err != nil {
+		return nil, err
+	}
+	folder2Save = append(folder2Save, scanResult.Folders...)
+	handlerTotal := scanResult.HandlerTotal
+	preHandlerFileSet := scanResult.PreHandlerFileSet
+	handlerFiles := scanResult.HandlerFiles
+	handlerFileSet := make(map[string]struct{}, len(handlerFiles))
+	for _, handlerFile := range handlerFiles {
+		handlerFileSet[handlerFile] = struct{}{}
+	}
+	preHandlerTotal := scanResult.PreHandlerTotal
+	preHandlerFiles := scanResult.PreHandlerFiles
+	if preHandlerTotal < handlerTotal {
+		preHandlerTotal = handlerTotal
+		preHandlerFiles = handlerFiles
+	}
+	calculateTime = time.Since(start)
+	c.Config.SetCompileProjectBytes(scanResult.HandlerBytes)
+	emitCompileScale(processCallback, loadProcess(), scanResult)
+	if restoreGC := c.applyCompileProjectGCPercent(); restoreGC != nil {
+		defer restoreGC()
+	}
+
+	plan := buildCompileUnitPlan(c.LanguageBuilder, c.GetLanguage(), filesystem, preHandlerFiles)
+	if len(plan.Order) == 0 {
+		unit := &CompileUnit{Key: "unit:all", Path: ".", Files: append([]string(nil), preHandlerFiles...), Language: c.GetLanguage()}
+		plan = &UnitPlan{Units: map[string]*CompileUnit{unit.Key: unit}, Order: [][]*CompileUnit{{unit}}}
+	}
+	batchMinFiles, batchMinBytes := compileUnitBatchThresholds()
+	batches := buildCompileUnitExecutionBatches(plan.Order, batchMinFiles, batchMinBytes)
+	if err := c.prepareStructScan(plan); err != nil {
+		return nil, err
+	}
+	// Struct queries carry their own unit boundary. Keep the bounded compile
+	// batches instead of forcing one parser/flush cycle for every tiny SCC.
+	// Step mode (compile-unit batching) is the DEFAULT for any project size.
+	// YAK_SSA_COMPILE_UNIT_LEGACY opts back into the monolithic legacy/compat
+	// compile path (no batching).
+	//
+	// Explicit batch flushes preserve cross-unit boundary instructions. Keep
+	// automatic compile-unit spill disabled while a batch is still building.
+	writerCacheRequested := true
+	writerCacheEnabled := true
+	if envFlagEnabled(compileUnitLegacyEnv) {
+		c.Config.SetCompileUnitSplit(false)
+		payload := buildCompileUnitPlanLog(
+			programName,
+			fmt.Sprintf("%v", c.GetLanguage()),
+			plan,
+			batches,
+			batchMinFiles,
+			batchMinBytes,
+			"legacy-opt-out",
+			"resident-fast-path",
+			writerCacheRequested,
+			writerCacheEnabled,
+		)
+		if target, err := writeCompileUnitPlanLogFile(os.Getenv("YAK_SSA_COMPILE_UNIT_LOG_DIR"), payload); err != nil {
+			processCallback(0, "[f0_scan] compile unit legacy opt-out plan write failed: %v", err)
+		} else if target != "" {
+			processCallback(0, "[f0_scan] compile unit legacy opt-out wrote plan: %s", target)
+		}
+		processCallback(0, "[f0_scan] compile unit graph built units=%d edges=%d scc=%d batches=%d; legacy compile mode requested via %s",
+			len(plan.Units), len(plan.Edges), len(plan.Order), len(batches), compileUnitLegacyEnv)
+		return c.parseProjectWithFSLegacy(sourceFilesystem, processCallback)
+	}
+	c.Config.SetCompileUnitSplit(false)
+
+	prog, builder, err := c.init(filesystem, handlerTotal)
+	if err != nil {
+		return nil, err
+	}
+	if language, ok := c.LanguageBuilder.(ssa.ConcurrentUnitBuilder); ok {
+		prog.SetConcurrentUnitBuild(language.SupportsConcurrentUnitBuild())
+	}
+	if language, ok := c.LanguageBuilder.(ssa.MethodLookupBuilder); ok {
+		prog.SetDeferMethodBuildOnLookup(language.DeferMethodBuildOnLookup())
+	}
+	prog.ProcessInfof = func(s string, v ...any) {
+		msg := s
+		if len(v) > 0 {
+			msg = fmt.Sprintf(s, v...)
+		}
+		if compilePhase != "" {
+			msg = fmt.Sprintf("[%s] %s", compilePhase, msg)
+		}
+		reportProcess(loadProcess(), msg)
+	}
+	if stopAdaptiveGC := startSSACompileAdaptiveGC(prog.ProcessInfof); stopAdaptiveGC != nil {
+		defer stopAdaptiveGC()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for _, folder := range folder2Save {
+			prog.SaveFolder(folder)
+		}
+	}()
+
+	if c.isStop() {
+		return nil, ErrContextCancel
+	}
+	if (handlerTotal + preHandlerTotal) == 0 {
+		return nil, ErrNoFoundCompiledFile
+	}
+	prog.ProcessInfof("calculate total size of project finish preHandler(len:%d) build(len:%d)", preHandlerTotal, handlerTotal)
+	defer c.LanguageBuilder.Clearup()
+
+	prog.CompileUnits = flattenCompileUnits(plan)
+	prog.ProcessInfof("compile unit graph built units=%d edges=%d scc=%d", len(plan.Units), len(plan.Edges), len(plan.Order))
+	structScanOn := c.structScan != nil && c.structScan.enabled()
+	if structScanOn {
+		c.structScan.prepareSave(prog)
+	}
+	// Struct opcode queries enumerate live instructions. TTL/capacity eviction
+	// must not remove the completed batch before its semantic scan sees it.
+	holdSCCIR := envFlagEnabled(compileUnitHoldSCCIREnv) || structScanOn
+	spillMode := "auto"
+	if holdSCCIR {
+		spillMode = "held"
+	}
+	cacheMode := "none"
+	if prog.Cache != nil {
+		cacheMode = prog.Cache.InstructionCacheMode()
+	}
+	prog.ProcessInfof("compile unit execution batches built batches=%d min_files=%d min_bytes=%d writer_requested=%v writer_enabled=%v cache=%s concurrency=%d memory_limit=%d",
+		len(batches), batchMinFiles, batchMinBytes, writerCacheRequested, writerCacheEnabled, cacheMode, c.GetCompileConcurrency(), c.GetCompileMemoryLimit())
+	logCompileUnitPlan(prog, fmt.Sprintf("%v", c.GetLanguage()), plan, batches, batchMinFiles, batchMinBytes, spillMode, cacheMode, writerCacheRequested, writerCacheEnabled)
+
+	var astErr error
+	astParseErrLogged := 0
+	astParseErrSuppressed := false
+	const maxAstParseErrLogs = 20
+	preHandlerBuildsFiles := c.LanguageBuilder != nil && c.LanguageBuilder.UsesDeferredFileBuild()
+	var preHandlerNum atomic.Int32
+	preHandlerProcess := func() {
+		n := preHandlerNum.Add(1)
+		p := (float64(n) / float64(preHandlerTotal)) * 0.4
+		if p > 0.4 {
+			p = 0.4
+		}
+		storeProcess(p)
+		reportProcess(p, fmt.Sprintf("[%s] pre-handler progress(%d/%d)", compilePhase, n, preHandlerTotal))
+	}
+
+	compilePhase = "f1_units"
+	log.Debugf("ssa.compile.phase enter %s", compilePhase)
+	unitStart := time.Now()
+	prog.SetPreHandler(true)
+	prog.ProcessInfof("unit compile start scc=%d batches=%d", len(plan.Order), len(batches))
+	var structProgAPI *Program
+	for batchIndex, batch := range batches {
+		if c.isStop() {
+			return nil, ErrContextCancel
+		}
+		var batchFiles []string
+		fileUnits := make(map[string]string, batch.files)
+		for _, unit := range batch.units {
+			if unit == nil {
+				continue
+			}
+			// Unit order is the dependency batch. File completion order inside
+			// the batch is not part of that contract: a pre-handler that only
+			// works when its imports were visited first is a frontend bug.
+			batchFiles = append(batchFiles, unit.Files...)
+			for _, path := range unit.Files {
+				fileUnits[path] = unit.Key
+			}
+		}
+		// One parser pool for the entire batch lets small packages use the
+		// available workers too, without multiplying the AST window by the
+		// number of units. Files are delivered as their AST is ready.
+		prefetchedFiles := c.GetFileHandler(filesystem, batchFiles, preHandlerFileSet)
+		prog.SetPreHandler(true)
+		compilePhase = "f1_units"
+		if holdSCCIR && prog.Cache != nil {
+			prog.Cache.DisableInstructionSpill()
+		}
+		unitKeys := batch.unitKeys
+		if compileUnitLogEnabled() {
+			prog.ProcessInfof("compile unit batch(%d/%d) scc=%d-%d units=%d files=%d bytes=%d spill=%s keys=%s",
+				batchIndex+1, len(batches), batch.startSCC+1, batch.endSCC+1, len(batch.units), batch.files, batch.bytes, spillMode, strings.Join(unitKeys, ","))
+		} else {
+			prog.ProcessInfof("compile unit batch(%d/%d) scc=%d-%d units=%d files=%d bytes=%d spill=%s",
+				batchIndex+1, len(batches), batch.startSCC+1, batch.endSCC+1, len(batch.units), batch.files, batch.bytes, spillMode)
+		}
+		prehandleWorkers, buildWorkers, drainUnscheduled := unitWorkerCounts(c, prog)
+		if prehandleWorkers > 1 {
+			for _, key := range unitKeys {
+				prog.EnsureLibraryForCompileUnit(key)
+			}
+		}
+		prehandleStart := time.Now()
+		prehandle := &prehandleBatchEnv{
+			c:                     c,
+			prog:                  prog,
+			builder:               builder,
+			filesystem:            filesystem,
+			fileUnits:             fileUnits,
+			preHandlerFileSet:     preHandlerFileSet,
+			handlerFileSet:        handlerFileSet,
+			preHandlerBuildsFiles: preHandlerBuildsFiles,
+			preHandlerProcess:     preHandlerProcess,
+			concurrency:           prehandleWorkers,
+			astErr:                astErr,
+			astParseErrLogged:     astParseErrLogged,
+			astParseErrSuppressed: astParseErrSuppressed,
+			maxAstParseErrLogs:    maxAstParseErrLogs,
+		}
+		unitCanceled := prehandle.consume(prefetchedFiles)
+		astErr = prehandle.astErr
+		astParseErrLogged = prehandle.astParseErrLogged
+		astParseErrSuppressed = prehandle.astParseErrSuppressed
+		log.Infof("compile unit prehandler batch=%d units=%d files=%d concurrency=%d cost=%v",
+			batchIndex+1, len(unitKeys), len(batchFiles), prehandle.concurrency, time.Since(prehandleStart))
+		if unitCanceled {
+			prog.EndCompileUnit()
+			return nil, ErrContextCancel
+		}
+		if c.isStop() {
+			return nil, ErrContextCancel
+		}
+		if language := c.LanguageBuilder; language != nil {
+			language.AfterPreHandlerProject(builder)
+			language.Clearup()
+		}
+		// Binding then hierarchy run after every skeleton has released its
+		// builder and before prehandler mode is cleared. Frontends register
+		// those phases by kind. Other deferred work stays on the later pass.
+		for _, kind := range []ssa.DeferredBuildKind{ssa.DeferredBuildKindBinding, ssa.DeferredBuildKindHierarchy} {
+			if !prog.RunDeferredBuildsForUnitsOfKind(unitKeys, kind, nil, nil) {
+				return nil, ErrContextCancel
+			}
+		}
+		prog.SetPreHandler(false)
+		if holdSCCIR && !structScanOn && prog.Cache != nil {
+			prog.Cache.EnableInstructionSpill()
+		}
+		compilePhase = "f3_unit_build"
+		unitBuildStart := time.Now()
+		flushThreshold := flushCompileUnitThreshold()
+		isIncremental := c.compileMode() != compileModeFull
+		flushedUnits := make(map[string]bool)
+		if !prog.RunDeferredBuildsForUnitsWithUnitCallback(unitKeys,
+			func(index int, total int) bool {
+				// Match legacy deferred band: pre-handler ends ~0.40, builds fill to ~0.88.
+				// Spread that band across all batches so batch 1/N cannot claim ~87%.
+				p := deferredBuildProcessFraction(batchIndex, len(batches), index, total)
+				storeProcess(p)
+				reportProcess(p, fmt.Sprintf("[%s] deferred build progress(%d/%d) batch(%d/%d)", compilePhase, index, total, batchIndex+1, len(batches)))
+				return !c.isStop()
+			},
+			func(unitKey string) bool {
+				if structScanOn {
+					return !c.isStop()
+				}
+				if !isIncremental && prog.Cache != nil && !flushedUnits[unitKey] {
+					if prog.Cache.CountInstruction() > flushThreshold {
+						prog.Cache.FlushCompileUnit(unitKey)
+						flushedUnits[unitKey] = true
+					}
+				}
+				return !c.isStop()
+			},
+		) {
+			return nil, ErrContextCancel
+		}
+		// Unit-end and batch-boundary instruction flushes enqueue ordinary
+		// instructions for asynchronous persistence. Boundary instructions stay
+		// resident for cross-unit resolution, while the completion callback logs
+		// the real post-eviction state. Incremental compile still skips both
+		// paths to preserve its overlay semantics.
+		if c.isStop() {
+			return nil, ErrContextCancel
+		}
+		// Second phase of this batch: expand method-body LazyBuilders that
+		// belong to these units. The same DAG scheduler serves every frontend;
+		// buildWorkers 1 is its serial mode, not a second implementation.
+		if c.isStop() {
+			return nil, ErrContextCancel
+		}
+		// A single-batch project has no future declarations to add to the
+		// application entry functions. Finish their lazy top-level work before
+		// the struct scan observes resident instructions.
+		if structScanOn && len(batches) == 1 {
+			prog.Finish()
+		}
+		if structScanOn && structProgAPI == nil {
+			structProgAPI = NewProgram(prog, c)
+		}
+		cleanup := compileBatchCleanup{
+			config: c, program: prog, apiProgram: structProgAPI,
+			batch: batch, unitKeys: unitKeys, structScan: structScanOn,
+			incremental: isIncremental, batchIndex: batchIndex,
+			batchCount: len(batches), buildStarted: unitBuildStart,
+			loadProgress: loadProcess, reportProgress: reportProcess,
+		}
+		// The scan and cache mutate or traverse shared IR. Finish them before
+		// starting the next batch; compilation parallelism is inside the DAG
+		// scheduler above, not in an unowned cleanup goroutine.
+		buildCost, err := executeCompileUnitBatch(
+			c.GetContext(), prog, plan, batch, buildWorkers, batchIndex, cleanup, drainUnscheduled,
+		)
+		parseTime += buildCost
+		if err != nil {
+			if c.isStop() || errors.Is(err, context.Canceled) {
+				return nil, ErrContextCancel
+			}
+			return nil, err
+		}
+	}
+	preHandlerTime = time.Since(unitStart) - parseTime
+	if astErr != nil && c.GetCompileStrictMode() {
+		return nil, utils.Errorf("pre-handler parse project error: %v", astErr)
+	}
+
+	compilePhase = "f4_finish"
+	log.Debugf("ssa.compile.phase enter %s", compilePhase)
+	finishStart := time.Now()
+	storeProcess(0.88)
+	prog.SetPreHandler(false)
+	if !prog.RunDeferredBuildsWithCallback(func(index int, total int) bool {
+		return !c.isStop()
+	}) {
+		return nil, ErrContextCancel
+	}
+	if c.isStop() {
+		return nil, ErrContextCancel
+	}
+	prog.Finish()
+	c.applyIncrementalMetadata(prog)
+	if prog.DatabaseKind != ssa.ProgramCacheMemory {
+		prog.ProcessInfof("[SSA/persist] program %s saving program metadata (ir_program)", prog.Name)
+		metaStart := time.Now()
+		prog.UpdateToDatabaseWithWG(&wg)
+		since := time.Since(metaStart)
+		log.Infof("program %s save to database cost: %s", prog.Name, since)
+		prog.ProcessInfof("[SSA/persist] program %s program metadata saved, cost %v", prog.Name, since)
+	}
+	if c.structScan != nil && c.structScan.enabled() {
+		c.structScan.WaitSaves()
+	}
+	finishTime = time.Since(finishStart)
+
+	compilePhase = "f5_save_db"
+	log.Debugf("ssa.compile.phase enter %s", compilePhase)
+	saveStart := time.Now()
+	// Finish() may have generated a large deferred-build tail after the last
+	// per-unit flush. Drain it BEFORE SaveToDatabase so f5 starts with only
+	// boundary instructions (Function/BasicBlock) resident instead of ~2.6M
+	// ordinary instructions that would otherwise be marshaled and GC-scanned
+	// during the final flush.
+	if c.compileMode() == compileModeFull &&
+		prog.DatabaseKind != ssa.ProgramCacheMemory && prog.Cache != nil {
+		prog.Cache.FlushCompileUnit("final")
+		prog.Cache.FlushInstructionSaver()
+	}
+	accounting := prog.Cache.GetFlushAccounting()
+	remaining := int(accounting.RemainingDirty)
+	persisted := int(accounting.AlreadyPersisted)
+	total := int(accounting.InstructionsTotal)
+	storeProcess(0.90)
+	// Log memory state before the heaviest save phase
+	{
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		log.Infof("[ssa-compile] f5_save_db enter: program=%s remaining=%d persisted=%d total=%d resident=%d heapAlloc=%.1fMB heapSys=%.1fMB heapObjects=%d numGC=%d",
+			prog.Name, remaining, persisted, total, accounting.Resident,
+			float64(ms.Alloc)/1024/1024, float64(ms.Sys)/1024/1024, ms.HeapObjects, ms.NumGC)
+	}
+	if prog.DatabaseKind != ssa.ProgramCacheMemory {
+		prog.ProcessInfof("[SSA/persist] program %s flushing IR cache (remaining=%d persisted=%d total=%d) to database",
+			prog.Name, remaining, persisted, total)
+	} else {
+		prog.ProcessInfof("[SSA/persist] program %s finishing cache instruction(len:%d) (memory only, not saved)", prog.Name, remaining)
+	}
+	if err := prog.Cache.SaveToDatabase(irSaveProgressCallback(prog, total, persisted, 0.90, 1.0, func(p float64) {
+		storeProcess(p)
+	})); err != nil {
+		return nil, utils.Errorf("persist IR to database failed: %w", err)
+	}
+	saveTime = time.Since(saveStart)
+	if prog.DatabaseKind != ssa.ProgramCacheMemory {
+		prog.ProcessInfof("[SSA/persist] program %s IR cache flush finished, cost %v", prog.Name, saveTime)
+	}
+
+	compilePhase = "f6_wait"
+	wg.Wait()
+
+	p := structProgAPI
+	if p == nil {
+		p = NewProgram(prog, c)
+	}
+	SaveConfig(c, p)
+	SetProgramCache(p)
+	return p, nil
+}
+
+// parseProjectWithFS compiles a whole project from a filesystem.
+//
+// Pipeline: parallel read/ParseAST is inside f1 only (FilesHandler -> channel). One goroutine
+// consumes the channel (PreHandlerProject) and fills fileContents. f3 walks targets and Build
+// sequentially — it does not consume the AST channel. Observability: log=info prints
+// [ssa.compile.summary]; log=debug prints ssa.compile.phase enter f1_pre_handler / f3_main_build / …
+// and ProcessInfof lines are prefixed with the current phase tag.
+func (c *Config) parseProjectWithFS(
+	filesystem filesys_interface.FileSystem,
+	processCallback func(float64, string, ...any),
+) (*Program, error) {
+	if stopCPUProfile := startSSACompileCPUProfile(); stopCPUProfile != nil {
+		defer stopCPUProfile()
+	}
+	return c.parseProjectWithFSUnits(filesystem, processCallback)
+}
+
+func (c *Config) parseProjectWithFSLegacy(
+	filesystem filesys_interface.FileSystem,
+	processCallback func(float64, string, ...any),
+) (result *Program, err error) {
+	var calculateTime, preHandlerTime, parseTime, finishTime, saveTime time.Duration
+	overallStart := time.Now()
+	defer func() {
+		log.Debugf("calculate time: %v", calculateTime)
+		log.Debugf("pre-handler time: %v", preHandlerTime)
+		log.Debugf("parse time (main build f3): %v", parseTime)
+		log.Debugf("finish time (f4 Finish+metadata): %v", finishTime)
+		log.Debugf("save time: %v", saveTime)
+		log.Debugf("ssa.compile.phase_segments: %v", calculateTime+preHandlerTime+parseTime+finishTime+saveTime)
+		log.Debugf("ssa.compile.wall: %v", time.Since(overallStart))
+	}()
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = utils.Errorf("parse project panic: %v", r)
+			log.Errorf("parse project error: %s", r)
+			utils.PrintCurrentGoroutineRuntimeStack()
+		}
+	}()
+
+	wg := sync.WaitGroup{}
+
+	// compilePhase labels UI / callback messages and debug logs so operators can align htop with f1/f3/f5.
+	compilePhase := "f0_scan"
+
+	programName := c.GetProgramName()
+	programPath := c.programPath
+	preHandlerTotal := 0
+	handlerTotal := 0
+	preHandlerFiles := make([]string, 0)
+	handlerFiles := make([]string, 0)
+	preHandlerFileSet := make(map[string]struct{})
+	handlerFileSet := make(map[string]struct{})
+	start := time.Now()
+
+	log.Debugf("ssa.compile.phase enter %s", compilePhase)
+	processCallback(0.0, fmt.Sprintf("[%s] parse project in fs: %v, path: %v", compilePhase, filesystem, c.GetCodeSource().ToJSONString()))
+	processCallback(0.0, fmt.Sprintf("[%s] calculate total size of project", compilePhase))
+
+	folder2Save := make([][]string, 0)
+	if programName != "" {
+		folder2Save = append(folder2Save, []string{"/", programName})
+	}
+
+	filesystem = c.swapLanguageFs(filesystem)
+	// get total size
+	// scan project files
+	scanResult, err := ScanProjectFiles(ScanConfig{
+		ProgramName:     programName,
+		ProgramPath:     programPath,
+		FileSystem:      filesystem,
+		ExcludeFunc:     c.excludeMatcher,
+		CheckLanguage:   c.checkLanguage,
+		CheckPreHandler: c.checkLanguagePreHandler,
+		Context:         c.ctx,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	folder2Save = append(folder2Save, scanResult.Folders...)
+	handlerTotal = scanResult.HandlerTotal
+	handlerFiles = scanResult.HandlerFiles
+	handlerFileSet = make(map[string]struct{}, len(handlerFiles))
+	for _, handlerFile := range handlerFiles {
+		handlerFileSet[handlerFile] = struct{}{}
+	}
+	preHandlerTotal = scanResult.PreHandlerTotal
+	preHandlerFiles = scanResult.PreHandlerFiles
+	preHandlerFileSet = scanResult.PreHandlerFileSet
+	calculateTime = time.Since(start)
+	if err != nil {
+		return nil, err
+	}
+	// Feed the total compile-input bytes into the adaptive IR cache policy.
+	// This is runtime tuning input, not persistent project metadata.
+	c.Config.SetCompileProjectBytes(scanResult.HandlerBytes)
+	emitCompileScale(processCallback, 0, scanResult)
+	if restoreGC := c.applyCompileProjectGCPercent(); restoreGC != nil {
+		defer restoreGC()
+	}
+	c.Config.SetCompileUnitSplit(false)
+
+	prog, builder, err := c.init(filesystem, handlerTotal)
+	if err != nil {
+		return nil, err
+	}
+
+	wg.Add(1)
+	go func() {
+		wg.Done()
+		for _, folder := range folder2Save {
+			_ = folder
+			prog.SaveFolder(folder)
+		}
+	}()
+
+	process := 0.0
+	prog.ProcessInfof = func(s string, v ...any) {
+		msg := s
+		if len(v) > 0 {
+			msg = fmt.Sprintf(s, v...)
+		}
+		if compilePhase != "" {
+			msg = fmt.Sprintf("[%s] %s", compilePhase, msg)
+		}
+		processCallback(process, msg)
+	}
+	if stopAdaptiveGC := startSSACompileAdaptiveGC(prog.ProcessInfof); stopAdaptiveGC != nil {
+		defer stopAdaptiveGC()
+	}
+
+	if c.isStop() {
+		return nil, ErrContextCancel
+	}
+	if (handlerTotal + preHandlerTotal) == 0 {
+		return nil, ErrNoFoundCompiledFile
+	}
+	if preHandlerTotal < handlerTotal {
+		preHandlerTotal = handlerTotal
+		preHandlerFiles = handlerFiles
+	}
+	prog.ProcessInfof("calculate total size of project finish preHandler(len:%d) build(len:%d)", preHandlerTotal, handlerTotal)
+	defer c.LanguageBuilder.Clearup()
+
+	var AstErr error
+	astParseErrLogged := 0
+	astParseErrSuppressed := false
+	const maxAstParseErrLogs = 20
+	// When pre-handler already emits file skeletons and schedules remaining file
+	// work, the shared pipeline must not capture the whole file AST in another
+	// closure.
+	preHandlerBuildsFiles := c.LanguageBuilder != nil && c.LanguageBuilder.UsesDeferredFileBuild()
+	// pre handler  0-40%
+	f1 := func() error {
+		if prog.Cache != nil {
+			prog.Cache.DisableInstructionSpill()
+		}
+		preHandlerNum := 0
+		preHandlerProcess := func() {
+			preHandlerNum++
+			process = 0 + (float64(preHandlerNum)/float64(preHandlerTotal))*0.4
+			if process > 0.4 {
+				process = 0.4
+			}
+			processCallback(process, fmt.Sprintf("[%s] pre-handler progress(%d/%d)", compilePhase, preHandlerNum, preHandlerTotal))
+		}
+		prog.SetPreHandler(true)
+		prog.ProcessInfof("pre-handler parse project in fs: %v, path: %v", filesystem, c.GetCodeSource().ToJSONString())
+		start = time.Now()
+
+		ch := c.GetFileHandler(
+			filesystem, preHandlerFiles, preHandlerFileSet,
+		)
+		for fileContent := range ch {
+			if fileContent == nil {
+				continue
+			}
+			func(fileContent *ssareducer.FileContent) {
+				defer fileContent.Release()
+				if fileContent.Status == ssareducer.FileStatusFsError {
+					log.Errorf("skip file: %s with fs error: %v", fileContent.Path, fileContent.Err)
+					prog.ProcessInfof("skip  file: %s with fs error: %v", fileContent.Path, fileContent.Err)
+					return
+				}
+
+				if fileContent.Status == ssareducer.FileParseASTError {
+					if astParseErrLogged < maxAstParseErrLogs {
+						log.Warnf("parse Ast file: %s error: %s", fileContent.Path, fileContent.Err)
+						astParseErrLogged++
+					} else if !astParseErrSuppressed {
+						astParseErrSuppressed = true
+						log.Warnf("too many AST parse errors; suppressing further per-file logs (limit=%d)", maxAstParseErrLogs)
+					}
+					AstErr = utils.Errorf("parse Ast file: %s error: %s", fileContent.Path, fileContent.Err)
+					// continue
+				}
+
+				editor := prog.CreateEditor(fileContent.Content, fileContent.Path)
+				// editor := prog.CreateEditor([]byte{}, fileContent.Path)
+
+				fileContent.Editor = editor
+				fileContent.Content = nil
+
+				if fileContent.Err != nil {
+					prog.ProcessInfof("file %s parse ast error: %v", fileContent.Path, fileContent.Err)
+					AstErr = utils.JoinErrors(AstErr,
+						utils.Errorf("pre-handler parse file %s error: %v", fileContent.Path, fileContent.Err),
+					)
+				}
+
+				preHandlerProcess() // notify the process
+				// handler
+				if language := c.LanguageBuilder; language != nil {
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								log.Errorf("pre-handler parse [%s] error %v  ", fileContent.Path, r)
+								utils.PrintCurrentGoroutineRuntimeStack()
+							}
+						}()
+						language.InitHandler(builder)
+						err = language.PreHandlerProject(filesystem, fileContent.AST, builder, editor)
+						if err != nil {
+							log.Errorf("pre-handler parse [%s] error %v", fileContent.Path, err)
+						}
+					}()
+				}
+				if preHandlerBuildsFiles {
+					ssa.ReleaseASTRoot(fileContent.AST)
+				}
+				if _, needBuild := preHandlerFileSet[fileContent.Path]; needBuild {
+					_, needsCompile := handlerFileSet[fileContent.Path]
+					switch {
+					case needsCompile && fileContent.AST != nil && !preHandlerBuildsFiles:
+						ast := fileContent.AST
+						path := fileContent.Path
+						prog.RegisterFileBuild(path, editor, builder, func(fileBuilder *ssa.FunctionBuilder) {
+							fileBuildStart := time.Now()
+							defer func() {
+								if d := time.Since(fileBuildStart); d > 100*time.Millisecond {
+									log.Debugf("[file build] %s cost %v", path, d)
+								}
+							}()
+							if err := c.LanguageBuilder.BuildFromAST(ast, fileBuilder); err != nil {
+								log.Errorf("file build [%s] failed: %v", path, err)
+							}
+						})
+					case !needsCompile && fileContent.Editor != nil:
+						rootEditor := fileContent.Editor
+						prog.RegisterDeferredBuild(ssa.DeferredBuildKindHelper, "extra-file:"+rootEditor.GetUrl(), func() {
+							prog.PushEditor(rootEditor)
+							prog.PopEditor(true)
+						})
+					}
+				}
+				// Once skeleton + deferred tasks are registered (pass1), drop the file
+				// AST root reference. For self-registering languages the body subtrees
+				// are detached, so the rest of the parse tree becomes collectable here.
+				fileContent.AST = nil
+			}(fileContent)
+		}
+		preHandlerTime = time.Since(start)
+		if AstErr != nil && c.GetCompileStrictMode() {
+			return utils.Errorf("pre-handler parse project error: %v", AstErr)
+		}
+		if c.isStop() {
+			return ErrContextCancel
+		}
+		return nil
+	}
+
+	f2 := func() error {
+		if language := c.LanguageBuilder; language != nil {
+			language.AfterPreHandlerProject(builder)
+			// Release ANTLR caches early: main build doesn't require the pre-handler
+			// parsing caches, and keeping them can cause huge heap + GC overhead.
+			language.Clearup()
+		}
+		prog.ProcessInfof("pre-handler parse project finish")
+		return nil
+	}
+
+	f3 := func() error {
+		if prog.Cache != nil {
+			prog.Cache.EnableInstructionSpill()
+		}
+		process = 0.4 // 40%
+		prog.ProcessInfof("deferred build start")
+		prog.SetPreHandler(false)
+		start = time.Now()
+		deferredBuildTotal := prog.DeferredBuildCount()
+		completed := prog.RunDeferredBuildsWithCallback(func(index int, total int) bool {
+			if total <= 0 {
+				return !c.isStop()
+			}
+			// Reserve [0.88, 0.90) for program metadata (f4) and [0.90, 1.0] for IR flush (f5).
+			process = 0.4 + (float64(index)/float64(total))*0.48
+			if process > 0.88 {
+				process = 0.88
+			}
+			prog.ProcessInfof("deferred build progress(%d/%d)", index, total)
+			return !c.isStop()
+		})
+		if deferredBuildTotal == 0 {
+			process = 0.88
+		}
+		if !completed {
+			return ErrContextCancel
+		}
+		process = 0.88
+		parseTime = time.Since(start)
+		if c.isStop() {
+			return ErrContextCancel
+		}
+		return nil
+	}
+
+	f4 := func() error {
+		f4Start := time.Now()
+		defer func() { finishTime = time.Since(f4Start) }()
+		process = 0.88
+		prog.Finish()
+		// 在保存到数据库之前，设置增量编译信息（如果存在）
+		c.applyIncrementalMetadata(prog)
+		if prog.DatabaseKind != ssa.ProgramCacheMemory { // save program
+			prog.ProcessInfof("[SSA/persist] program %s saving program metadata (ir_program)", prog.Name)
+			metaStart := time.Now()
+			prog.UpdateToDatabaseWithWG(&wg)
+			since := time.Since(metaStart)
+			log.Infof("program %s save to database cost: %s", prog.Name, since)
+			prog.ProcessInfof("[SSA/persist] program %s program metadata saved, cost %v", prog.Name, since)
+		}
+		process = 0.90
+		return nil
+	}
+
+	f5 := func() error {
+		saveStart := time.Now()
+		accounting := prog.Cache.GetFlushAccounting()
+		remaining := int(accounting.RemainingDirty)
+		persisted := int(accounting.AlreadyPersisted)
+		total := int(accounting.InstructionsTotal)
+		process = 0.90
+		if prog.DatabaseKind != ssa.ProgramCacheMemory {
+			prog.ProcessInfof("[SSA/persist] program %s flushing IR cache (remaining=%d persisted=%d total=%d) to database",
+				prog.Name, remaining, persisted, total)
+		} else {
+			prog.ProcessInfof("[SSA/persist] program %s finishing cache instruction(len:%d) (memory only, not saved)", prog.Name, remaining)
+		}
+
+		if err := prog.Cache.SaveToDatabase(irSaveProgressCallback(prog, total, persisted, 0.90, 1.0, func(p float64) {
+			process = p
+		})); err != nil {
+			return utils.Errorf("persist IR to database failed: %w", err)
+		}
+		saveTime = time.Since(saveStart)
+		if prog.DatabaseKind != ssa.ProgramCacheMemory {
+			prog.ProcessInfof("[SSA/persist] program %s IR cache flush finished, cost %v", prog.Name, saveTime)
+		}
+		return nil
+	}
+	f6 := func() error {
+		wg.Wait()
+		return nil
+	}
+	wrapPhase := func(phase string, fn func() error) func() error {
+		return func() error {
+			compilePhase = phase
+			log.Debugf("ssa.compile.phase enter %s", compilePhase)
+			stepErr := fn()
+			return stepErr
+		}
+	}
+	phaseSteps := []func() error{
+		wrapPhase("f1_pre_handler", f1),
+		wrapPhase("f2_after_pre", f2),
+		wrapPhase("f3_main_build", f3),
+		wrapPhase("f4_finish", f4),
+		wrapPhase("f5_save_db", f5),
+		wrapPhase("f6_wait", f6),
+	}
+	for _, step := range phaseSteps {
+		if err = step(); err != nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// 输出文件性能汇总表格
+	return NewProgram(prog, c), nil
+}

@@ -1,0 +1,265 @@
+package ssa
+
+import (
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/omap"
+	"golang.org/x/exp/maps"
+	"strings"
+)
+
+type importDeclareItem struct {
+	pkgName      string
+	aliasPkgName string
+	// all          bool
+	typ map[string]Type
+	val map[string]Value
+}
+
+func readImportDecl(p *Program, get func(*importDeclareItem) bool) {
+
+	len := p.importDeclares.Len()
+	idecl := p.importDeclares
+	if p.importCoverInner {
+		// read from last to first
+		for i := len - 1; i >= 0; i-- {
+			item, ok := idecl.GetByIndex(i)
+			if ok && get(item) {
+				return // stop
+			}
+		}
+	} else {
+		// read from first to last
+		for i := 0; i < len; i++ {
+			item, ok := idecl.GetByIndex(i)
+			if ok && get(item) {
+				return // stop
+			}
+		}
+	}
+
+}
+
+/// ===================================== read import
+
+func (p *Program) ReadImportType(name string) (Type, bool) {
+	var ret Type = nil
+	readImportDecl(p, func(idi *importDeclareItem) bool {
+		t, ok := idi.typ[name]
+		ret = t
+		return ok
+	})
+	return ret, ret != nil
+}
+
+func (p *Program) TryReadImportDeclare(name string) (Type, bool) {
+	var ret Type = nil
+	readImportDecl(p, func(idi *importDeclareItem) bool {
+		t, ok := idi.typ[name]
+		ret = t
+		if ret == nil {
+			for libName := range p.importDeclares.GetMap() {
+				lib, exist := p.GetLibrary(libName)
+				if lib != nil && exist {
+					ret, ok = lib.GetExportType(name)
+				}
+				if ok && ret != nil {
+					break
+				}
+				lib.GlobalVariablesBlueprint.Build()
+				if _, ok = lib.GetGlobalVariable(name); ok {
+					ret = lib.GlobalVariablesBlueprint
+					return true
+				}
+			}
+
+		}
+		return ok
+	})
+	return ret, ret != nil
+}
+
+func (p *Program) ReadImportValue(name string) (Value, bool) {
+	var ret Value = nil
+	readImportDecl(p, func(idi *importDeclareItem) bool {
+		v, ok := idi.val[name]
+		ret = v
+		return ok
+	})
+	return ret, ret != nil
+}
+
+func (p *Program) ReadImportTypeWithPkg(pkgName, name string) (Type, bool) {
+	if imp, ok := p.importDeclares.Get(pkgName); ok {
+		typ, ok := imp.typ[name]
+		return typ, ok
+	} else {
+		return nil, false
+	}
+}
+
+func (p *Program) ReadImportValueWithPkg(pkgName, name string) (Value, bool) {
+	if imp, ok := p.importDeclares.Get(pkgName); ok {
+		val, ok := imp.val[name]
+		return val, ok
+	} else {
+		return nil, false
+	}
+}
+
+/// ===================================== import
+
+func (p *Program) checkImportRelationship(lib *Program) (*importDeclareItem, error) {
+	currentLib, ok := p.UpStream.Get(lib.Name)
+	if ok {
+		if currentLib != lib {
+			return nil, utils.Errorf("program library not contain this program")
+		}
+	} else {
+		p.UpStream.Set(lib.Name, lib)
+	}
+	importDecl := p.importDeclares
+	if importDecl == nil {
+		importDecl = omap.NewOrderedMap[string, *importDeclareItem](nil)
+		p.importDeclares = importDecl
+	}
+	pkg, ok := importDecl.Get(lib.Name)
+	if !ok {
+		pkg = &importDeclareItem{
+			pkgName: lib.Name,
+			typ:     make(map[string]Type),
+			val:     make(map[string]Value),
+		}
+		importDecl.Set(lib.Name, pkg)
+	}
+	return pkg, nil
+}
+
+func (p *Program) ImportTypeFromLib(lib *Program, name string, token CanStartStopToken) error {
+	pkg, err := p.checkImportRelationship(lib)
+	if err != nil {
+		return err
+	}
+	importType := fakeImportType(lib, name, token)
+	pkg.typ[name] = importType
+	if idx := strings.LastIndex(name, "."); idx >= 0 && idx+1 < len(name) {
+		pkg.typ[name[idx+1:]] = importType
+	}
+	return err
+}
+
+func (p *Program) ImportValueFromLib(lib *Program, names ...string) error {
+	pkg, err := p.checkImportRelationship(lib)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		value := fakeImportValue(lib, name)
+		pkg.val[name] = value
+		p.fixImportCallback = append(p.fixImportCallback, func() {
+			if real := lib.GetExportValue(name); real != nil {
+				if value != nil && value != real {
+					ReplaceAllValue(value, real)
+				}
+				pkg.val[name] = real
+			}
+		})
+	}
+	return err
+}
+func getBlueprintForImportType(lib *Program, className string) (*Blueprint, error) {
+	if lib == nil {
+		return nil, utils.Errorf("library is nil")
+	}
+	t := fakeImportType(lib, className, nil)
+	if t == nil {
+		return nil, utils.Errorf("library %s not contain type: %s", lib.Name, className)
+	}
+	blueprint, ok := ToClassBluePrintType(t)
+	if !ok {
+		return nil, utils.Errorf("no support to blueprint")
+	}
+	return blueprint, nil
+}
+
+func (p *Program) ImportTypeStaticAll(lib *Program, classname string) error {
+	pkg, err := p.checkImportRelationship(lib)
+	if err != nil {
+		return err
+	}
+	blueprint, err := getBlueprintForImportType(lib, classname)
+	if err != nil {
+		return err
+	}
+	blueprint.Build()
+	p.fixImportCallback = append(p.fixImportCallback, func() {
+		//fix
+		for s, values := range blueprint.StaticMember {
+			if len(values) > 0 {
+				pkg.val[s] = values[len(values)-1]
+			}
+		}
+		for s, function := range blueprint.StaticMethod {
+			pkg.val[s] = function
+		}
+	})
+	for s, values := range blueprint.StaticMember {
+		if len(values) > 0 {
+			pkg.val[s] = values[len(values)-1]
+		}
+	}
+	for s, function := range blueprint.StaticMethod {
+		pkg.val[s] = function
+	}
+	return nil
+}
+func (p *Program) ImportTypeStaticMemberFromLib(lib *Program, clsName string, names ...string) error {
+	pkg, err := p.checkImportRelationship(lib)
+	if err != nil {
+		return err
+	}
+	build := func(blueprint *Blueprint, name string) {
+		p.fixImportCallback = append(p.fixImportCallback, func() {
+			for s, values := range blueprint.StaticMember {
+				if name == s && len(values) > 0 {
+					pkg.val[s] = values[len(values)-1]
+				}
+			}
+			for s, function := range blueprint.StaticMethod {
+				if name == s {
+					pkg.val[s] = function
+				}
+			}
+		})
+		for s, values := range blueprint.StaticMember {
+			if name == s && len(values) > 0 {
+				pkg.val[s] = values[len(values)-1]
+			}
+		}
+		for s, function := range blueprint.StaticMethod {
+			if name == s {
+				pkg.val[s] = function
+			}
+		}
+	}
+	blueprint, err := getBlueprintForImportType(lib, clsName)
+	if err != nil {
+		return utils.JoinErrors(err)
+	}
+	blueprint.Build()
+	for _, name := range names {
+		build(blueprint, name)
+	}
+	return nil
+}
+
+func (p *Program) ImportAll(lib *Program) error {
+	pkg, err := p.checkImportRelationship(lib)
+	if err != nil {
+		return err
+	}
+	maps.Copy(pkg.typ, lib.externType)
+	lib.initConcurrentMaps()
+	maps.Copy(pkg.val, lib.ExportValue.GetAll())
+	_ = pkg
+	return nil
+}

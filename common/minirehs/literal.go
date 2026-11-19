@@ -1,0 +1,347 @@
+package minirehs
+
+import (
+	"regexp/syntax"
+	"sort"
+	"strings"
+	"unicode"
+)
+
+// extractRequiredLiterals 从 RE2 语法树提取"必需字面量"集合: 任何命中都必然包含其中
+// 至少一个字面量 (OR 关系). 这些字面量灌入 prefilter, 数据中不出现任一字面量的位置可被
+// 整体跳过, 从而避免对每条正则全量扫描.
+//
+// 返回的字面量已小写化 (供大小写无关预过滤), 并保证每个长度 >= minLen.
+// 若无法提取出满足条件的必需字面量, 返回 nil, 该 pattern 归入 always-on 集合.
+//
+// 提取策略 (先简后繁, 保证正确性优先):
+//   - 对整棵树递归求 "required literal set": 任一命中必含该集合中某个字面量.
+//   - OpLiteral: 该字面量本身.
+//   - OpConcat: 取各子节点中"最长的那个必需字面量集合" (concat 要求所有子串都出现,
+//     故任取其一即为必需; 选最长以最大化过滤力).
+//   - OpAlternate: 各分支必需集合的并集 (任一分支命中即可), 但只有当每个分支都能提供
+//     非空必需字面量时, 整体才有必需字面量; 任一分支无字面量 -> 整体无 (返回 nil).
+//   - OpCapture/OpPlus (>=1次): 透传子节点 (至少出现一次).
+//   - OpStar/OpQuest (可零次)/OpAnyChar/OpCharClass 等: 无必需字面量.
+//
+// 关键词: literal factoring, 必需字面量, string factor, prefilter
+func extractRequiredLiterals(re *syntax.Regexp, minLen int) []string {
+	lits := requiredLiterals(re)
+	if lits == nil {
+		return nil
+	}
+	out := make([]string, 0, len(lits))
+	seen := make(map[string]struct{}, len(lits))
+	for _, l := range lits {
+		if len([]byte(l)) < minLen && !isRareAnchorLiteral(l) {
+			// 任一必需字面量过短 -> 整体过滤力不足, 退化为 always-on 以避免高假阳预过滤.
+			// 例外: 稀有锚字节 (见 isRareAnchorLiteral) 即便短于 minLen 仍保留 —— 门控永不劣于
+			// always-on (命中集合不变, 仅扫描更少记录), 故正确性不受影响而显著省整段扫.
+			return nil
+		}
+		low := asciiLowerString(l)
+		if _, ok := seen[low]; ok {
+			continue
+		}
+		seen[low] = struct{}{}
+		out = append(out, low)
+	}
+	return out
+}
+
+// extractRequiredLiteralFactors 把正则可证明的必需字面量编成合取范式。
+//
+// 返回值的每一项是一个 OR 因子：其中任一 literal 出现即可满足该因子；所有因子都必须
+// 满足，regex 才有可能命中。例如 foo.*bar 编成 {{"foo"}, {"bar"}}，而
+// (foo|bar).*baz 编成 {{"foo", "bar"}, {"baz"}}。这是 Rose 风格 trigger 图的
+// 编译期输入：运行期可先淘汰缺任一必要因子的记录，再把余下命中交给精确 verifier。
+//
+// 该函数只丢弃无法证明或短于 minLen 的因子，绝不把非必要 literal 加入条件；因此仅会
+// 少过滤，不会造成假阴。返回 nil 表示退回 extractRequiredLiterals 的旧 OR 语义。
+func extractRequiredLiteralFactors(re *syntax.Regexp, minLen int) [][]string {
+	raw := requiredLiteralFactorsOf(re)
+	var out [][]string
+	seenFactor := make(map[string]struct{})
+	for _, f := range raw {
+		if len(f) == 0 {
+			continue
+		}
+		norm := make([]string, 0, len(f))
+		seen := make(map[string]struct{}, len(f))
+		valid := true
+		for _, lit := range f {
+			if len([]byte(lit)) < minLen && !isRareAnchorLiteral(lit) {
+				valid = false
+				break
+			}
+			low := asciiLowerString(lit)
+			if _, duplicate := seen[low]; duplicate {
+				continue
+			}
+			seen[low] = struct{}{}
+			norm = append(norm, low)
+		}
+		if !valid || len(norm) == 0 {
+			continue
+		}
+		sort.Strings(norm)
+		key := strings.Join(norm, "\x00")
+		if _, duplicate := seenFactor[key]; duplicate {
+			continue
+		}
+		seenFactor[key] = struct{}{}
+		out = append(out, norm)
+	}
+	return out
+}
+
+// requiredLiteralFactorsOf 递归求未规整的必需字面量 CNF。它与 requiredLiterals 的区别是
+// Concat 保留全部子项的必要条件，而不是只保留最长的一项；Alternate 则退化为单个 OR
+// 因子，避免把分支特有 literal 错当成全局必需条件。
+func requiredLiteralFactorsOf(re *syntax.Regexp) [][]string {
+	switch re.Op {
+	case syntax.OpLiteral:
+		if lits := requiredLiteralNode(re); len(lits) > 0 {
+			return [][]string{lits}
+		}
+		return nil
+	case syntax.OpConcat:
+		var all [][]string
+		for _, sub := range re.Sub {
+			all = append(all, requiredLiteralFactorsOf(sub)...)
+		}
+		return all
+	case syntax.OpAlternate:
+		lits := requiredLiterals(re)
+		if len(lits) == 0 {
+			return nil
+		}
+		return [][]string{lits}
+	case syntax.OpCapture, syntax.OpPlus:
+		if len(re.Sub) == 1 {
+			return requiredLiteralFactorsOf(re.Sub[0])
+		}
+	case syntax.OpRepeat:
+		if re.Min >= 1 && len(re.Sub) == 1 {
+			return requiredLiteralFactorsOf(re.Sub[0])
+		}
+	}
+	return nil
+}
+
+// flattenLiteralFactors 返回所有因子的去重并集，供既有 literalIndex 扫描。因子为空时
+// 返回 nil；runtime 将把它视为旧版单 OR trigger，不改变原有正确性退化路径。
+func flattenLiteralFactors(factors [][]string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, factor := range factors {
+		for _, lit := range factor {
+			if _, duplicate := seen[lit]; duplicate {
+				continue
+			}
+			seen[lit] = struct{}{}
+			out = append(out, lit)
+		}
+	}
+	return out
+}
+
+// requiredLiterals 返回"命中必含其一"的字面量集合; nil 表示无法保证任何必需字面量.
+func requiredLiterals(re *syntax.Regexp) []string {
+	switch re.Op {
+	case syntax.OpLiteral:
+		return requiredLiteralNode(re)
+
+	case syntax.OpConcat:
+		var best []string
+		bestLen := 0
+		for _, sub := range re.Sub {
+			cand := requiredLiterals(sub)
+			if cand == nil {
+				continue
+			}
+			l := minLiteralLen(cand)
+			if best == nil || l > bestLen {
+				best = cand
+				bestLen = l
+			}
+		}
+		return best
+
+	case syntax.OpAlternate:
+		var all []string
+		for _, sub := range re.Sub {
+			cand := requiredLiterals(sub)
+			if cand == nil {
+				// 某分支无必需字面量 -> 整体无法保证 (该分支可不含任何字面量命中).
+				return nil
+			}
+			all = append(all, cand...)
+		}
+		return all
+
+	case syntax.OpCapture:
+		if len(re.Sub) == 1 {
+			return requiredLiterals(re.Sub[0])
+		}
+		return nil
+
+	case syntax.OpPlus:
+		// x+ 至少出现一次 x, 故 x 的必需字面量也是整体必需的.
+		if len(re.Sub) == 1 {
+			return requiredLiterals(re.Sub[0])
+		}
+		return nil
+
+	case syntax.OpRepeat:
+		// {n,m}: 当 n>=1 时子节点必需字面量被保留.
+		if re.Min >= 1 && len(re.Sub) == 1 {
+			return requiredLiterals(re.Sub[0])
+		}
+		return nil
+
+	default:
+		// OpStar / OpQuest / OpAnyChar / OpCharClass / OpEmptyMatch / 锚点 等: 无必需字面量.
+		return nil
+	}
+}
+
+func requiredLiteralNode(re *syntax.Regexp) []string {
+	lit := asciiSafeLiteral(re)
+	if len(lit) >= 2 || isRareAnchorLiteral(lit) || re.Flags&syntax.FoldCase == 0 {
+		if lit == "" {
+			return nil
+		}
+		return []string{lit}
+	}
+	// A short literal may have no useful safe fragment ("SK" or "sk-").
+	// Preserve filtering by listing its finite Unicode forms.
+	// Cap expansion; longer ambiguous literals safely remain always-on.
+	if len(re.Rune) == 0 || re.Flags&syntax.FoldCase == 0 {
+		return nil
+	}
+	forms := []string{""}
+	for _, r := range re.Rune {
+		var variants []string
+		switch r {
+		case 'k', 'K':
+			variants = []string{"k", "K"}
+		case 's', 'S':
+			variants = []string{"s", "ſ"}
+		default:
+			if r > 127 {
+				if lit != "" {
+					return []string{lit}
+				}
+				return nil
+			}
+			variants = []string{asciiLowerString(string(r))}
+		}
+		if len(forms) > 64/len(variants) {
+			if lit != "" {
+				return []string{lit}
+			}
+			return nil
+		}
+		next := make([]string, 0, len(forms)*len(variants))
+		for _, prefix := range forms {
+			for _, v := range variants {
+				next = append(next, prefix+v)
+			}
+		}
+		forms = next
+	}
+	return forms
+}
+
+// A byte trigger cannot require the UTF-8 encoding of RuneError: RE2 decodes
+// invalid bytes as that rune, and the PCRE compatibility wrapper normalizes them.
+// ASCII case folding also cannot represent long s or the Kelvin sign.
+func asciiSafeLiteral(re *syntax.Regexp) string {
+	if re.Flags&syntax.FoldCase == 0 {
+		literal := string(re.Rune)
+		if !strings.ContainsRune(literal, unicode.ReplacementChar) {
+			return literal
+		}
+		best := ""
+		for _, fragment := range strings.Split(literal, string(unicode.ReplacementChar)) {
+			if len(fragment) > len(best) {
+				best = fragment
+			}
+		}
+		return best
+	}
+	start, bestStart, bestEnd := 0, 0, 0
+	for i, r := range re.Rune {
+		if !asciiFoldSafe(r) {
+			if i-start > bestEnd-bestStart {
+				bestStart, bestEnd = start, i
+			}
+			start = i + 1
+		}
+	}
+	if len(re.Rune)-start > bestEnd-bestStart {
+		bestStart, bestEnd = start, len(re.Rune)
+	}
+	return string(re.Rune[bestStart:bestEnd])
+}
+
+func asciiFoldSafe(r rune) bool {
+	if r > 127 {
+		return false
+	}
+	for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+		if folded > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+// ASCII byte preconditions cannot constrain these folds. Localization instead
+// uses literalTriggerBounds to account for every fragment occurrence and width.
+func hasNonASCIIFold(re *syntax.Regexp) bool {
+	if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 {
+		for _, r := range re.Rune {
+			if !asciiFoldSafe(r) {
+				return true
+			}
+		}
+	}
+	for _, sub := range re.Sub {
+		if hasNonASCIIFold(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRareAnchorLiteral 报告单字符字面量 l 是否属于"稀有锚字节": 在真实 HTTP 流量中出现稀疏
+// (跨记录与记录内均低频) 且语义上是强结构锚点的分隔符. 允许此类字节作为必需字面量 (即便短于
+// minLen), 使本会退化为 always-on (每记录整段扫) 的 pattern 可被 prefilter 门控.
+//
+// 正确性: 必需字面量门控永不劣于 always-on —— 任一命中必含该字面量 (必需语义), 故只在含该字节的
+// 记录上验证, 命中集合与 always-on 完全一致, 仅扫描更少记录. 因此这是纯性能优化, 不影响正确性
+// (差分 / oracle 测试为护栏)。
+//
+// 当前集合: '@' (email / 账号标识锚). 实测真实 HTTP 语料中仅约 16% 记录含 '@' 且记录内稀疏,
+// 据此把 email 类 pattern 从 always-on (100% 记录整段扫) 降为仅 16% 记录验证。不纳入字母数字 /
+// 空白 / 高频结构符 ('/' '=' ':' '<' '>' 等): 它们记录内高频, AC 命中过密会抵消门控收益。
+func isRareAnchorLiteral(l string) bool {
+	return l == "@"
+}
+
+// minLiteralLen 返回字面量集合中最短者的字节长度.
+func minLiteralLen(lits []string) int {
+	m := -1
+	for _, l := range lits {
+		n := len([]byte(l))
+		if m < 0 || n < m {
+			m = n
+		}
+	}
+	if m < 0 {
+		return 0
+	}
+	return m
+}

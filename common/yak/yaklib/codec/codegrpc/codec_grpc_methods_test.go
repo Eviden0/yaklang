@@ -1,0 +1,583 @@
+package codegrpc
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/yaklang/yaklang/common/authhack"
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/mutate"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/lowhttp"
+	"github.com/yaklang/yaklang/common/utils/tlsutils"
+	"github.com/yaklang/yaklang/common/yak/yaklib/codec"
+	"github.com/yaklang/yaklang/common/yakgrpc/yakit"
+	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+)
+
+var (
+	defaultCodecExecFlow = NewCodecExecFlow([]byte(""), nil)
+)
+
+// generateRandomPlaintext 生成随机明文用于测试
+func generateRandomPlaintext(minLen, maxLen int) []byte {
+	// 随机长度在 minLen 到 maxLen 之间
+	length := minLen
+	if maxLen > minLen {
+		extraLen := make([]byte, 1)
+		rand.Read(extraLen)
+		length = minLen + int(extraLen[0])%(maxLen-minLen+1)
+	}
+
+	plaintext := make([]byte, length)
+	_, err := rand.Read(plaintext)
+	if err != nil {
+		panic(err)
+	}
+	return plaintext
+}
+
+func TestJwt(t *testing.T) {
+	// 注： 这里testData的sig是错误的
+	testData := `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXUyJ9.eyJsb2dpbiI6InRlc3QiLCJpYXQiOiIxNzM0OTIyMTgxIn0.OGY2NDkyZWI3ZWQ3YmJkMjdiNmY0ODYwY2NjNTdiMGY3ZjAxMWM3YjkwMGYxNGViOTFiYzc4NzlkYWFmYTZmZA`
+	defaultCodecExecFlow.Text = []byte(testData)
+	// parse
+	err := defaultCodecExecFlow.JwtParse()
+	require.NoError(t, err)
+	want := `{
+    "alg": "HS256",
+    "brute_secret_key_finished": false,
+    "claims": {
+        "iat": "1734922181",
+        "login": "test"
+    },
+    "header": {
+        "alg": "HS256",
+        "typ": "JWS"
+    },
+    "is_valid": false,
+    "raw": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXUyJ9.eyJsb2dpbiI6InRlc3QiLCJpYXQiOiIxNzM0OTIyMTgxIn0.OGY2NDkyZWI3ZWQ3YmJkMjdiNmY0ODYwY2NjNTdiMGY3ZjAxMWM3YjkwMGYxNGViOTFiYzc4NzlkYWFmYTZmZA",
+    "secret_key": ""
+}`
+	// check result
+	wantMap, gotMap := make(map[string]any), make(map[string]any)
+	err = json.Unmarshal([]byte(want), &wantMap)
+	require.NoError(t, err)
+	err = json.Unmarshal(defaultCodecExecFlow.Text, &gotMap)
+	require.NoError(t, err)
+	require.Equal(t, wantMap, gotMap)
+
+	// reverse sign
+	err = defaultCodecExecFlow.JwtReverseSign()
+	// check result
+	require.NoError(t, err)
+	wantToken, _, err := authhack.JwtParse(testData)
+	require.ErrorIs(t, err, authhack.ErrKeyNotFound)
+	gotToken, _, err := authhack.JwtParse(string(defaultCodecExecFlow.Text))
+	require.ErrorIs(t, err, authhack.ErrKeyNotFound)
+
+	require.Equal(t, wantToken.Header, gotToken.Header)
+	require.Equal(t, wantToken.Claims, gotToken.Claims)
+}
+
+// TestAESGCMDecryptFallback 测试 AES-GCM 解密的兜底机制
+// AES-GCM 有认证标签验证，可以安全地自动尝试多种编码
+func TestAESGCMDecryptFallback(t *testing.T) {
+	plaintext := generateRandomPlaintext(10, 100) // 生成10-100字节的随机明文
+	key := "12345678901234567890123456789012"     // 32 bytes for AES-256
+	nonce := "123456789012"                       // 12 bytes nonce
+
+	// 测试1: 原文解密
+	flow := NewCodecExecFlow(plaintext, nil)
+	err := flow.AESGCMEncrypt(key, "raw", nonce, "raw", "12", "raw")
+	require.NoError(t, err)
+	encrypted1 := make([]byte, len(flow.Text))
+	copy(encrypted1, flow.Text)
+
+	flow = NewCodecExecFlow(encrypted1, nil)
+	err = flow.AESGCMDecrypt(key, "raw", nonce, "raw", "12", "raw")
+	require.NoError(t, err)
+	require.Equal(t, plaintext, flow.Text)
+
+	// 测试2: base64编码的兜底
+	flow = NewCodecExecFlow(plaintext, nil)
+	err = flow.AESGCMEncrypt(key, "raw", nonce, "raw", "12", "raw")
+	require.NoError(t, err)
+	encrypted2 := make([]byte, len(flow.Text))
+	copy(encrypted2, flow.Text)
+
+	encryptedBase64 := codec.EncodeBase64(encrypted2)
+	flow = NewCodecExecFlow([]byte(encryptedBase64), nil)
+	err = flow.AESGCMDecrypt(key, "raw", nonce, "raw", "12", "raw")
+	require.NoError(t, err)
+	require.Equal(t, plaintext, flow.Text)
+
+	// 测试3: hex编码的兜底
+	flow = NewCodecExecFlow(plaintext, nil)
+	err = flow.AESGCMEncrypt(key, "raw", nonce, "raw", "12", "raw")
+	require.NoError(t, err)
+	encrypted3 := make([]byte, len(flow.Text))
+	copy(encrypted3, flow.Text)
+
+	encryptedHex := codec.EncodeToHex(encrypted3)
+	flow = NewCodecExecFlow([]byte(encryptedHex), nil)
+	err = flow.AESGCMDecrypt(key, "raw", nonce, "raw", "12", "raw")
+	require.NoError(t, err)
+	require.Equal(t, plaintext, flow.Text)
+}
+
+func TestAESDecryptKeyTryDecode(t *testing.T) {
+	plaintext := []byte("try decode aes key and iv")
+	key := "1234567890123456"
+	iv := "abcdefghijklmnop"
+
+	flow := NewCodecExecFlow(plaintext, nil)
+	err := flow.AESEncrypt(key, "raw", iv, "raw", "CBC", "hex", "pkcs")
+	require.NoError(t, err)
+	encryptedHex := string(flow.Text)
+
+	flow = NewCodecExecFlow([]byte(encryptedHex), nil)
+	err = flow.AESDecrypt(codec.EncodeBase64([]byte(key)), "hex", codec.EncodeBase64([]byte(iv)), "hex", "CBC", "hex", "pkcs")
+	require.NoError(t, err)
+	require.Equal(t, plaintext, flow.Text)
+}
+
+// TestRSADecryptFallback 测试 RSA 解密的兜底机制
+// RSA 有密文长度验证，可以安全地自动尝试多种编码
+func TestRSADecryptFallback(t *testing.T) {
+	// RSA 2048位密钥最多能加密 214 字节 (2048/8 - 42 for OAEP padding)
+	// 使用较小的明文以适应所有填充方式
+	plaintext := generateRandomPlaintext(10, 50) // 生成10-50字节的随机明文
+
+	// 生成 RSA 密钥对 (2048 bits)
+	pubKeyPEM, priKeyPEM, err := tlsutils.RSAGenerateKeyPair(2048)
+	require.NoError(t, err)
+
+	// 测试所有填充方式和哈希算法组合
+	testCases := []struct {
+		name          string
+		paddingSchema string
+		hashAlgorithm string
+	}{
+		// RSA-OAEP 支持多种哈希算法
+		{"RSA-OAEP_SHA-1", "RSA-OAEP", "SHA-1"},
+		{"RSA-OAEP_SHA-256", "RSA-OAEP", "SHA-256"},
+		{"RSA-OAEP_SHA-384", "RSA-OAEP", "SHA-384"},
+		{"RSA-OAEP_SHA-512", "RSA-OAEP", "SHA-512"},
+		{"RSA-OAEP_MD5", "RSA-OAEP", "MD5"},
+		// PKCS1v15 (哈希算法参数会被忽略，但仍需提供)
+		{"PKCS1v15", "PKCS1v15", "SHA-1"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 1. 加密
+			flow := NewCodecExecFlow(plaintext, nil)
+			err := flow.RSAEncrypt(string(pubKeyPEM), tc.paddingSchema, tc.hashAlgorithm)
+			require.NoError(t, err)
+			encrypted := make([]byte, len(flow.Text))
+			copy(encrypted, flow.Text)
+
+			// 2. 测试原文解密（raw）
+			flow = NewCodecExecFlow(encrypted, nil)
+			err = flow.RSADecrypt(string(priKeyPEM), tc.paddingSchema, tc.hashAlgorithm)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, flow.Text, "raw decryption failed for %s", tc.name)
+
+			// 3. 测试base64编码的兜底
+			encryptedBase64 := codec.EncodeBase64(encrypted)
+			flow = NewCodecExecFlow([]byte(encryptedBase64), nil)
+			err = flow.RSADecrypt(string(priKeyPEM), tc.paddingSchema, tc.hashAlgorithm)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, flow.Text, "base64 fallback failed for %s", tc.name)
+
+			// 4. 测试hex编码的兜底
+			encryptedHex := codec.EncodeToHex(encrypted)
+			flow = NewCodecExecFlow([]byte(encryptedHex), nil)
+			err = flow.RSADecrypt(string(priKeyPEM), tc.paddingSchema, tc.hashAlgorithm)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, flow.Text, "hex fallback failed for %s", tc.name)
+		})
+	}
+}
+
+func TestRSAKeyAndSignatureTryDecode(t *testing.T) {
+	msg := []byte("rsa key try decode")
+	pubKeyPEM, priKeyPEM, err := tlsutils.RSAGenerateKeyPair(2048)
+	require.NoError(t, err)
+
+	flow := NewCodecExecFlow(msg, nil)
+	err = flow.RSASign(codec.EncodeBase64(priKeyPEM), "PKCS1v15", "SHA-256", "base64")
+	require.NoError(t, err)
+	signBase64 := string(flow.Text)
+
+	flow = NewCodecExecFlow(msg, nil)
+	err = flow.RSAVerify(codec.EncodeBase64(pubKeyPEM), "PKCS1v15", "SHA-256", signBase64)
+	require.NoError(t, err)
+	require.Equal(t, []byte("验证成功"), flow.Text)
+}
+
+func TestRSAJSEncryptStyleFlow(t *testing.T) {
+	plaintext := bytes.Repeat([]byte("js-encrypt-style-"), 20)
+	pubKeyPEM, priKeyPEM, err := tlsutils.RSAGenerateKeyPair(1024)
+	require.NoError(t, err)
+
+	flow := NewCodecExecFlow(plaintext, nil)
+	err = flow.RSAEncrypt(codec.EncodeBase64(pubKeyPEM), "JSEncrypt", "SHA-256")
+	require.NoError(t, err)
+	encrypted := codec.EncodeBase64(flow.Text)
+
+	flow = NewCodecExecFlow([]byte(encrypted), nil)
+	err = flow.RSADecrypt(codec.EncodeBase64(priKeyPEM), "JSEncrypt", "SHA-256")
+	require.NoError(t, err)
+	require.Equal(t, plaintext, flow.Text)
+}
+
+// TestSM2DecryptFallback 测试 SM2 解密的兜底机制
+// SM2 有密文格式验证，可以安全地自动尝试多种编码
+func TestSM2DecryptFallback(t *testing.T) {
+	plaintext := generateRandomPlaintext(10, 100) // 生成10-100字节的随机明文
+
+	// 生成 SM2 密钥对
+	priKey, pubKey, err := codec.GenerateSM2PrivateKeyHEX()
+	require.NoError(t, err)
+
+	// 测试所有三种 SM2 编码格式
+	testCases := []struct {
+		name          string
+		encryptFunc   func([]byte, []byte) ([]byte, error)
+		decryptSchema string
+	}{
+		{
+			name: "ASN1",
+			encryptFunc: func(pub, plain []byte) ([]byte, error) {
+				return codec.SM2EncryptASN1(pub, plain)
+			},
+			decryptSchema: "ASN1",
+		},
+		{
+			name: "C1C2C3",
+			encryptFunc: func(pub, plain []byte) ([]byte, error) {
+				return codec.SM2EncryptC1C2C3(pub, plain)
+			},
+			decryptSchema: "C1C2C3",
+		},
+		{
+			name: "C1C3C2",
+			encryptFunc: func(pub, plain []byte) ([]byte, error) {
+				return codec.SM2EncryptC1C3C2(pub, plain)
+			},
+			decryptSchema: "C1C3C2",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 1. 加密
+			encrypted, err := tc.encryptFunc(pubKey, plaintext)
+			require.NoError(t, err)
+
+			// 2. 测试原文解密（raw）
+			flow := NewCodecExecFlow(encrypted, nil)
+			err = flow.SM2Decrypt(string(priKey), tc.decryptSchema)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, flow.Text, "raw decryption failed for %s", tc.name)
+
+			// 3. 测试base64编码的兜底
+			encryptedBase64 := codec.EncodeBase64(encrypted)
+			flow = NewCodecExecFlow([]byte(encryptedBase64), nil)
+			err = flow.SM2Decrypt(string(priKey), tc.decryptSchema)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, flow.Text, "base64 fallback failed for %s", tc.name)
+
+			// 4. 测试hex编码的兜底
+			encryptedHex := codec.EncodeToHex(encrypted)
+			flow = NewCodecExecFlow([]byte(encryptedHex), nil)
+			err = flow.SM2Decrypt(string(priKey), tc.decryptSchema)
+			require.NoError(t, err)
+			require.Equal(t, plaintext, flow.Text, "hex fallback failed for %s", tc.name)
+		})
+	}
+}
+
+func TestSM2PrivateKeyTryDecode(t *testing.T) {
+	plaintext := []byte("sm2 private key try decode")
+	priKey, pubKey, err := codec.GenerateSM2PrivateKeyHEX()
+	require.NoError(t, err)
+
+	encrypted, err := codec.SM2EncryptC1C2C3(pubKey, plaintext)
+	require.NoError(t, err)
+
+	flow := NewCodecExecFlow(encrypted, nil)
+	err = flow.SM2Decrypt(codec.EncodeBase64(priKey), "C1C2C3")
+	require.NoError(t, err)
+	require.Equal(t, plaintext, flow.Text)
+}
+
+func TestHTTPRequestMutate_PostToGetWithLeadingBlankLinesInBody(t *testing.T) {
+	// 用户反馈：body 前多一个空行时，POST→GET 会污染请求行：
+	// GET /path? HTTP/1.1
+	// sql=1 HTTP/1.1
+	raw := []byte("POST /WebServiceEx.asmx/GetDataTableBySql HTTP/1.1\nHost: \nContent-Type: application/x-www-form-urlencoded\n\n\nsql=1")
+	flow := NewCodecExecFlow(raw, nil)
+	err := flow.HTTPRequestMutate("GET")
+	require.NoError(t, err)
+
+	result := string(flow.Text)
+	// 请求行必须完整：?sql=1 在同一行，不能被拆成第二行 "sql=1 HTTP/1.1"
+	require.True(t, strings.HasPrefix(result, "GET /WebServiceEx.asmx/GetDataTableBySql?sql=1 HTTP/1.1"), "got: %q", result)
+	require.False(t, strings.Contains(result, "?\r\nsql=") || strings.Contains(result, "?\nsql="), "request-line should not be split by query CR/LF, got: %q", result)
+	require.Equal(t, "GET", lowhttp.GetHTTPRequestMethod(flow.Text))
+	require.Equal(t, map[string][]string{"sql": {"1"}}, lowhttp.GetFullHTTPRequestQueryParams(flow.Text))
+	require.Empty(t, strings.TrimSpace(string(lowhttp.GetHTTPPacketBody(flow.Text))))
+}
+
+// TestCodecSymmetricStreamModesNoPadding 验证 AES/DES/TripleDES 的流模式（CFB/OFB/CTR）
+// 在 Codec 层不产生 padding，密文长度等于明文长度；块模式（CBC/ECB）仍保留 padding。
+func TestCodecSymmetricStreamModesNoPadding(t *testing.T) {
+	plaintext := []byte("Hello Yak! This is a CFB/OFB test message.") // 42 bytes
+
+	cases := []struct {
+		name string
+		key  string
+		iv   string
+		enc  func(*CodecExecFlow, string, string, string, string, string) error
+		dec  func(*CodecExecFlow, string, string, string, string, string) error
+	}{
+		{
+			"AES", "1234567890123456", "abcdefghijklmnop",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.AESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.AESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"SM4", "1234567890123456", "abcdefghijklmnop",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.SM4Encrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.SM4Decrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"DES", "12345678", "abcdefgh",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.DESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.DESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"TripleDES", "123456789012345678901234", "abcdefgh",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.TripleDESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.TripleDESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+	}
+
+	streamModes := []string{"CFB", "OFB", "CTR"}
+	blockModes := []string{"CBC", "ECB"}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 流模式：密文长度 = 明文长度，round-trip 一致
+			for _, mode := range streamModes {
+				for _, pad := range []string{"pkcs", "zeroPadding"} {
+					ef := NewCodecExecFlow(plaintext, nil)
+					require.NoError(t, c.enc(ef, c.key, c.iv, mode, "raw", pad), "%s/%s encrypt", mode, pad)
+					ct := make([]byte, len(ef.Text))
+					copy(ct, ef.Text)
+					require.Equal(t, len(plaintext), len(ct), "%s/%s stream mode should not pad", mode, pad)
+
+					df := NewCodecExecFlow(ct, nil)
+					require.NoError(t, c.dec(df, c.key, c.iv, mode, "raw", pad), "%s/%s decrypt", mode, pad)
+					require.Equal(t, plaintext, df.Text, "%s/%s round-trip", mode, pad)
+				}
+			}
+			// 块模式：密文长度 = 明文长度向上取整到块大小，round-trip 一致
+			for _, mode := range blockModes {
+				for _, pad := range []string{"pkcs", "zeroPadding"} {
+					ef := NewCodecExecFlow(plaintext, nil)
+					require.NoError(t, c.enc(ef, c.key, c.iv, mode, "raw", pad), "%s/%s encrypt", mode, pad)
+					ct := make([]byte, len(ef.Text))
+					copy(ct, ef.Text)
+					require.Greater(t, len(ct), len(plaintext), "%s/%s block mode should pad", mode, pad)
+
+					df := NewCodecExecFlow(ct, nil)
+					require.NoError(t, c.dec(df, c.key, c.iv, mode, "raw", pad), "%s/%s decrypt", mode, pad)
+					require.Equal(t, plaintext, df.Text, "%s/%s round-trip", mode, pad)
+				}
+			}
+		})
+	}
+}
+
+// TestCodecSymmetricIVTruncation 验证对称加密加密时超长 IV 会被截断到块大小，
+// 与解密走 FixIV 的行为保持一致，加解密 round-trip 一致。
+func TestCodecSymmetricIVTruncation(t *testing.T) {
+	plaintext := []byte("Hello Yak! DES stream test message.")
+
+	cases := []struct {
+		name string
+		key  string
+		iv   string
+		enc  func(*CodecExecFlow, string, string, string, string, string) error
+		dec  func(*CodecExecFlow, string, string, string, string, string) error
+	}{
+		{
+			"AES", "1234567890123456", "abcdefghijklmnopqrstuvwxyz012345",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.AESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.AESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"SM4", "1234567890123456", "abcdefghijklmnopqrstuvwxyz012345",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.SM4Encrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.SM4Decrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"DES", "12345678", "abcdefghijklmnop",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.DESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.DESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"TripleDES", "123456789012345678901234", "abcdefghijklmnop",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.TripleDESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.TripleDESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, mode := range []string{"CFB", "OFB", "CTR", "CBC"} {
+				ef := NewCodecExecFlow(plaintext, nil)
+				require.NoError(t, c.enc(ef, c.key, c.iv, mode, "raw", "pkcs"), "%s encrypt", mode)
+				ct := make([]byte, len(ef.Text))
+				copy(ct, ef.Text)
+
+				df := NewCodecExecFlow(ct, nil)
+				require.NoError(t, c.dec(df, c.key, c.iv, mode, "raw", "pkcs"), "%s decrypt", mode)
+				require.Equal(t, plaintext, df.Text, "%s round-trip with truncated IV", mode)
+			}
+		})
+	}
+}
+
+// TestCodecSymmetricEmptyRawIV 验证 IV 为空且 ivType 为 raw 时，
+// 加密/解密都回退到 key 作为 IV（FixIV 对空切片的处理），round-trip 一致。
+func TestCodecSymmetricEmptyRawIV(t *testing.T) {
+	plaintext := []byte("Hello Yak! empty raw IV test message.")
+
+	cases := []struct {
+		name string
+		key  string
+		enc  func(*CodecExecFlow, string, string, string, string, string) error
+		dec  func(*CodecExecFlow, string, string, string, string, string) error
+	}{
+		{
+			"AES", "1234567890123456",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.AESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.AESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"SM4", "1234567890123456",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.SM4Encrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.SM4Decrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"DES", "12345678",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.DESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.DESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+		{
+			"TripleDES", "123456789012345678901234",
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.TripleDESEncrypt(k, "raw", iv, "raw", m, o, p) },
+			func(f *CodecExecFlow, k, iv, m, o, p string) error { return f.TripleDESDecrypt(k, "raw", iv, "raw", m, o, p) },
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, mode := range []string{"CFB", "OFB", "CTR", "CBC"} {
+				ef := NewCodecExecFlow(plaintext, nil)
+				require.NoError(t, c.enc(ef, c.key, "", mode, "raw", "pkcs"), "%s encrypt", mode)
+				ct := make([]byte, len(ef.Text))
+				copy(ct, ef.Text)
+
+				df := NewCodecExecFlow(ct, nil)
+				require.NoError(t, c.dec(df, c.key, "", mode, "raw", "pkcs"), "%s decrypt", mode)
+				require.Equal(t, plaintext, df.Text, "%s round-trip with empty raw IV", mode)
+			}
+		})
+	}
+}
+
+// TestCodecflowFuzzTagWithPipeInInput 测试 codecflow fuzztag 的完整链路：
+// 使用临时数据库保存 codecflow，通过 FuzzTagExec 执行，验证 SplitN 切分后 input 中可以包含 | 字符
+func TestCodecflowFuzzTagWithPipeInInput(t *testing.T) {
+	// 使用临时数据库，避免污染全局数据库
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test-profile.db")
+	db, err := consts.CreateProfileDatabase(dbPath)
+	require.NoError(t, err)
+	consts.BindProfileDatabase(db, dbPath)
+	flowName := utils.RandStringBytes(10)
+	// 测试结束后清理：删除测试数据、关闭临时数据库、恢复全局数据库状态
+	t.Cleanup(func() {
+		// 删除测试用的 codecflow 记录
+		_ = yakit.DeleteCodecFlow(db, flowName)
+		// 关闭临时数据库并清除全局绑定（profileDatabase 置 nil，下次使用时惰性重建）
+		consts.CloseProfileDatabase()
+	})
+
+	// WorkFlowUI 需要设置合法的 JSON，否则 jsonpath.Find 解析空字符串会报错
+	// rightItems 需要包含与 workFlow 数量一致的元素，且每个元素需要有 status 字段
+	// status 为空字符串表示正常执行（非 suspend/shield）
+	workFlowUI := `{"rightItems":[{"status":""}]}`
+
+	// 创建一个简单的 Base64Encode codec flow
+	workFlow := []*ypb.CodecWork{
+		{
+			CodecType:  "Base64Encode",
+			Script:     "",
+			PluginName: "",
+			Params: []*ypb.ExecParamItem{
+				{
+					Key:   "Alphabet",
+					Value: "standard",
+				},
+			},
+		},
+	}
+	workFlowJSON, err := json.Marshal(workFlow)
+	require.NoError(t, err)
+
+	err = yakit.CreateOrUpdateCodecFlow(db, &schema.CodecFlow{
+		FlowName:   flowName,
+		WorkFlow:   workFlowJSON,
+		WorkFlowUI: workFlowUI,
+	})
+	require.NoError(t, err)
+
+	t.Run("input with pipe character should not be split", func(t *testing.T) {
+		// input 中包含 | 字符，SplitN 只在第一个 | 处切分
+		// flowName=flowName, input=a|b|c
+		data := "a|b|c"
+		expected := codec.EncodeBase64(data)
+
+		res, err := mutate.FuzzTagExec("{{codecflow(" + flowName + "|" + data + ")}}")
+		require.NoError(t, err)
+		require.Len(t, res, 1)
+		require.Equal(t, expected, res[0])
+	})
+
+	t.Run("input with rawtag for reserved chars", func(t *testing.T) {
+		// 配合 rawtag 使用：rawtag 内的 {{ }} 不会被解析为 fuzztag
+		// {{codecflow(flowName|{{=复杂{{输入}}=}})}}
+		// rawtag 输出 "复杂{{输入}}"，然后传给 codecflow
+		rawInput := `{{=复杂{{输入}}=}}`
+		expectedInput := `复杂{{输入}}`
+		expected := codec.EncodeBase64(expectedInput)
+
+		res, err := mutate.FuzzTagExec("{{codecflow(" + flowName + "|" + rawInput + ")}}")
+		require.NoError(t, err)
+		require.Len(t, res, 1)
+		require.Equal(t, expected, res[0])
+	})
+}

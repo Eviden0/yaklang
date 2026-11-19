@@ -1,0 +1,78 @@
+package yakvm
+
+func (v *Frame) push(i *Value) {
+	v.stack.Push(i)
+}
+
+func (v *Frame) peek() *Value {
+	value := v.stack.Peek()
+	if value == nil {
+		return nil
+	}
+	return value
+}
+
+func (v *Frame) peekN(n int) *Value {
+	value := v.stack.PeekN(n)
+	if value == nil {
+		return nil
+	}
+	return value
+}
+
+func (v *Frame) peekNextCode() *Code {
+	if v.codePointer+1 >= len(v.codes) {
+		return nil
+	}
+	return v.codes[v.codePointer+1]
+}
+
+func (v *Frame) pop() *Value {
+	return v.stack.Pop()
+}
+
+func (v *Frame) popN(n int) []*Value {
+	var args = make([]*Value, n)
+	for i := 0; i < n; i++ {
+		args[i] = v.pop()
+	}
+	return args
+}
+
+func (v *Frame) popReverseN(n int) []*Value {
+	var args = make([]*Value, n)
+	for i := 0; i < n; i++ {
+		args[n-1-i] = v.pop()
+	}
+	return args
+}
+
+func (v *Frame) popArgN(n int) []*Value {
+	if n <= 0 {
+		return nil
+	}
+	return v.popReverseN(n)
+}
+
+func (v *Frame) setPendingCallArgCount(code *Code, count int) {
+	v.pendingCallCode = code
+	v.pendingCallArgCount = count
+}
+
+func (v *Frame) effectiveCallArgCount(code *Code) int {
+	if v.pendingCallCode == code {
+		return v.pendingCallArgCount
+	}
+	return code.Unary
+}
+
+func (v *Frame) consumeCallArgCount(code *Code) int {
+	count := v.effectiveCallArgCount(code)
+	v.clearPendingCallArgCount()
+	return count
+}
+
+func (v *Frame) clearPendingCallArgCount() {
+	v.pendingCallCode = nil
+	v.pendingCallArgCount = 0
+}

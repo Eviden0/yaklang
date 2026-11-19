@@ -1,0 +1,451 @@
+package ssaconfig
+
+import (
+	"time"
+
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yakgrpc/ypb"
+)
+
+// SyntaxFlow结果保存类型
+type SFResultSaveKind string
+
+const (
+	SFResultSaveNone     SFResultSaveKind = "none"     // no save
+	SFResultSaveMemory   SFResultSaveKind = "memory"   // in cache
+	SFResultSaveDatabase SFResultSaveKind = "database" // in database
+)
+
+// DefaultScanRuleWorkLimit is the default for both the CLI and the Yak script
+// per-rule structural work budget. Keep the default in one place so API
+// documentation and callers do not drift apart. 50k was validated on
+// dotCMS/core (188 SSA rules): it finishes in ~2m at default concurrency with
+// ~4GB peak RSS, while the legacy 200k default still reached the node's 24GiB
+// guard on that project.
+const DefaultScanRuleWorkLimit int64 = 50_000
+
+type SyntaxFlowConfig struct {
+	Memory         bool             `json:"memory"`
+	ResultSaveKind SFResultSaveKind `json:"result_save_kind"`
+	// NoSaveRisk prevents SyntaxFlow risks and audit result data from being
+	// persisted. Scan task state is still recorded, and risks remain available
+	// to output/report callbacks.
+	NoSaveRisk      bool                  `json:"no_save_risk"`
+	ProcessCallback func(float64, string) `json:"-"`
+}
+
+type ControlMode string
+
+const (
+	ControlModeStart  ControlMode = "start"
+	ControlModeStatus ControlMode = "status"
+	ControlModeResume ControlMode = "resume"
+)
+
+type SyntaxFlowScanConfig struct {
+	IgnoreLanguage bool       `json:"ignore_language"`
+	Language       []Language `json:"language"`
+	Concurrency    uint32     `json:"concurrency"`
+	ControlMode    string     `json:"control_mode"`   // 控制模式 "start" "pause" "resume" "status"
+	ResumeTaskId   string     `json:"resume_task_id"` // 恢复任务ID
+	// RuleTimeout is the per-rule wall-clock budget for a single rule execution
+	// over a single program. When > 0, each rule query runs under a
+	// context.WithTimeout derived from the scan context, so a pathological rule
+	// (e.g. a dataflow(include=...) matching tens of thousands of sources on a
+	// large project) is bailed at the budget instead of hanging the whole scan.
+	// 0 means no per-rule budget (legacy behavior). See nativeCallDataFlow and
+	// the scan runner Query in syntaxflow_scan/runtime.go.
+	RuleTimeout time.Duration `json:"rule_timeout"`
+	// RuleWorkLimit is the per-rule total-work budget: the max number of fanout
+	// elements (per <typeName>/<getReturns>/<getCallee>/.../dataflow source
+	// iterations) one rule execution may process across all its opcodes. When > 0,
+	// the scan runner attaches a sfvm.RuleWorkBudget to the rule; once exceeded the
+	// rule ctx is cancelled and the rule bails with partial results (same partial
+	// path as RuleTimeout) instead of doing tens of millions of per-element
+	// MergeAnchor(Clone)+AppendPredecessor ops that hang for hours. This bounds
+	// the within-opcode fanout that RuleTimeout (a wall-clock backstop) only
+	// catches after the fact. 0 means no work budget (legacy: only RuleTimeout).
+	// Default in `yak code-scan` is 50k; tune via --rule-work-limit.
+	RuleWorkLimit int64 `json:"rule_work_limit"`
+}
+
+// --- SyntaxFlow 配置 Get/Set 方法 ---
+
+func (c *Config) GetSyntaxFlowResultKind() SFResultSaveKind {
+	if c == nil || c.SyntaxFlow == nil {
+		return SFResultSaveNone
+	}
+	return c.SyntaxFlow.ResultSaveKind
+}
+
+// IsNoSaveRisk reports whether scan results must be kept out of the
+// SSA database. See SyntaxFlowConfig.NoSaveRisk.
+func (c *Config) IsNoSaveRisk() bool {
+	if c == nil || c.SyntaxFlow == nil {
+		return false
+	}
+	return c.SyntaxFlow.NoSaveRisk
+}
+
+func (c *Config) SetSyntaxFlowResultKind(resultKind SFResultSaveKind) {
+	if c == nil {
+		return
+	}
+	if c.SyntaxFlow == nil {
+		return
+	}
+	c.SyntaxFlow.ResultSaveKind = resultKind
+}
+
+func (c *Config) SetSyntaxFlowResultSaveDataBase() {
+	if c == nil {
+		return
+	}
+	if c.SyntaxFlow == nil {
+		c.SyntaxFlow = defaultSyntaxFlowConfig()
+	}
+	c.SyntaxFlow.ResultSaveKind = SFResultSaveDatabase
+}
+
+func (c *Config) SetSyntaxFlowResultSaveMemory() {
+	if c == nil {
+		return
+	}
+	if c.SyntaxFlow == nil {
+		c.SyntaxFlow = defaultSyntaxFlowConfig()
+	}
+	c.SyntaxFlow.ResultSaveKind = SFResultSaveMemory
+}
+
+func (c *Config) GetSyntaxFlowProcessCallback() func(float64, string) {
+	if c.SyntaxFlow == nil {
+		c.SyntaxFlow = defaultSyntaxFlowConfig()
+	}
+	return c.SyntaxFlow.ProcessCallback
+}
+
+func (c *Config) SetSyntaxFlowProcessCallback(processCallback func(float64, string)) {
+	if c == nil {
+		return
+	}
+	if c.SyntaxFlow == nil {
+		c.SyntaxFlow = defaultSyntaxFlowConfig()
+	}
+	c.SyntaxFlow.ProcessCallback = processCallback
+}
+
+// --- 扫描配置 Get 方法 ---
+
+func (c *Config) GetSyntaxFlowMemory() bool {
+	if c == nil || (c.Mode&ModeSyntaxFlow == 0 && c.Mode&ModeSyntaxFlowScanManager == 0) {
+		return false
+	}
+	if c.SyntaxFlow == nil {
+		c.SyntaxFlow = defaultSyntaxFlowConfig()
+	}
+	return c.SyntaxFlow.Memory
+}
+
+// GetScanMemory is a compatibility wrapper used by tests and callers.
+func (c *Config) GetScanMemory() bool {
+	if c == nil || (c.Mode&ModeSyntaxFlow == 0 && c.Mode&ModeSyntaxFlowScanManager == 0) {
+		return false
+	}
+	if c.SyntaxFlow == nil {
+		c.SyntaxFlow = defaultSyntaxFlowConfig()
+	}
+	return c.SyntaxFlow.Memory
+}
+
+func (c *Config) GetScanConcurrency() uint32 {
+	if c == nil || c.SyntaxFlowScan == nil || c.SyntaxFlowScan.Concurrency == 0 {
+		return uint32(DefaultCPUConcurrency())
+	}
+	return c.SyntaxFlowScan.Concurrency
+}
+
+// GetScanRuleTimeout returns the per-rule wall-clock budget. 0 means no budget.
+func (c *Config) GetScanRuleTimeout() time.Duration {
+	if c == nil || c.SyntaxFlowScan == nil {
+		return 0
+	}
+	return c.SyntaxFlowScan.RuleTimeout
+}
+
+// GetScanRuleWorkLimit returns the per-rule total-work budget (max fanout
+// elements per rule). 0 means no work budget (only RuleTimeout applies).
+func (c *Config) GetScanRuleWorkLimit() int64 {
+	if c == nil || c.SyntaxFlowScan == nil {
+		return 0
+	}
+	return c.SyntaxFlowScan.RuleWorkLimit
+}
+
+func (c *Config) GetScanIgnoreLanguage() bool {
+	if c == nil || c.SyntaxFlowScan == nil {
+		return false
+	}
+	return c.SyntaxFlowScan.IgnoreLanguage
+}
+
+func (c *Config) GetScanControlMode() ControlMode {
+	if c == nil || c.SyntaxFlowScan == nil {
+		return ""
+	}
+	return ControlMode(c.SyntaxFlowScan.ControlMode)
+}
+
+func (c *Config) GetScanResumeTaskId() string {
+	if c == nil || c.SyntaxFlowScan == nil {
+		return ""
+	}
+	return c.SyntaxFlowScan.ResumeTaskId
+}
+
+func (c *Config) GetScanLanguage() []Language {
+	if c == nil || c.SyntaxFlowScan == nil {
+		return nil
+	}
+	return c.SyntaxFlowScan.Language
+}
+
+// --- 扫描配置 Options ---
+
+func WithSyntaxFlowMemory(memory bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlow("Scan Memory"); err != nil {
+			return err
+		}
+		c.SyntaxFlow.Memory = memory
+		return nil
+	}
+}
+
+// WithSyntaxFlowResultKind declares how a scan result is persisted: database
+// (default for scan tasks), memory (kept in process only), or none.
+func WithSyntaxFlowResultKind(kind SFResultSaveKind) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlow("Result Save Kind"); err != nil {
+			return err
+		}
+		c.SyntaxFlow.ResultSaveKind = kind
+		return nil
+	}
+}
+
+// WithNoSaveRisk prevents risks and audit result data from being
+// persisted while keeping them available to output/report callbacks. It is
+// valid during compile mode because struct rules save through the same result
+// path after compilation.
+func WithNoSaveRisk(noSaveRisk bool) Option {
+	return func(c *Config) error {
+		if c == nil {
+			return nil
+		}
+		if c.Mode&(ModeSyntaxFlow|ModeSyntaxFlowScanManager|modeSSACompile) == 0 {
+			return utils.Errorf("Config: No Save Risk can only be set in Scan or Compile mode")
+		}
+		if c.SyntaxFlow == nil {
+			c.SyntaxFlow = defaultSyntaxFlowConfig()
+		}
+		c.SyntaxFlow.NoSaveRisk = noSaveRisk
+		return nil
+	}
+}
+
+// WithScanConcurrency 设置扫描并发数（导出名为 syntaxflow.withScanConcurrency）
+// 参数:
+//   - concurrency: 并发执行的规则数量
+//
+// 返回值:
+//   - 扫描配置可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withScanConcurrency(10)
+// println(opt)
+// ```
+func WithScanConcurrency(concurrency uint32) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Concurrency"); err != nil {
+			return err
+		}
+		c.SyntaxFlowScan.Concurrency = concurrency
+		return nil
+	}
+}
+
+// WithScanConcurrencyDefault sets scan concurrency only when the caller didn't explicitly set it.
+// This is used by high-level helpers (like syntaxflow_scan.StartScan) to avoid overriding user input.
+func WithScanConcurrencyDefault(concurrency uint32) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Concurrency Default"); err != nil {
+			return err
+		}
+		if c.SyntaxFlowScan.Concurrency <= 0 {
+			c.SyntaxFlowScan.Concurrency = concurrency
+		}
+		return nil
+	}
+}
+
+// WithScanRuleTimeout sets the per-rule wall-clock budget for a single rule
+// execution over a single program (导出名为 syntaxflow.withScanRuleTimeout).
+// When > 0, each rule query runs under a context.WithTimeout so a pathological
+// rule (e.g. dataflow(include=...) matching tens of thousands of sources on a
+// large project) is bailed at the budget instead of hanging the scan. 0 disables.
+//
+// 参数:
+//   - timeout: 单规则单程序执行的最大墙钟时间；<=0 表示不限制（兼容旧行为）
+//
+// Example:
+// ```
+// opt = syntaxflow.withScanRuleTimeout(300 * time.Second)
+// println(opt)
+// ```
+func WithScanRuleTimeout(timeout time.Duration) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Rule Timeout"); err != nil {
+			return err
+		}
+		c.SyntaxFlowScan.RuleTimeout = timeout
+		return nil
+	}
+}
+
+// WithScanRuleWorkLimit sets the per-rule total-work budget: the max number of
+// fanout elements one rule execution may process across all its opcodes
+// (导出名为 syntaxflow.withScanRuleWorkLimit). When > 0, the scan runner
+// attaches a sfvm.RuleWorkBudget to the rule; exceeding it cancels the rule ctx
+// and the rule bails with partial results (same path as WithScanRuleTimeout)
+// instead of hanging for hours on huge value-set fanout. 0 disables (only the
+// wall-clock RuleTimeout applies).
+//
+// 参数:
+//   - limit: 单规则单程序执行的最大 fanout 元素数；<=0 表示不限制
+//
+// Example:
+// ```
+// opt = syntaxflow.withScanRuleWorkLimit(50_000)
+// println(opt)
+// ```
+func WithScanRuleWorkLimit(limit int64) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Rule Work Limit"); err != nil {
+			return err
+		}
+		c.SyntaxFlowScan.RuleWorkLimit = limit
+		return nil
+	}
+}
+
+// WithScanRuleWorkLimitDefault sets the per-rule work budget only when the
+// caller didn't explicitly configure it. It is used by high-level helpers such
+// as syntaxflow_scan.StartScan so API callers get the safe CLI default while
+// explicit 0 remains disabled.
+func WithScanRuleWorkLimitDefault(limit int64) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Rule Work Limit Default"); err != nil {
+			return err
+		}
+		if c.SyntaxFlowScan.RuleWorkLimit <= 0 {
+			c.SyntaxFlowScan.RuleWorkLimit = limit
+		}
+		return nil
+	}
+}
+
+// WithScanIgnoreLanguage 设置忽略语言
+func WithScanIgnoreLanguage(ignoreLanguage bool) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Ignore Language"); err != nil {
+			return err
+		}
+		c.SyntaxFlowScan.IgnoreLanguage = ignoreLanguage
+		return nil
+	}
+}
+
+func WithScanControlMode(mode ControlMode) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Control Mode"); err != nil {
+			return err
+		}
+		c.SyntaxFlowScan.ControlMode = string(mode)
+		return nil
+	}
+}
+
+// WithScanRaw 从 ypb.SyntaxFlowScanRequest 提取配置
+func WithScanRaw(req *ypb.SyntaxFlowScanRequest) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Raw"); err != nil {
+			return err
+		}
+		if req == nil {
+			return nil
+		}
+
+		// 提取扫描配置
+		c.SyntaxFlowScan.ControlMode = req.GetControlMode()
+		c.SyntaxFlowScan.IgnoreLanguage = req.GetIgnoreLanguage()
+		c.SyntaxFlowScan.ResumeTaskId = req.GetResumeTaskId()
+		c.SyntaxFlowScan.Concurrency = req.GetConcurrency()
+
+		// SyntaxFlow
+		if err := c.ensureSyntaxFlow("Scan Raw"); err == nil {
+			c.SyntaxFlow.Memory = req.Memory
+		}
+
+		// 提取基础信息 (只有当 Base 模式启用时)
+		if c != nil && c.Mode&ModeProjectBase != 0 {
+			if c.BaseInfo == nil {
+				c.BaseInfo = defaultBaseInfo()
+			}
+			if len(req.ProgramName) > 0 {
+				c.BaseInfo.ProgramNames = req.GetProgramName()
+			}
+			if len(req.ProjectName) > 0 {
+				c.BaseInfo.ProjectName = req.GetProjectName()[0]
+			}
+			c.BaseInfo.ProjectID = req.GetSSAProjectId()
+		}
+
+		// 提取规则配置
+		if c != nil && c.Mode&ModeSyntaxFlowRule != 0 {
+			if c.SyntaxFlowRule == nil {
+				c.SyntaxFlowRule = defaultSyntaxFlowRuleConfig()
+			}
+			if req.Filter != nil {
+				c.SyntaxFlowRule.RuleFilter = req.GetFilter()
+			}
+			if req.RuleInput != nil {
+				c.SyntaxFlowRule.RuleInput = append(c.SyntaxFlowRule.RuleInput, req.GetRuleInput())
+			}
+		}
+
+		return nil
+	}
+}
+
+// WithResumeTaskId 设置要恢复的任务ID，用于恢复之前暂停的扫描任务
+func WithScanResumeTaskId(taskId string) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Resume Task Id"); err != nil {
+			return err
+		}
+		c.SyntaxFlowScan.ResumeTaskId = taskId
+		return nil
+	}
+}
+
+// WithScanLanguage 设置扫描语言
+func WithScanLanguage(language ...Language) Option {
+	return func(c *Config) error {
+		if err := c.ensureSyntaxFlowScan("Scan Language"); err != nil {
+			return err
+		}
+		c.SyntaxFlowScan.Language = language
+		return nil
+	}
+}

@@ -1,0 +1,483 @@
+package minirehs
+
+// 本文件把前端 (Go) 编译出的 rune 级 Glushkov 位并行 NFA 序列化为"平台无关只读 blob"
+// (小端、显式编码、与机器字节序/对齐无关), 作为 Go 前端与纯 C 运行期内核 (native/mvscan)
+// 的解耦契约 (见 MINI_VECTOR_SCAN_IMPL.md 第 7.3 节). C 侧 mvscan_db_open 零依赖地解析它.
+//
+// 本文件是纯 Go、不带 build tag: 即使不启用 cgo 也能编译/单测 (可对 blob 往返做结构校验),
+// 真正消费它的是 cgo 内核 (mvs_cgo.go). per-pattern NFA 与合并 always-on NFA 统一序列化为
+// "unit": 用 firstUnanchored/firstAnchored 承载锚点语义, posPat 承载命中位置->成员映射.
+//
+// 关键词: mvscan, blob, 序列化, 平台无关, 小端, 前后端契约
+
+// mvsBlobMagic / mvsBlobVersion 是 blob 头, C 侧校验. 契约一旦冻结不得随意改 (改则升 version).
+var mvsBlobMagic = [4]byte{'M', 'V', 'S', '1'}
+
+// Version 4 uses an empty consumed-position set for DFA state zero. Version 3
+// tables remain loadable, but native execution uses their original NFA instead.
+const mvsBlobVersion uint32 = 4
+
+func validMVSBlobVersion(v uint32) bool { return v == 3 || v == mvsBlobVersion }
+
+func newMVSKernel(d *mvsDB) *mvsKernel {
+	if d == nil {
+		return nil
+	}
+	d.blob = buildMVSBlob(d.nfas, d.merged, d.assertNecFactor, d.hasLiterals)
+	k := openMVSKernel(d.blob, d.n)
+	k.configureMergedSingleton(d)
+	return k
+}
+
+// mvsUnit 是 per-pattern NFA 与合并 NFA 的统一可序列化视图.
+type mvsUnit struct {
+	npos        int
+	nword       int
+	nsym        int
+	hasAnchored bool
+
+	firstUnanchored []uint64 // [nword] 每步注入的起点集 (无锚成员)
+	firstAnchored   []uint64 // [nword] 仅输入起点注入 (有锚成员)
+	lastAny         []uint64 // [nword] 任意处接受的命中位置集
+	lastEnd         []uint64 // [nword] 仅输入末尾接受 ($/\z)
+	follow          []uint64 // [npos*nword] 行优先展平
+	reach           []uint64 // [nsym*nword] 行优先展平
+	cuts            []int32  // [nsym+1] 升序切点
+	asciiSym        []int32  // [128]
+	posPat          []int32  // [npos] 命中位置->成员 idx (-1 表示非命中位置)
+
+	// LimEx 多字扩展 (v3 blob, merged NFA): 链边由整个位集左移推进，只保留异常边行。
+	hasLimEx    bool
+	chainTarget []uint64 // [nword]
+	excMask     []uint64 // [nword]
+	excFollow   []uint64 // [npos*nword]
+
+	// 断言扩展 (v2 blob, 仅 hasAssert NFA). 对应 C mvs_nfa assert 字段.
+	hasAssert bool
+	// LimEx 单字字段
+	chainTarget1    uint64
+	excMask1        uint64
+	excFollow1Flat  []uint64 // [npos]
+	condFollowMask1 uint64
+	// condFirst (条件起点注入)
+	condFirstGuard []uint8
+	condFirstBits  []uint64
+	// condFollow (条件后继, 扁平三元组)
+	condFollowPos   []int32
+	condFollowGuard []uint8
+	condFollowBits  []uint64
+	// condAccept (条件接受)
+	condAcceptGuard []uint8
+	condAcceptBits  []uint64
+	// 必要条件预过滤 (C 内核同侧检查, 零跨界开销)
+	necMinRunLen     int32
+	necRunClass      int32 // 1=digit, 2=hex
+	necRequiredByte  int32 // -1=无, 0-255
+	necRequiredCount int32
+	// DFA 转换 (小规模 NFA 确定性化)
+	hasDFA     bool
+	dfaNstates int32
+	dfaNext    []int32 // [nstates*256]
+	dfaAccept  []byte  // [nstates]
+}
+
+// unitFromNFA 把一条 per-pattern NFA 转为 unit. reportedIdx 填入命中位置的 posPat
+// (存在性执行不使用 posPat, 仅为统一结构/可观测).
+func unitFromNFA(nfa *mvsNFA, reportedIdx int, hasLiterals bool) mvsUnit {
+	zero := make([]uint64, nfa.nword)
+	u := mvsUnit{
+		npos:        nfa.npos,
+		nword:       nfa.nword,
+		nsym:        nfa.nsym,
+		hasAnchored: nfa.anchoredStart,
+		lastAny:     cloneU64(nfa.lastAny),
+		lastEnd:     cloneU64(nfa.lastEnd),
+		follow:      flattenRows(nfa.follow, nfa.npos, nfa.nword),
+		reach:       flattenRows(nfa.reach, nfa.nsym, nfa.nword),
+		cuts:        runesToI32(nfa.cuts),
+		asciiSym:    nfa.asciiSym[:],
+		posPat:      make([]int32, nfa.npos),
+	}
+	// 锚点分桶: 无锚成员 first 每步注入; 有锚成员仅起点注入. 与 existsIn 的
+	// "if !anchored || atStart: cand |= first" 等价.
+	if nfa.anchoredStart {
+		u.firstUnanchored = cloneU64(zero)
+		u.firstAnchored = cloneU64(nfa.first)
+	} else {
+		u.firstUnanchored = cloneU64(nfa.first)
+		u.firstAnchored = cloneU64(zero)
+	}
+	for p := range u.posPat {
+		u.posPat[p] = -1
+	}
+	setAcceptPos(u.posPat, nfa.lastAny, int32(reportedIdx))
+	setAcceptPos(u.posPat, nfa.lastEnd, int32(reportedIdx))
+	// DFA 转换: 仅对无字面量、无锚点、无断言的 always-on lean NFA 构建.
+	// anchoredStart/requireEnd NFA 的 DFA 死状态重置不正确 (锚点语义).
+	if !hasLiterals && !nfa.hasAssert && !nfa.anchoredStart && !nfa.requireEnd &&
+		nfa.npos <= DFA_MAX_NPOS && nfa.npos >= 2 {
+		if dfa := buildDFAFromNFA(nfa); dfa != nil {
+			u.hasDFA = true
+			u.dfaNstates = int32(dfa.nstates)
+			u.dfaNext = dfa.next
+			u.dfaAccept = dfa.accept
+		}
+	}
+	return u
+}
+
+// unitFromMerged 把合并 always-on NFA 转为 unit.
+func unitFromMerged(m *mvsMergedNFA) mvsUnit {
+	le := buildLimEx(m)
+	return mvsUnit{
+		npos:            m.npos,
+		nword:           m.nword,
+		nsym:            m.nsym,
+		hasAnchored:     m.hasAnchored,
+		firstUnanchored: cloneU64(m.firstUnanchored),
+		firstAnchored:   cloneU64(m.firstAnchored),
+		lastAny:         cloneU64(m.lastAny),
+		lastEnd:         cloneU64(m.lastEnd),
+		follow:          flattenRows(m.follow, m.npos, m.nword),
+		reach:           flattenRows(m.reach, m.nsym, m.nword),
+		cuts:            runesToI32(m.cuts),
+		asciiSym:        m.asciiSym[:],
+		posPat:          cloneI32(m.posPat),
+		hasLimEx:        true,
+		chainTarget:     cloneU64(le.chainTarget),
+		excMask:         cloneU64(le.excMask),
+		excFollow:       flattenRows(le.excFollow, m.npos, m.nword),
+	}
+}
+
+// unitFromAssertNFA 把断言 NFA (hasAssert, nword==1) 转为 unit, 含 LimEx + guard + 必要条件字段.
+func unitFromAssertNFA(nfa *mvsNFA, reportedIdx int, nec necFactor) mvsUnit {
+	u := unitFromNFA(nfa, reportedIdx, true) // assert NFA: 不构建 DFA
+	u.hasAssert = true
+	u.chainTarget1 = nfa.chainTarget1
+	u.excMask1 = nfa.excMask1
+	u.excFollow1Flat = make([]uint64, nfa.npos)
+	copy(u.excFollow1Flat, nfa.excFollow1)
+	u.condFollowMask1 = nfa.condFollowMask1
+	nw := uint64(nfa.nword)
+	// condFirst: 每个 guard 条目的 bits 为 nword 个 uint64 (单字时 nword=1, 向后兼容).
+	for _, gb := range nfa.condFirst {
+		u.condFirstGuard = append(u.condFirstGuard, uint8(gb.g))
+		for w := 0; w < int(nw); w++ {
+			if w < len(gb.bits) {
+				u.condFirstBits = append(u.condFirstBits, gb.bits[w])
+			} else {
+				u.condFirstBits = append(u.condFirstBits, 0)
+			}
+		}
+	}
+	// condFollow (扁平三元组, 每个 bits 为 nword 个 uint64)
+	for p := 0; p < nfa.npos; p++ {
+		for _, gb := range nfa.condFollow[p] {
+			u.condFollowPos = append(u.condFollowPos, int32(p))
+			u.condFollowGuard = append(u.condFollowGuard, uint8(gb.g))
+			for w := 0; w < int(nw); w++ {
+				if w < len(gb.bits) {
+					u.condFollowBits = append(u.condFollowBits, gb.bits[w])
+				} else {
+					u.condFollowBits = append(u.condFollowBits, 0)
+				}
+			}
+		}
+	}
+	// condAccept
+	for _, gb := range nfa.condAccept {
+		u.condAcceptGuard = append(u.condAcceptGuard, uint8(gb.g))
+		for w := 0; w < int(nw); w++ {
+			if w < len(gb.bits) {
+				u.condAcceptBits = append(u.condAcceptBits, gb.bits[w])
+			} else {
+				u.condAcceptBits = append(u.condAcceptBits, 0)
+			}
+		}
+	}
+	// 必要条件预过滤 (从 necFactor 提取, C 内核同侧检查)
+	if nec.hasFactor && nec.minRunLen > 0 {
+		u.necMinRunLen = int32(nec.minRunLen)
+		switch nec.runClass {
+		case byteClassDigit:
+			u.necRunClass = 1
+		case byteClassHex:
+			u.necRunClass = 2
+		default:
+			u.necMinRunLen = 0
+		}
+	}
+	u.necRequiredByte = -1
+	for b, req := range nec.requiredBytes {
+		if req > 0 {
+			u.necRequiredByte = int32(b)
+			u.necRequiredCount = int32(req)
+			break
+		}
+	}
+	return u
+}
+
+// getNecFactor 安全获取 assertNecFactors[idx] (可能为 nil 或越界).
+func getNecFactor(factors []necFactor, idx int) necFactor {
+	if factors != nil && idx < len(factors) {
+		return factors[idx]
+	}
+	return necFactor{}
+}
+
+// buildMVSBlob 把整个 db 的 per-pattern NFA (按 idx) + 合并 NFA 序列化为单段 blob.
+// hasLiterals[idx] 标记该 idx 是否有必需字面量 (有字面量的 pattern 不构建 DFA).
+func buildMVSBlob(nfas []*mvsNFA, merged *mvsMergedNFA, assertNecFactors []necFactor, hasLiterals []bool) []byte {
+	npat := len(nfas)
+	slotUnit := make([]int32, npat)
+	var units []mvsUnit
+	for idx := 0; idx < npat; idx++ {
+		if nfas[idx] == nil {
+			slotUnit[idx] = -1
+			continue
+		}
+		if nfas[idx].hasAssert {
+			slotUnit[idx] = int32(len(units))
+			units = append(units, unitFromAssertNFA(nfas[idx], idx, getNecFactor(assertNecFactors, idx)))
+			continue
+		}
+		hl := true // 默认有字面量 (保守: 不构建 DFA)
+		if hasLiterals != nil && idx < len(hasLiterals) {
+			hl = hasLiterals[idx]
+		}
+		slotUnit[idx] = int32(len(units))
+		units = append(units, unitFromNFA(nfas[idx], idx, hl))
+	}
+	mergedUnit := int32(-1)
+	if merged != nil {
+		mergedUnit = int32(len(units))
+		units = append(units, unitFromMerged(merged))
+	}
+
+	// Measure first, then write each unit straight into the final owned buffer.
+	// No intermediate encoded unit copies or extension-driven buffer growth.
+	unitSizes := make([]int, len(units))
+	dataStart := addMVSEncodedSize(addMVSEncodedSize(20, npat, 4), len(units), 8)
+	total := dataStart
+	for i := range units {
+		unitSizes[i] = encodedUnitSize(units[i])
+		total = addMVSEncodedSize(total, unitSizes[i], 1)
+	}
+	if uint64(total) > uint64(^uint32(0)) {
+		panic("minirehs: native blob size overflows uint32")
+	}
+
+	b := make([]byte, 0, total)
+	b = append(b, mvsBlobMagic[:]...)
+	b = putU32(b, mvsBlobVersion)
+	b = putU32(b, uint32(npat))
+	b = putI32(b, mergedUnit)
+	b = putU32(b, uint32(len(units)))
+	for _, s := range slotUnit {
+		b = putI32(b, s)
+	}
+	cur := dataStart
+	for _, size := range unitSizes {
+		b = putU32(b, uint32(cur))
+		cur += size
+	}
+	for _, size := range unitSizes {
+		b = putU32(b, uint32(size))
+	}
+	for i := range units {
+		b = appendMVSUnit(b, units[i])
+	}
+	return b
+}
+
+// addMVSEncodedSize checks arithmetic before allocation. The native interface
+// uses u32 offsets; these are representation limits, never silent truncation.
+func addMVSEncodedSize(size, count, stride int) int {
+	if size < 0 || count < 0 || stride <= 0 || count > (int(^uint(0)>>1)-size)/stride {
+		panic("minirehs: native unit size overflows int")
+	}
+	return size + count*stride
+}
+
+func encodedUnitSize(u mvsUnit) int {
+	n := 16
+	for _, row := range [][]uint64{u.firstUnanchored, u.firstAnchored, u.lastAny, u.lastEnd, u.follow, u.reach} {
+		n = addMVSEncodedSize(n, len(row), 8)
+	}
+	for _, row := range [][]int32{u.cuts, u.asciiSym, u.posPat} {
+		n = addMVSEncodedSize(n, len(row), 4)
+	}
+	if u.hasLimEx {
+		for _, row := range [][]uint64{u.chainTarget, u.excMask, u.excFollow} {
+			n = addMVSEncodedSize(n, len(row), 8)
+		}
+	}
+	if u.hasAssert {
+		n = addMVSEncodedSize(n, 52, 1) // Three u64, three counts and four i32.
+		for _, row := range [][]uint64{u.excFollow1Flat, u.condFirstBits, u.condFollowBits, u.condAcceptBits} {
+			n = addMVSEncodedSize(n, len(row), 8)
+		}
+		n = addMVSEncodedSize(n, len(u.condFollowPos), 4)
+		for _, row := range [][]byte{u.condFirstGuard, u.condFollowGuard, u.condAcceptGuard} {
+			n = addMVSEncodedSize(n, len(row), 1)
+		}
+	}
+	if u.hasDFA {
+		n = addMVSEncodedSize(n, 1, 4)
+		n = addMVSEncodedSize(n, len(u.dfaNext), 4)
+		n = addMVSEncodedSize(n, len(u.dfaAccept), 1)
+	}
+	return n
+}
+
+// encodeUnit 按 native/mvscan/mvscan.c parse_unit 约定的布局编码一个 unit.
+func encodeUnit(u mvsUnit) []byte {
+	return appendMVSUnit(make([]byte, 0, encodedUnitSize(u)), u)
+}
+
+func appendMVSUnit(b []byte, u mvsUnit) []byte {
+	flags := uint32(0)
+	if u.hasAnchored {
+		flags |= 1
+	}
+	if u.hasAssert {
+		flags |= 2 // bit1 = hasAssert
+	}
+	if u.hasDFA {
+		flags |= 4 // bit2 = hasDFA
+	}
+	if u.hasLimEx {
+		flags |= 8 // bit3 = hasLimEx (v3)
+	}
+	b = putU32(b, uint32(u.npos))
+	b = putU32(b, uint32(u.nword))
+	b = putU32(b, uint32(u.nsym))
+	b = putU32(b, flags)
+	b = putU64s(b, u.firstUnanchored)
+	b = putU64s(b, u.firstAnchored)
+	b = putU64s(b, u.lastAny)
+	b = putU64s(b, u.lastEnd)
+	b = putU64s(b, u.follow)
+	b = putU64s(b, u.reach)
+	b = putI32s(b, u.cuts)
+	b = putI32s(b, u.asciiSym)
+	b = putI32s(b, u.posPat)
+	// LimEx 多字扩展 (v3, flags bit3).
+	if u.hasLimEx {
+		b = putU64s(b, u.chainTarget)
+		b = putU64s(b, u.excMask)
+		b = putU64s(b, u.excFollow)
+	}
+	// 断言扩展 (v2, 仅 hasAssert):
+	if u.hasAssert {
+		b = putU64(b, u.chainTarget1)
+		b = putU64(b, u.excMask1)
+		b = putU64s(b, u.excFollow1Flat)
+		b = putU64(b, u.condFollowMask1)
+		// condFirst
+		b = putI32(b, int32(len(u.condFirstGuard)))
+		for _, g := range u.condFirstGuard {
+			b = append(b, g)
+		}
+		b = putU64s(b, u.condFirstBits)
+		// condFollow
+		b = putI32(b, int32(len(u.condFollowPos)))
+		b = putI32s(b, u.condFollowPos)
+		for _, g := range u.condFollowGuard {
+			b = append(b, g)
+		}
+		b = putU64s(b, u.condFollowBits)
+		// condAccept
+		b = putI32(b, int32(len(u.condAcceptGuard)))
+		for _, g := range u.condAcceptGuard {
+			b = append(b, g)
+		}
+		b = putU64s(b, u.condAcceptBits)
+		// 必要条件预过滤 (4 个 i32)
+		b = putI32(b, u.necMinRunLen)
+		b = putI32(b, u.necRunClass)
+		b = putI32(b, u.necRequiredByte)
+		b = putI32(b, u.necRequiredCount)
+	}
+	// DFA 扩展 (bit2 = hasDFA, 在所有字段最后)
+	if u.hasDFA {
+		b = putI32(b, u.dfaNstates)
+		b = putI32s(b, u.dfaNext)
+		for _, a := range u.dfaAccept {
+			b = append(b, a)
+		}
+	}
+	return b
+}
+
+// ---- 小端编码 helper ----
+
+func putU32(b []byte, v uint32) []byte {
+	return append(b, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+}
+
+func putI32(b []byte, v int32) []byte { return putU32(b, uint32(v)) }
+
+func putU64(b []byte, v uint64) []byte {
+	return append(b, byte(v), byte(v>>8), byte(v>>16), byte(v>>24),
+		byte(v>>32), byte(v>>40), byte(v>>48), byte(v>>56))
+}
+
+func putU64s(b []byte, vs []uint64) []byte {
+	for _, v := range vs {
+		b = putU64(b, v)
+	}
+	return b
+}
+
+func putI32s(b []byte, vs []int32) []byte {
+	for _, v := range vs {
+		b = putI32(b, v)
+	}
+	return b
+}
+
+// ---- 结构辅助 ----
+
+func cloneU64(in []uint64) []uint64 {
+	out := make([]uint64, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneI32(in []int32) []int32 {
+	out := make([]int32, len(in))
+	copy(out, in)
+	return out
+}
+
+func runesToI32(in []rune) []int32 {
+	out := make([]int32, len(in))
+	for i, r := range in {
+		out[i] = int32(r)
+	}
+	return out
+}
+
+// flattenRows 把 rows*cols 的二维位集行优先展平; 行缺失/不足时补零, 保证长度恒为 rows*cols.
+func flattenRows(rows [][]uint64, nrows, cols int) []uint64 {
+	out := make([]uint64, nrows*cols)
+	for r := 0; r < nrows && r < len(rows); r++ {
+		row := rows[r]
+		for c := 0; c < cols && c < len(row); c++ {
+			out[r*cols+c] = row[c]
+		}
+	}
+	return out
+}
+
+// setAcceptPos 把 bitset bs 中每个置位下标 p 的 posPat[p] 设为 idx.
+func setAcceptPos(posPat []int32, bs []uint64, idx int32) {
+	forEachSetBit(bs, func(p int) {
+		if p >= 0 && p < len(posPat) {
+			posPat[p] = idx
+		}
+	})
+}

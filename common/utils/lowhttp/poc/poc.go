@@ -1,0 +1,3813 @@
+package poc
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/corpix/uarand"
+	utls "github.com/yaklang/yaklang/common/third_party/utls"
+	"github.com/samber/lo"
+	"github.com/yaklang/yaklang/common/utils/cli"
+
+	"github.com/yaklang/yaklang/common/consts"
+	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/mutate"
+	"github.com/yaklang/yaklang/common/netx"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/lowhttp"
+	"github.com/yaklang/yaklang/common/utils/lowhttp/http_struct"
+	"github.com/yaklang/yaklang/common/yak/yaklib/codec"
+
+	"github.com/pkg/errors"
+
+	"github.com/davecgh/go-spew/spew"
+)
+
+var (
+	defaultWaitTime    = time.Duration(100) * time.Millisecond
+	defaultMaxWaitTime = time.Duration(2000) * time.Millisecond
+	defaultTimeout     = time.Duration(15000) * time.Millisecond
+)
+
+type PocConfig struct {
+	Host                     string
+	Port                     int
+	ForceHttps               *bool
+	ForceHttp2               *bool
+	SNI                      *string
+	Timeout                  *time.Duration
+	ConnectTimeout           *time.Duration
+	RetryTimes               *int
+	RetryInStatusCode        []int
+	RetryNotInStatusCode     []int
+	RetryWaitTime            *time.Duration
+	RetryMaxWaitTime         *time.Duration
+	RedirectTimes            *int
+	NoRedirect               *bool
+	Proxy                    []string
+	FuzzParams               map[string][]string
+	NoFixContentLength       *bool
+	JsRedirect               *bool
+	RedirectHandler          func(bool, []byte, []byte) bool
+	Session                  string // session 标识符（cookie jar 池 key）
+	DisableSession           bool   // 为 true 时不自动分配 session，也不使用 cookie jar
+	SaveHTTPFlow             *bool
+	SaveHTTPFlowHandler      []func(*lowhttp.LowhttpResponse)
+	AfterSaveHTTPFlowHandler []func(*schema.HTTPFlow)
+	UseMITMRule              *bool
+	SaveHTTPFlowSync         *bool
+	Source                   string
+	Username                 *string
+	Password                 *string
+	FixQueryEscape           *bool
+
+	// packetHandler
+	PacketHandler []func([]byte) []byte
+
+	// websocket opt
+	// 标注是否开启 Websocket 连接？
+	Websocket bool
+
+	// 这是用来出来 Websocket 数据的
+	// 参数一为数据的 bytes
+	// 参数二为取消函数，调用将会强制断开 websocket
+	WebsocketHandler func(i []byte, cancel func())
+	// 获取 Websocket 客户端的手段，如果连接成功，Websocket 客户端在这里
+	// 可以直接 c.WriteText 即可写入数据
+	WebsocketClientHandler func(c *lowhttp.WebsocketClient)
+	// strict mode
+	// whether strictly follow RFC 6455
+	WebsocketStrictMode bool
+
+	FromPlugin string
+	RuntimeId  string
+
+	ConnectionPool bool
+
+	Context context.Context
+
+	DNSServers []string
+	DNSNoCache bool
+
+	BodyStreamHandler func([]byte, io.ReadCloser)
+	NoBodyBuffer      *bool // 禁用响应体缓冲，用于下载大文件避免内存占用
+
+	ClientHelloSpec  *utls.ClientHelloSpec
+	RandomJA3        bool
+	TLSFingerprint   string
+	HTTP2Fingerprint string
+
+	GmTLS                  bool
+	GmTLSOnly              bool
+	GmTLSPrefer            bool
+	GmTLSCipherSuites      []uint16
+	GmTLSDisableCompatMode bool
+
+	// random chunked
+	EnableRandomChunked bool
+	MinChunkedLength    int
+	MaxChunkedLength    int
+	MinChunkDelay       time.Duration
+	MaxChunkDelay       time.Duration
+	ChunkedHandler      func(id int, chunkRaw []byte, totalTime time.Duration, chunkSendTime time.Duration)
+
+	// Download related options
+	DownloadProgressCallback func(downloaded int64, total int64, percent float64)
+	DownloadFinishedCallback func(filePath string)
+	DownloadFilename         *string // manually specify filename
+	DownloadDir              *string // download save directory
+}
+
+func (c *PocConfig) IsHTTPS() bool {
+	return c.ForceHttps != nil && *c.ForceHttps
+}
+
+func (c *PocConfig) ToLowhttpOptions() []lowhttp.LowhttpOpt {
+	var opts []lowhttp.LowhttpOpt
+	if c.Host != "" {
+		opts = append(opts, lowhttp.WithHost(c.Host))
+	}
+	if c.RuntimeId != "" {
+		opts = append(opts, lowhttp.WithRuntimeId(c.RuntimeId))
+	}
+	if c.Port != 0 {
+		opts = append(opts, lowhttp.WithPort(c.Port))
+	}
+	if c.ForceHttps != nil {
+		opts = append(opts, lowhttp.WithHttps(*c.ForceHttps))
+	}
+	if c.ForceHttp2 != nil {
+		opts = append(opts, lowhttp.WithHttp2(*c.ForceHttp2))
+	}
+	if c.SNI != nil {
+		opts = append(opts, lowhttp.WithSNI(*c.SNI))
+	}
+	if c.Timeout != nil {
+		opts = append(opts, lowhttp.WithTimeout(*c.Timeout))
+	}
+	if c.RetryTimes != nil {
+		opts = append(opts, lowhttp.WithRetryTimes(*c.RetryTimes))
+	}
+	if len(c.RetryInStatusCode) > 0 {
+		opts = append(opts, lowhttp.WithRetryInStatusCode(c.RetryInStatusCode))
+	}
+	if len(c.RetryNotInStatusCode) > 0 {
+		opts = append(opts, lowhttp.WithRetryNotInStatusCode(c.RetryNotInStatusCode))
+	}
+	if c.RetryWaitTime != nil {
+		opts = append(opts, lowhttp.WithRetryWaitTime(*c.RetryWaitTime))
+	}
+	if c.RetryMaxWaitTime != nil {
+		opts = append(opts, lowhttp.WithRetryMaxWaitTime(*c.RetryMaxWaitTime))
+	}
+	if c.RedirectTimes != nil {
+		opts = append(opts, lowhttp.WithRedirectTimes(*c.RedirectTimes))
+	}
+	if c.NoRedirect != nil && *c.NoRedirect {
+		opts = append(opts, lowhttp.WithRedirectTimes(0))
+	}
+
+	if len(c.Proxy) > 0 {
+		opts = append(opts, lowhttp.WithProxy(c.Proxy...))
+	}
+
+	if c.NoFixContentLength != nil {
+		opts = append(opts, lowhttp.WithNoFixContentLength(*c.NoFixContentLength))
+	}
+	if c.FixQueryEscape != nil {
+		opts = append(opts, lowhttp.WithFixQueryEscape(*c.FixQueryEscape))
+	}
+	if c.JsRedirect != nil {
+		opts = append(opts, lowhttp.WithJsRedirect(*c.JsRedirect))
+	}
+	if c.SaveHTTPFlow != nil {
+		opts = append(opts, lowhttp.WithSaveHTTPFlow(*c.SaveHTTPFlow))
+	}
+	if c.SaveHTTPFlowHandler != nil {
+		opts = append(opts, lowhttp.WithSaveHTTPFlowHandler(c.SaveHTTPFlowHandler...))
+	}
+	if c.AfterSaveHTTPFlowHandler != nil {
+		opts = append(opts, lowhttp.WithAfterSaveHTTPFlowHandler(c.AfterSaveHTTPFlowHandler...))
+	}
+	if c.UseMITMRule != nil {
+		opts = append(opts, lowhttp.WithUseMITMRule(*c.UseMITMRule))
+	}
+	if c.SaveHTTPFlowSync != nil {
+		opts = append(opts, lowhttp.WithSaveHTTPFlowSync(*c.SaveHTTPFlowSync))
+	}
+	opts = append(opts, lowhttp.WithRedirectHandler(func(isHttps bool, req []byte, rsp []byte) bool {
+		if c.RedirectHandler == nil {
+			return true
+		}
+		return c.RedirectHandler(isHttps, req, rsp)
+	}))
+	if c.DisableSession {
+		opts = append(opts, lowhttp.WithDisableSession(true))
+	}
+	if c.Session != "" {
+		opts = append(opts, lowhttp.WithSession(c.Session))
+	}
+	if c.Source != "" {
+		opts = append(opts, lowhttp.WithSource(c.Source))
+	}
+	if c.FromPlugin != "" {
+		opts = append(opts, lowhttp.WithFromPlugin(c.FromPlugin))
+	}
+	opts = append(opts, lowhttp.WithConnPool(c.ConnectionPool))
+	if c.ConnectTimeout != nil {
+		opts = append(opts, lowhttp.WithConnectTimeout(*c.ConnectTimeout))
+	}
+	if c.Context != nil {
+		opts = append(opts, lowhttp.WithContext(c.Context))
+	}
+	if len(c.DNSServers) > 0 {
+		opts = append(opts, lowhttp.WithDNSServers(c.DNSServers))
+	}
+	opts = append(opts, lowhttp.WithDNSNoCache(c.DNSNoCache))
+
+	if c.BodyStreamHandler != nil {
+		opts = append(opts, lowhttp.WithBodyStreamReaderHandler(c.BodyStreamHandler))
+	}
+	if c.NoBodyBuffer != nil {
+		opts = append(opts, lowhttp.WithNoBodyBuffer(*c.NoBodyBuffer))
+	}
+
+	if c.Username != nil {
+		opts = append(opts, lowhttp.WithUsername(*c.Username))
+	}
+	if c.Password != nil {
+		opts = append(opts, lowhttp.WithPassword(*c.Password))
+	}
+
+	if c.ClientHelloSpec != nil {
+		opts = append(opts, lowhttp.WithClientHelloSpec(c.ClientHelloSpec))
+	}
+
+	if c.RandomJA3 {
+		opts = append(opts, lowhttp.WithRandomJA3FingerPrint(c.RandomJA3))
+	}
+	if c.TLSFingerprint != "" {
+		opts = append(opts, lowhttp.WithTLSFingerprint(c.TLSFingerprint))
+	}
+	if c.HTTP2Fingerprint != "" {
+		opts = append(opts, lowhttp.WithHTTP2Fingerprint(c.HTTP2Fingerprint))
+	}
+	if c.GmTLSOnly {
+		opts = append(opts, lowhttp.WithGmTLSOnly(c.GmTLSOnly))
+	}
+	if c.GmTLS {
+		opts = append(opts, lowhttp.WithGmTLS(c.GmTLS))
+	}
+	if c.GmTLSPrefer {
+		opts = append(opts, lowhttp.WithGmTLSPrefer(c.GmTLSPrefer))
+	}
+	if len(c.GmTLSCipherSuites) > 0 {
+		suiteIDs := make([]int, len(c.GmTLSCipherSuites))
+		for i, id := range c.GmTLSCipherSuites {
+			suiteIDs[i] = int(id)
+		}
+		opts = append(opts, lowhttp.WithGmTLSCipherSuite(suiteIDs...))
+	}
+	if c.GmTLSDisableCompatMode {
+		opts = append(opts, lowhttp.WithGmTLSDisableCompatMode())
+	}
+	if c.EnableRandomChunked {
+		opts = append(opts, lowhttp.WithEnableRandomChunked(c.EnableRandomChunked))
+		opts = append(opts, lowhttp.WithRandomChunkedLength(c.MinChunkedLength, c.MaxChunkedLength))
+		opts = append(opts, lowhttp.WithRandomChunkedDelay(c.MinChunkDelay, c.MaxChunkDelay))
+		opts = append(opts, lowhttp.WithRandomChunkedHandler(c.ChunkedHandler))
+	}
+	return opts
+}
+
+func NewDefaultPoCConfig() *PocConfig {
+	config := &PocConfig{
+		Host:                   "",
+		Port:                   0,
+		RetryTimes:             nil,
+		RetryInStatusCode:      []int{},
+		RetryNotInStatusCode:   []int{},
+		RedirectTimes:          nil,
+		Proxy:                  nil,
+		FuzzParams:             nil,
+		RedirectHandler:        nil,
+		Session:                "",
+		Source:                 "",
+		Websocket:              false,
+		WebsocketHandler:       nil,
+		WebsocketClientHandler: nil,
+		PacketHandler:          make([]func([]byte) []byte, 0),
+		Context:                nil,
+		ConnectionPool:         false,
+		DNSServers:             make([]string, 0),
+		DNSNoCache:             false,
+	}
+	return config
+}
+
+type PocConfigOption func(c *PocConfig)
+
+// params 是一个请求选项参数，用于在请求时使用传入的值，需要注意的是，它可以很方便地使用 `str.f()`或 f-string 代替
+// 参数:
+//   - i: 参数表，可以是 map 等可被转换为键值对的对象，用于替换报文中的 {{params(key)}} 占位符
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：用 params 替换报文中的 {{params(key)}} 占位符(本地构建, 不出网)
+// ```
+// // 关键词: poc.params, 占位符替换, 模板变量
+// packet = `POST /post HTTP/1.1
+// Content-Type: application/json
+// Host: pie.dev
+//
+// {"key": "{{params(a)}}"}`
+// raw = poc.BuildRequest(packet, poc.params({"a": "bbb"})) // 占位符 {{params(a)}} 被替换为 bbb
+// println(string(raw))                                      // body 变成 {"key": "bbb"}
+// assert string(raw).Contains(`"key": "bbb"`), "params placeholder should be replaced"
+// // 真实发包时同样可用: poc.HTTP(packet, poc.params({"a": "bbb"}))
+// ```
+// <|EXAMPLE_END|>
+func WithParams(i interface{}) PocConfigOption {
+	return func(c *PocConfig) {
+		c.FuzzParams = utils.InterfaceToMap(i)
+	}
+}
+
+// redirectHandler 是一个请求选项参数，用于作为重定向处理函数，如果设置了该选项，则会在重定向时调用该函数，如果该函数返回 true，则会继续重定向，否则不会重定向。其第一个参数为是否使用 https 协议，第二个参数为原始请求报文，第三个参数为原始响应报文
+// 参数:
+//   - i: 重定向处理回调函数，参数依次为是否 https、请求报文、响应报文，返回 true 表示继续重定向
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实重定向目标
+// count = 3
+// poc.Get("https://pie.dev/redirect/5", poc.redirectHandler(func(https, req, rsp) {
+// count--
+// return count >= 0
+// })) // 向 pie.edv 发起请求，使用自定义 redirectHandler 函数，使用 count 控制，进行最多3次重定向
+// ```
+func WithRedirectHandler(i func(isHttps bool, req, rsp []byte) bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RedirectHandler = i
+	}
+}
+
+// redirect 是一个请求选项参数，用于设置旧风格的 redirectHandler 函数，如果设置了该选项，则会在重定向时调用该函数，如果该函数返回 true，则会继续重定向，否则不会重定向。其第一个参数为当前的请求，第二个参数为既往的多个请求
+// 参数:
+//   - i: 重定向处理回调函数，参数依次为当前请求、既往请求列表，返回 true 表示继续重定向
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实重定向目标
+// poc.HTTP(poc.BasicRequest(), poc.redirect(func(current, vias) {
+// return true
+// })) // 向 example.com 发起请求，使用自定义 redirectHandler 函数，如果该函数返回 true，则会继续重定向，否则不会重定向
+// ```
+func WithRedirect(i func(current *http.Request, vias []*http.Request) bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RedirectHandler = func(isHttps bool, req, rsp []byte) bool {
+			reqInstance, err := lowhttp.ParseBytesToHttpRequest(req)
+			if err != nil {
+				return i(reqInstance, []*http.Request{reqInstance})
+			}
+			return i(reqInstance, []*http.Request{reqInstance})
+		}
+	}
+}
+
+// bodyStreamHandler 是一个请求选项参数，可以设置一个回调函数，如果 body 读取了，将会复制一份给这个流，在这个流中处理 body 是不会影响最终结果的，一般用于处理较长的 chunk 数据
+// 参数:
+//   - i: 流式处理回调函数，参数依次为响应头字节、响应体读取流
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实下载目标
+// // 流式处理响应体，依赖网络，此处仅作示意
+// poc.Get("https://example.com/file", poc.bodyStreamHandler(func(header, body) { io.Copy(os.Stdout, body) }))~
+// ```
+func WithBodyStreamReaderHandler(i func(r []byte, closer io.ReadCloser)) PocConfigOption {
+	return func(c *PocConfig) {
+		c.BodyStreamHandler = i
+	}
+}
+
+// noBodyBuffer 是一个请求选项参数，用于指定是否禁用响应体缓冲，设置为 true 时可以避免大文件下载时的内存占用
+// 通常与 WithBodyStreamReaderHandler 配合使用，用于流式处理大文件
+// 参数:
+//   - b: 是否禁用响应体缓冲
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实大文件下载目标
+// poc.Get("https://example.com/large-file.zip",
+//
+//	poc.noBodyBuffer(true),
+//	poc.bodyStreamHandler(func(header, body) {
+//	    // 流式处理响应体，不会将整个文件读入内存
+//	    io.Copy(file, body)
+//	}))
+//
+// ```
+func WithNoBodyBuffer(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.NoBodyBuffer = &b
+	}
+}
+
+// retryTimes 是一个请求选项参数，用于指定请求失败时的重试次数，需要搭配 retryInStatusCode 或 retryNotInStatusCode 使用，来设置在什么响应码的情况下重试
+// 参数:
+//   - t: 重试次数
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.retryTimes(5), poc.retryInStatusCode(500, 502)) // 向 example.com 发起请求，如果响应状态码500或502则进行重试，最多进行5次重试
+// ```
+func WithRetryTimes(t int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RetryTimes = &t
+	}
+}
+
+// retryInStatusCode 是一个请求选项参数，用于指定在某些响应状态码的情况下重试，需要搭配 retryTimes 使用
+// 参数:
+//   - codes: 一个或多个触发重试的响应状态码
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.retryTimes(5), poc.retryInStatusCode(500, 502)) // 向 example.com 发起请求，如果响应状态码500或502则进行重试，最多进行5次重试
+// ```
+func WithRetryInStatusCode(codes ...int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RetryInStatusCode = codes
+	}
+}
+
+// retryNotInStatusCode 是一个请求选项参数，用于指定非某些响应状态码的情况下重试，需要搭配 retryTimes 使用
+// 参数:
+//   - codes: 一个或多个状态码，响应不在这些状态码内时触发重试
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.retryTimes(5), poc.retryNotInStatusCode(200)) // 向 example.com 发起请求，如果响应状态码不等于200则进行重试，最多进行5次重试
+// ```
+func WithRetryNotInStausCode(codes ...int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RetryNotInStatusCode = codes
+	}
+}
+
+// retryWaitTime 是一个请求选项参数，用于指定重试时最小等待时间，需要搭配 retryTimes 使用，默认为0.1秒
+// 参数:
+//   - f: 最小等待时间，单位为秒
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.retryTimes(5), poc.retryNotInStatusCode(200), poc.retryWaitTime(0.1)) // 向 example.com 发起请求，如果响应状态码不等于200则进行重试，最多进行5次重试，重试时最小等待0.1秒
+// ```
+func WithRetryWaitTime(f float64) PocConfigOption {
+	return func(c *PocConfig) {
+		t := utils.FloatSecondDuration(f)
+		c.RetryWaitTime = &t
+	}
+}
+
+// retryMaxWaitTime 是一个请求选项参数，用于指定重试时最大等待时间，需要搭配 retryTimes 使用，默认为2秒
+// 参数:
+//   - f: 最大等待时间，单位为秒
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.retryTimes(5), poc.retryNotInStatusCode(200), poc.retryMaxWaitTime(2)) // 向 example.com 发起请求，如果响应状态码不等于200则进行重试，最多进行5次重试，重试时最多等待2秒
+// ```
+func WithRetryMaxWaitTime(f float64) PocConfigOption {
+	return func(c *PocConfig) {
+		t := utils.FloatSecondDuration(f)
+		c.RetryMaxWaitTime = &t
+	}
+}
+
+// redirectTimes 是一个请求选项参数，用于指定最大重定向次数，默认为5次
+// 参数:
+//   - t: 最大重定向次数
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.redirectTimes(5)) // 向 example.com 发起请求，如果响应重定向到其他链接，则会自动跟踪重定向最多5次
+// ```
+func WithRedirectTimes(t int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RedirectTimes = &t
+	}
+}
+
+// noFixContentLength 是一个请求选项参数，用于指定是否修复响应报文中的 Content-Length 字段，默认为 false 即会自动修复Content-Length字段
+// 参数:
+//   - b: 为 true 时不自动修复 Content-Length
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.noFixContentLength()) // 向 example.com 发起请求，如果响应报文中的Content-Length字段不正确或不存在	也不会自动修复
+// ```
+func WithNoFixContentLength(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.NoFixContentLength = &b
+	}
+}
+
+// noRedirect 是一个请求选项参数，用于指定是否跟踪重定向，默认为 false 即会自动跟踪重定向
+// 参数:
+//   - b: 为 true 时不跟踪重定向
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.noRedirect()) // 向 example.com 发起请求，如果响应重定向到其他链接也不会自动跟踪重定向
+// ```
+func WithNoRedirect(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.NoRedirect = &b
+	}
+}
+
+// proxy 是一个请求选项参数，用于指定请求使用的代理，可以指定多个代理，默认会使用系统代理
+// 参数:
+//   - proxies: 一个或多个代理地址，如 http://127.0.0.1:7890
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标与代理
+// poc.HTTP(poc.BasicRequest(), poc.proxy("http://127.0.0.1:7890")) // 向 example.com 发起请求，使用 http://127.0.0.1:7890 代理
+// ```
+func WithProxy(proxies ...string) PocConfigOption {
+	return func(c *PocConfig) {
+		data := utils.StringArrayFilterEmpty(proxies)
+		if len(data) > 0 {
+			c.Proxy = proxies
+		}
+	}
+}
+
+// https 是一个请求选项参数，用于指定是否使用 https 协议，默认为 false 即使用 http 协议
+// 参数:
+//   - isHttps: 是否使用 https 协议
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTPS 目标
+// poc.HTTP(poc.BasicRequest(), poc.https(true)) // 向 example.com 发起请求，使用 https 协议
+// ```
+func WithForceHTTPS(isHttps bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.ForceHttps = &isHttps
+	}
+}
+
+// http2 是一个请求选项参数，用于指定是否使用 http2 协议，默认为 false 即使用http1协议
+// 参数:
+//   - isHttp2: 是否使用 http2 协议
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP2 目标
+// poc.Get("https://www.example.com", poc.http2(true), poc.https(true)) // 向 www.example.com 发起请求，使用 http2 协议
+// ```
+func WithForceHTTP2(isHttp2 bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.ForceHttp2 = &isHttp2
+	}
+}
+
+// sni 是一个请求选项参数，用于指定使用 tls(https) 协议时的 服务器名称指示(SNI)
+// 参数:
+//   - sni: 服务器名称指示(SNI)域名
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTPS 目标
+// poc.Get("https://www.example.com", poc.sni("google.com"))
+// ```
+func WithSNI(sni string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.SNI = &sni
+	}
+}
+
+// username 是一个请求选项参数，用于指定认证时的用户名
+// 参数:
+//   - username: 认证用户名
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://www.example.com", poc.username("admin"), poc.password("admin"))
+// ```
+func WithUsername(username string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Username = &username
+	}
+}
+
+// password 是一个请求选项参数，用于指定认证时的密码
+// 参数:
+//   - password: 认证密码
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://www.example.com", poc.username("admin"), poc.password("admin"))
+// ```
+func WithPassword(password string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Password = &password
+	}
+}
+
+// timeout 是一个请求选项参数，用于指定读取超时时间，默认为15秒
+// 参数:
+//   - f: 读取超时时间，单位为秒
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://www.example.com", poc.timeout(15)) // 向 www.baidu.com 发起请求，读取超时时间为15秒
+// ```
+func WithTimeout(f float64) PocConfigOption {
+	return func(c *PocConfig) {
+		t := utils.FloatSecondDuration(f)
+		c.Timeout = &t
+	}
+}
+
+// connectTimeout 是一个请求选项参数，用于指定连接超时时间，默认为15秒
+// 参数:
+//   - f: 连接超时时间，单位为秒
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://www.example.com", poc.connectTimeout(15)) // 向 www.example.com 发起请求，连接超时时间为15秒
+// ```
+func WithConnectTimeout(f float64) PocConfigOption {
+	return func(c *PocConfig) {
+		t := utils.FloatSecondDuration(f)
+		c.ConnectTimeout = &t
+	}
+}
+
+// host 是一个请求选项参数，用于指定实际请求的 host，如果没有设置该请求选项，则会依据原始请求报文中的Host字段来确定实际请求的host
+// 参数:
+//   - h: 实际请求的 host
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.HTTP(poc.BasicRequest(), poc.host("yaklang.com")) // 实际上请求 yaklang.com
+// ```
+func WithHost(h string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Host = h
+	}
+}
+
+// runtimeID 是一个请求选项参数，用于为此次请求指定运行时 ID，便于关联与追踪请求记录
+// 参数:
+//   - r: 运行时 ID
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 指定运行时 ID，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://example.com", poc.runtimeID("task-001"))~
+// ```
+func WithRuntimeId(r string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RuntimeId = r
+	}
+}
+
+// fromPlugin 是一个请求选项参数，用于标记此次请求来源于哪个插件，便于请求记录的归类与溯源
+// 参数:
+//   - b: 来源插件的名称/标识
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 标记请求来源插件，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://example.com", poc.fromPlugin("my-plugin"))~
+// ```
+func WithFromPlugin(b string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.FromPlugin = b
+	}
+}
+
+// json 是一个请求选项参数，用于指定请求的 body 为 json 格式，需要传入一个任意类型的参数，会自动转换为 json 格式
+// 参数:
+//   - i: 任意类型的值，会被序列化为 JSON 作为请求体
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：用 json 选项设置 JSON 请求体(本地构建可验证)
+// ```
+// // 关键词: poc.json, JSON请求体, 自动设置Content-Type
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.json({"a": "b"})) // 自动序列化并设置 Content-Type
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "Content-Type") == "application/json", "should set json content-type"
+// assert string(poc.GetHTTPPacketBody(raw)) == `{"a":"b"}`, "body should be json"
+// // 真实发包: poc.Post("https://www.example.com", poc.json({"a": "b"}))
+// ```
+// <|EXAMPLE_END|>
+func WithJSON(i any) PocConfigOption {
+	raw, err := json.Marshal(i)
+	if err != nil {
+		log.Errorf("poc WithJson Failed: %v", err)
+		return func(c *PocConfig) {
+
+		}
+	}
+	return func(c *PocConfig) {
+		WithReplaceHttpPacketHeader("Content-Type", "application/json")(c)
+		WithReplaceHttpPacketBody(raw, false)(c)
+	}
+}
+
+// body 是一个请求选项参数，用于指定请求的 body，需要传入一个任意类型的参数，如果不是 string 或者 bytes 会抛出日志并忽略。
+// 参数:
+//   - i: 请求体内容，需为 string 或 bytes 类型
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：用 body 选项设置请求体(本地构建可验证)
+// ```
+// // 关键词: poc.body, 设置请求体
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.body("a=b&c=d")) // body 接收 string 或 bytes
+// println(string(raw))
+// assert string(poc.GetHTTPPacketBody(raw)) == "a=b&c=d", "body should be set"
+// // 真实发包: poc.Post("https://www.example.com", poc.body("a=b"))
+// ```
+// <|EXAMPLE_END|>
+func WithBody(i any) PocConfigOption {
+	return func(c *PocConfig) {
+		switch i.(type) {
+		case string, []byte:
+			WithReplaceHttpPacketBody(utils.InterfaceToBytes(i), false)(c)
+		default:
+			log.Warnf("poc WithBody Failed: %#v", i)
+		}
+	}
+}
+
+// query 是一个请求选项参数，用于指定请求的 query 参数，需要传入一个任意类型的参数，会自动转换为 query 参数
+// 如果输入的是 map 类型，则会自动转换为 query 参数，例如：{"a": "b"} 转换为 a=b
+// 如果输入的是其他，会把字符串结果直接作为 query 设置
+// 参数:
+//   - i: query 参数，可以是 map（键值对）或字符串（原始 query）
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：用 query 选项设置 GET 参数(本地构建可验证)
+// ```
+// // 关键词: poc.query, 设置GET参数, map或原始字符串
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.query({"a": "b", "c": "d"})) // map 形式自动拼接
+// println(string(raw))
+// assert string(raw).Contains("a=b"), "query a=b should be set"
+// // 也可直接传原始 query 字符串: poc.query("a=b")
+// // 真实发包: poc.Get("https://www.example.com", poc.query({"a": "b"}))
+// ```
+// <|EXAMPLE_END|>
+func WithQuery(i any) PocConfigOption {
+	return func(c *PocConfig) {
+		if utils.IsMap(i) {
+			for k, raw := range utils.InterfaceToMap(i) {
+				if len(raw) > 0 {
+					for _, v := range raw {
+						WithAppendQueryParam(k, utils.InterfaceToString(v))(c)
+					}
+				} else {
+					WithAppendQueryParam(k, "")(c)
+				}
+			}
+		} else {
+			WithReplaceHttpPacketQueryParamRaw(utils.InterfaceToString(i))(c)
+		}
+	}
+}
+
+// postData 是一个请求选项参数，用于指定请求的 body 为 post 数据，需要传入一个任意类型的参数，会自动转换为 post 数据
+// 输入是原始字符串，不会修改 Content-Type
+// 参数:
+//   - i: POST 请求体的原始字符串内容
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：用 postData 设置原始 POST body(不改 Content-Type, 本地可验证)
+// ```
+// // 关键词: poc.postData, 原始POST数据
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.postData("a=b&c=d")) // 原样写入 body, 不修改 Content-Type
+// println(string(raw))
+// assert string(poc.GetHTTPPacketBody(raw)) == "a=b&c=d", "post data should be set"
+// // 真实发包: poc.Post("https://www.example.com", poc.postData("a=b"))
+// ```
+// <|EXAMPLE_END|>
+func WithPostData(i string) PocConfigOption {
+	return func(c *PocConfig) {
+		WithReplaceHttpPacketBody([]byte(i), false)(c)
+	}
+}
+
+// postParams 是一个请求选项参数，用于指定请求的 body 为 post 数据，需要传入一个任意类型的参数，会自动转换为 post 数据
+// 输入是 map 类型，会自动转换为 post 数据，同时会自动设置 Content-Type 为 application/x-www-form-urlencoded
+// 参数:
+//   - i: POST 参数，map 类型时自动转为表单数据，否则作为原始字符串
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：用 postParams 设置表单 POST 参数(本地构建可验证)
+// ```
+// // 关键词: poc.postParams, 表单POST参数, 自动设置Content-Type
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.postParams({"a": "b"})) // map 自动转表单并设置 Content-Type
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "Content-Type") == "application/x-www-form-urlencoded", "should set form content-type"
+// assert string(poc.GetHTTPPacketBody(raw)).Contains("a=b"), "form body should contain a=b"
+// // 真实发包: poc.Post("https://www.example.com", poc.postParams({"a": "b"}))
+// ```
+// <|EXAMPLE_END|>
+func WithPostParams(i any) PocConfigOption {
+	return func(c *PocConfig) {
+		if utils.IsMap(i) {
+			WithReplaceHttpPacketHeader("Content-Type", "application/x-www-form-urlencoded")(c)
+			for k, v := range utils.InterfaceToMap(i) {
+				if len(v) == 0 {
+					WithReplaceHttpPacketPostParam(k, "")(c)
+				} else {
+					for _, vv := range v {
+						WithAppendPostParam(k, utils.InterfaceToString(vv))(c)
+					}
+				}
+			}
+		} else {
+			WithPostData(utils.InterfaceToString(i))(c)
+		}
+	}
+}
+
+// randomJA3 是一个请求选项参数，用于指定是否启用随机 JA3 指纹，默认为 false
+// 参数:
+//   - b: 是否启用随机 JA3 指纹
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 启用随机 JA3 指纹，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实 HTTPS 目标
+// poc.Get("https://example.com", poc.https(true), poc.randomJA3(true))~
+// ```
+func WithRandomJA3(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.RandomJA3 = b
+	}
+}
+
+// WithTLSFingerprint selects a built-in TLS fingerprint profile.
+// Available profiles can be queried with TLSFingerprintProfiles.
+func WithTLSFingerprint(name string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.TLSFingerprint = name
+	}
+}
+
+func TLSFingerprintProfiles() []string {
+	return netx.AvailableClientHelloProfiles()
+}
+
+// WithHTTP2Fingerprint selects a built-in HTTP/2 framing fingerprint profile.
+// Available profiles can be queried with HTTP2FingerprintProfiles. It is
+// independent of WithTLSFingerprint and only takes effect on h2 connections.
+func WithHTTP2Fingerprint(name string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.HTTP2Fingerprint = name
+	}
+}
+
+func HTTP2FingerprintProfiles() []string {
+	return lowhttp.AvailableHTTP2Profiles()
+}
+
+// not export
+func WithClientHelloSpec(spec *utls.ClientHelloSpec) PocConfigOption {
+	return func(c *PocConfig) {
+		c.ClientHelloSpec = spec
+	}
+}
+
+// websocket 是一个请求选项参数，用于允许将链接升级为 websocket，此时发送的请求应该为 websocket 握手请求
+// 参数:
+//   - w: 是否允许升级为 websocket
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// rsp, req, err = poc.HTTP(`GET / HTTP/1.1
+// Connection: Upgrade
+// Upgrade: websocket
+// Sec-Websocket-Version: 13
+// Sec-Websocket-Extensions: permessage-deflate; client_max_window_bits
+// Host: echo.websocket.events
+// Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7
+// Sec-Websocket-Key: L31R1As+71fwuXqhwhABuA==`,
+//
+//	poc.proxy("http://127.0.0.1:7890"), poc.websocketFromServer(func(rsp, cancel) {
+//		    dump(rsp)
+//		}), poc.websocketOnClient(func(c) {
+//		    c.WriteText("123")
+//		}), poc.websocket(true),
+//
+// )
+// time.Sleep(100)
+// ```
+func WithWebsocket(w bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Websocket = w
+	}
+}
+
+// websocketFromServer 是一个请求选项参数，它接收一个回调函数，这个函数有两个参数，其中第一个参数为服务端发送的数据，第二个参数为取消函数，调用将会强制断开 websocket
+// 参数:
+//   - w: 回调函数，参数依次为服务端数据、取消函数
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// rsp, req, err = poc.HTTP(`GET / HTTP/1.1
+// Connection: Upgrade
+// Upgrade: websocket
+// Sec-Websocket-Version: 13
+// Sec-Websocket-Extensions: permessage-deflate; client_max_window_bits
+// Host: echo.websocket.events
+// Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7
+// Sec-Websocket-Key: L31R1As+71fwuXqhwhABuA==`,
+//
+//	poc.proxy("http://127.0.0.1:7890"), poc.websocketFromServer(func(rsp, cancel) {
+//		    dump(rsp)
+//		}), poc.websocketOnClient(func(c) {
+//		    c.WriteText("123")
+//		}), poc.websocket(true),
+//
+// )
+// time.Sleep(100)
+// ```
+func WithWebsocketHandler(w func(i []byte, cancel func())) PocConfigOption {
+	return func(c *PocConfig) {
+		c.WebsocketHandler = w
+	}
+}
+
+// websocketOnClient 是一个请求选项参数，它接收一个回调函数，这个函数有一个参数，是WebsocketClient结构体，通过该结构体可以向服务端发送数据
+// 参数:
+//   - w: 回调函数，参数为 WebsocketClient 客户端对象
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// rsp, req, err = poc.HTTP(`GET / HTTP/1.1
+// Connection: Upgrade
+// Upgrade: websocket
+// Sec-Websocket-Version: 13
+// Sec-Websocket-Extensions: permessage-deflate; client_max_window_bits
+// Host: echo.websocket.events
+// Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7
+// Sec-Websocket-Key: L31R1As+71fwuXqhwhABuA==`,
+//
+//	poc.proxy("http://127.0.0.1:7890"), poc.websocketFromServer(func(rsp, cancel) {
+//		    dump(rsp)
+//		}), poc.websocketOnClient(func(c) {
+//		    c.WriteText("123")
+//		}), poc.websocket(true),
+//
+// )
+// time.Sleep(100)
+// ```
+func WithWebsocketClientHandler(w func(c *lowhttp.WebsocketClient)) PocConfigOption {
+	return func(c *PocConfig) {
+		c.WebsocketClientHandler = w
+	}
+}
+
+// websocketStrictMode 是一个请求选项参数，它用于控制是否启用严格模式，如果启用严格模式，则会遵循 RFC 6455 规范
+// 参数:
+//   - b: 是否启用严格模式
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// rsp, req, err = poc.HTTP(`GET / HTTP/1.1
+// Connection: Upgrade
+// Upgrade: websocket
+// Sec-Websocket-Version: 13
+// Sec-Websocket-Extensions: permessage-deflate; client_max_window_bits
+// Host: echo.websocket.events
+// Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7
+// Sec-Websocket-Key: L31R1As+71fwuXqhwhABuA==`,
+// poc.proxy("http://127.0.0.1:7890"), poc.websocketStrictMode(true))
+//
+// time.Sleep(100)
+// ```
+func WithWebsocketStrictMode(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.WebsocketStrictMode = b
+	}
+}
+
+// port 是一个请求选项参数，用于指定实际请求的端口，如果没有设置该请求选项，则会依据原始请求报文中的Host字段来确定实际请求的端口
+// 参数:
+//   - port: 实际请求的端口
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTPS 目标
+// poc.HTTP(poc.BasicRequest(), poc.host("yaklang.com"), poc.port(443), poc.https(true)) // 实际上请求 yaklang.com 的443端口
+// ```
+func WithPort(port int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Port = port
+	}
+}
+
+// jsRedirect 是一个请求选项参数，用于指定是否跟踪JS重定向，默认为false即不会自动跟踪JS重定向
+// 参数:
+//   - b: 是否跟踪 JS 重定向
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.HTTP(poc.BasicRequest(), poc.redirectTimes(5), poc.jsRedirect(true)) // 向 www.baidu.com 发起请求，如果响应重定向到其他链接也会自动跟踪JS重定向，最多进行5次重定向
+// ```
+func WithJSRedirect(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.JsRedirect = &b
+	}
+}
+
+// session 是一个请求选项参数，用于指定请求的 session 标识（string），同一 session 共享 cookie jar，适合登录后连续请求
+// 参数:
+//   - session: session 标识符
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://pie.dev/cookies/set/AAA/BBB", poc.session("test")) // 向 pie.dev 发起第一次请求，这会设置一个名为AAA，值为BBB的cookie
+// rsp, req, err = poc.Get("https://pie.dev/cookies", poc.session("test")) // 向 pie.dev 发起第二次请求，这个请求会输出所有的cookies，可以看到第一次请求设置的cookie已经存在了
+// ```
+func WithSession(session string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Session = session
+	}
+}
+
+// disableSession 为 true 时不自动分配 session，也不启用 cookie jar（适合无需 cookie 的探测请求）
+// 参数:
+//   - b: 是否禁用 session 与 cookie jar
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 禁用 session，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://example.com", poc.disableSession(true))~
+// ```
+func WithDisableSession(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.DisableSession = b
+	}
+}
+
+// save 是一个请求选项参数，用于指定是否将此次请求的记录保存在数据库中，默认为true即会保存到数据库
+// 参数:
+//   - b: 是否将请求记录保存到数据库
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://exmaple.com", poc.save(true)) // 向 example.com 发起请求，会将此次请求保存到数据库中
+// ```
+func WithSave(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.SaveHTTPFlow = &b
+	}
+}
+
+// saveHandler 是一个请求选项参数，用于设置在将此次请求存入数据库之前的回调函数
+// 参数:
+//   - f: 一个或多个回调函数，参数为 LowhttpResponse，在保存前调用
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+//
+//	// 无法本地验证: 需要可达的真实目标
+//	poc.Get("https://exmaple.com", poc.saveHandler(func(resp){
+//		resp.Tags = append(resp.Tags,"test")
+//	})) // 向 example.com 发起请求，添加test tag
+//
+// ```
+func WithSaveHandler(f ...func(response *lowhttp.LowhttpResponse)) PocConfigOption {
+	return func(c *PocConfig) {
+		if c.SaveHTTPFlowHandler == nil {
+			c.SaveHTTPFlowHandler = make([]func(*lowhttp.LowhttpResponse), 0)
+		}
+		c.SaveHTTPFlowHandler = append(c.SaveHTTPFlowHandler, f...)
+	}
+}
+
+// afterSaveHandler 是一个请求选项参数，用于设置在此次请求记录保存到数据库之后的回调函数
+// 参数:
+//   - f: 一个或多个回调函数，参数为已保存的 HTTPFlow 对象
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 保存后回调，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://example.com", poc.save(true), poc.afterSaveHandler(func(flow) { println(flow.Url) }))~
+// ```
+func WithAfterSaveHandler(f ...func(flow *schema.HTTPFlow)) PocConfigOption {
+	return func(c *PocConfig) {
+		if c.AfterSaveHTTPFlowHandler == nil {
+			c.AfterSaveHTTPFlowHandler = make([]func(*schema.HTTPFlow), 0)
+		}
+		c.AfterSaveHTTPFlowHandler = append(c.AfterSaveHTTPFlowHandler, f...)
+	}
+}
+
+// useMitmRule 是一个请求选项参数，用于指定是否使用MITM规则，默认为false即不会使用MITM规则，使用规则可以完成流量染色，附加tag与提取数据的功能
+// 参数:
+//   - b: 是否使用 MITM 规则
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://exmaple.com", poc.save(true), poc.useMitmRule(true))
+// ```
+func WithMITMRule(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.UseMITMRule = &b
+	}
+}
+
+// saveSync 是一个请求选项参数，用于指定是否将此次请求的记录保存在数据库中，且同步保存，默认为false即会异步保存到数据库
+// 参数:
+//   - b: 是否同步保存到数据库
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://exmaple.com", poc.save(true), poc.saveSync(true)) // 向 example.com 发起请求，会将此次请求保存到数据库中，且同步保存
+// ```
+func WithSaveSync(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.SaveHTTPFlowSync = &b
+	}
+}
+
+// source 是一个请求选项参数，用于在请求记录保存到数据库时标识此次请求的来源
+// 参数:
+//   - i: 请求来源标识
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://exmaple.com", poc.save(true), poc.source("test")) // 向 example.com 发起请求，会将此次请求保存到数据库中，指示此次请求的来源为test
+// ```
+func WithSource(i string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Source = i
+	}
+}
+
+// connPool 是一个请求选项参数，用于指定是否使用连接池，默认不使用连接池
+// 参数:
+//   - b: 是否使用连接池
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// rsp, req, err = poc.HTTP(x`POST /post HTTP/1.1
+// Content-Type: application/json
+// Host: pie.dev
+//
+// {"key": "asd"}`, poc.connPool(true)) // 使用连接池发送请求，这在发送多个请求时非常有用
+// ```
+func WithConnPool(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.ConnectionPool = b
+	}
+}
+
+// context 是一个请求选项参数，用于指定请求的上下文
+// 参数:
+//   - ctx: 上下文对象，可用于取消请求
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// ctx = context.New()
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://exmaple.com", poc.context(ctx)) // 向 example.com 发起请求，使用指定的上下文
+// ```
+func WithContext(ctx context.Context) PocConfigOption {
+	return func(c *PocConfig) {
+		c.Context = ctx
+	}
+}
+
+// dnsServer 是一个请求选项参数，用于指定请求所使用的DNS服务器，默认使用系统自带的DNS服务器
+// 参数:
+//   - servers: 一个或多个 DNS 服务器地址
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 向 example.com 发起请求，使用指定的DNS服务器
+// 无法本地验证: 需要可达的真实目标与 DNS
+// poc.Get("https://exmaple.com", poc.dnsServer("8.8.8.8", "1.1.1.1"))
+// ```
+func WithDNSServers(servers ...string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.DNSServers = lo.Uniq(append(c.DNSServers, servers...))
+	}
+}
+
+// dnsNoCache 是一个请求选项参数，用于指定请求时不使用DNS缓存，默认使用DNS缓存
+// 参数:
+//   - b: 是否禁用 DNS 缓存
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 向 example.com 发起请求，不使用DNS缓存
+// 无法本地验证: 需要可达的真实目标
+// poc.Get("https://exmaple.com", poc.dnsNoCache(true))
+// ```
+func WithDNSNoCache(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.DNSNoCache = b
+	}
+}
+
+// replaceFirstLine 是一个请求选项参数，用于改变请求报文，修改第一行（即请求方法，请求路径，协议版本）
+// 参数:
+//   - firstLine: 新的请求行，如 "GET /test HTTP/1.1"
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换请求行(本地构建可验证)
+// ```
+// // 关键词: poc.replaceFirstLine, 修改请求行
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceFirstLine("GET /test HTTP/1.1"))
+// println(string(raw))
+// assert string(raw).Contains("GET /test HTTP/1.1"), "first line should be replaced"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketFirstLine(firstLine string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketFirstLine(packet, firstLine)
+		},
+		)
+	}
+}
+
+// replaceMethod 是一个请求选项参数，用于改变请求报文，修改请求方法
+// 参数:
+//   - method: 新的请求方法，如 GET、POST
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换请求方法(本地构建可验证)
+// ```
+// // 关键词: poc.replaceMethod, 修改请求方法
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"))
+// println(string(raw))
+// assert poc.GetHTTPRequestMethod(raw) == "POST", "method should be POST"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketMethod(method string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketMethod(packet, method)
+		},
+		)
+	}
+}
+
+// replaceHeader 是一个请求选项参数，用于改变请求报文，修改修改请求头，如果不存在则会增加
+// 参数:
+//   - key: 请求头名称
+//   - value: 请求头的值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：修改/新增请求头(本地构建可验证)
+// ```
+// // 关键词: poc.replaceHeader, 修改请求头
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceHeader("AAA", "BBB")) // 不存在则新增
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "AAA") == "BBB", "header AAA should be BBB"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketHeader(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketHeader(packet, key, value)
+		},
+		)
+	}
+}
+
+// replaceAllHeaders 是一个请求选项参数，用于改变请求报文，修改修改所有请求头
+// 参数:
+//   - headers: 请求头键值对表，会替换所有请求头
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：整体替换所有请求头(本地构建可验证)
+// ```
+// // 关键词: poc.replaceAllHeaders, 替换全部请求头
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceAllHeaders({"AAA": "BBB", "CCC": "DDD"}))
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "AAA") == "BBB", "header AAA should be set"
+// assert poc.GetHTTPPacketHeader(raw, "CCC") == "DDD", "header CCC should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceAllHttpPacketHeaders(headers map[string]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceAllHTTPPacketHeaders(packet, headers)
+		},
+		)
+	}
+}
+
+// replaceHost 是一个请求选项参数，用于改变请求报文，修改Host请求头，如果不存在则会增加，实际上是replaceHeader("Host", host)的简写
+// 参数:
+//   - host: 新的 Host 请求头的值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换 Host 请求头(本地构建可验证)
+// ```
+// // 关键词: poc.replaceHost, 修改Host
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceHost("www.yaklang.com")) // 等价于 replaceHeader("Host", ...)
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "Host") == "www.yaklang.com", "host should be replaced"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketHost(host string) PocConfigOption {
+	return WithReplaceHttpPacketHeader("Host", host)
+}
+
+// replaceBasicAuth 是一个请求选项参数，用于改变请求报文，修改 Authorization 请求头为基础认证的密文，如果不存在则会增加，实际上是replaceHeader("Authorization", codec.EncodeBase64(username + ":" + password))的简写
+// 参数:
+//   - username: 基础认证用户名
+//   - password: 基础认证密码
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：设置 HTTP 基础认证头(本地构建可验证)
+// ```
+// // 关键词: poc.replaceBasicAuth, 基础认证, Authorization
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceBasicAuth("admin", "password"))
+// println(string(raw))
+// // Authorization: Basic YWRtaW46cGFzc3dvcmQ= (即 base64("admin:password"))
+// assert poc.GetHTTPPacketHeader(raw, "Authorization") == "Basic "+codec.EncodeBase64("admin:password"), "basic auth header should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketBasicAuth(username, password string) PocConfigOption {
+	return WithReplaceHttpPacketHeader("Authorization", "Basic "+codec.EncodeBase64(username+":"+password))
+}
+
+// replaceUserAgent 是一个请求选项参数，用于改变请求报文，修改 User-Agent 请求头，实际上是replaceHeader("User-Agent", userAgent)的简写
+// 参数:
+//   - ua: 新的 User-Agent 请求头的值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换 User-Agent(本地构建可验证)
+// ```
+// // 关键词: poc.replaceUserAgent, 修改UA
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceUserAgent("yak-http-client"))
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "User-Agent") == "yak-http-client", "ua should be replaced"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketUserAgent(ua string) PocConfigOption {
+	return WithReplaceHttpPacketHeader("User-Agent", ua)
+}
+
+// replaceRandomUserAgent 是一个请求选项参数，用于改变请求报文，修改 User-Agent 请求头为随机的常见请求头
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换为随机常见 User-Agent(本地构建可验证)
+// ```
+// // 关键词: poc.replaceRandomUserAgent, 随机UA
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceRandomUserAgent())
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "User-Agent") != "", "ua should be set to a random one"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketRandomUserAgent() PocConfigOption {
+	return WithReplaceHttpPacketHeader("User-Agent", uarand.GetRandom())
+}
+
+// replaceCookie 是一个请求选项参数，用于改变请求报文，修改Cookie请求头中的值，如果不存在则会增加
+// 参数:
+//   - key: Cookie 名称
+//   - value: Cookie 的值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：设置单个 Cookie(本地构建可验证)
+// ```
+// // 关键词: poc.replaceCookie, 修改Cookie
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceCookie("aaa", "bbb")) // 不存在则新增
+// println(string(raw))
+// assert string(raw).Contains("aaa=bbb"), "cookie aaa=bbb should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketCookie(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketCookie(packet, key, value)
+		},
+		)
+	}
+}
+
+// replaceCookies 是一个请求选项参数，用于改变请求报文，修改所有Cookie请求头中的值
+// 参数:
+//   - cookies: Cookie 键值对表
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：批量设置 Cookie(本地构建可验证)
+// ```
+// // 关键词: poc.replaceCookies, 批量Cookie
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceCookies({"aaa":"bbb", "ccc":"ddd"}))
+// println(string(raw))
+// assert string(raw).Contains("aaa=bbb"), "cookie aaa=bbb should be set"
+// assert string(raw).Contains("ccc=ddd"), "cookie ccc=ddd should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketCookies(cookies any) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketCookies(packet, cookies)
+		},
+		)
+	}
+}
+
+// replaceBody 是一个请求选项参数，用于改变请求报文，修改请求体内容，第一个参数为修改后的请求体内容，第二个参数为是否分块传输
+// 参数:
+//   - body: 修改后的请求体内容
+//   - chunk: 是否使用分块传输编码
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换请求体(本地构建可验证)
+// ```
+// // 关键词: poc.replaceBody, 修改请求体
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"), poc.replaceBody("a=b", false)) // 第二个参数为是否分块传输
+// println(string(raw))
+// assert string(poc.GetHTTPPacketBody(raw)) == "a=b", "body should be a=b"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketBody(body []byte, chunk bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketBody(packet, body, chunk)
+		},
+		)
+	}
+}
+
+// replacePath 是一个请求选项参数，用于改变请求报文，修改请求路径
+// 参数:
+//   - path: 新的请求路径
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换请求路径(本地构建可验证)
+// ```
+// // 关键词: poc.replacePath, 修改请求路径
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replacePath("/get"))
+// println(string(raw))
+// assert poc.GetHTTPRequestPath(raw) == "/get", "path should be /get"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketPath(path string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketPath(packet, path)
+		},
+		)
+	}
+}
+
+// replacePathFunc 是一个请求选项参数，用于使用回调改变请求报文，修改请求路径
+// 参数:
+//   - handle: 路径处理回调函数，参数为原路径，返回新路径
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：用回调函数改写请求路径(本地构建可验证)
+// ```
+// // 关键词: poc.replacePathFunc, 回调改写路径
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replacePathFunc(func(old){
+//     return old + "/api/poc" // old 是原始路径, 这里在其后追加
+// }))
+// println(string(raw))
+// assert poc.GetHTTPRequestPath(raw).Contains("/api/poc"), "path should be rewritten by callback"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketPathFunc(handle func(string) string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketPathFunc(packet, handle)
+		},
+		)
+	}
+}
+
+func WithReplaceHttpPacketQueryParamRaw(rawQuery string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketQueryParamRaw(packet, rawQuery)
+		},
+		)
+	}
+}
+
+// replaceQueryParam 是一个请求选项参数，用于改变请求报文，修改 GET 请求参数，如果不存在则会增加
+// 参数:
+//   - key: GET 请求参数名
+//   - value: GET 请求参数值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：设置单个 GET 参数(本地构建可验证)
+// ```
+// // 关键词: poc.replaceQueryParam, 修改GET参数
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceQueryParam("a", "b")) // 不存在则新增
+// println(string(raw))
+// assert string(raw).Contains("a=b"), "query param a=b should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketQueryParam(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketQueryParam(packet, key, value)
+		},
+		)
+	}
+}
+
+// replaceAllQueryParams 是一个请求选项参数，用于改变请求报文，修改所有 GET 请求参数，如果不存在则会增加，其接收一个map[string]string 类型的参数，其中 key 为请求参数名，value 为请求参数值
+// 参数:
+//   - values: GET 请求参数键值对表，会替换所有 GET 参数
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：整体替换所有 GET 参数(本地构建可验证)
+// ```
+// // 关键词: poc.replaceAllQueryParams, 替换全部GET参数
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceAllQueryParams({"a":"b", "c":"d"}))
+// println(string(raw))
+// assert string(raw).Contains("a=b") && string(raw).Contains("c=d"), "all query params should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceAllHttpPacketQueryParams(values map[string]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceAllHTTPPacketQueryParams(packet, values)
+		},
+		)
+	}
+}
+
+// replaceAllQueryParamsWithoutEscape 是一个请求选项参数，用于改变请求报文，修改所有 GET 请求参数，如果不存在则会增加，其接收一个map[string]string 类型的参数，其中 key 为请求参数名，value 为请求参数值
+// 与 poc.replaceAllQueryParams 类似，但是不会将参数值进行转义
+// 参数:
+//   - values: GET 请求参数键值对表（值不做 URL 转义）
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换所有 GET 参数且不转义(本地构建可验证)
+// ```
+// // 关键词: poc.replaceAllQueryParamsWithoutEscape, GET参数不转义
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceAllQueryParamsWithoutEscape({"a":"{{}}", "c":"%%"})) // 值原样写入
+// println(string(raw))
+// assert string(raw).Contains("a={{}}"), "value should not be url-escaped"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceAllHttpPacketQueryParamsWithoutEscape(values map[string]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceAllHTTPPacketQueryParamsWithoutEscape(packet, values)
+		},
+		)
+	}
+}
+
+func WithReplaceFullHttpPacketQueryParamsWithoutEscape(values map[string][]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceFullHTTPPacketQueryParamsWithoutEscape(packet, values)
+		},
+		)
+	}
+}
+
+// replacePostParam 是一个请求选项参数，用于改变请求报文，修改 POST 请求参数，如果不存在则会增加
+// 参数:
+//   - key: POST 请求参数名
+//   - value: POST 请求参数值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：设置单个 POST 参数(本地构建可验证)
+// ```
+// // 关键词: poc.replacePostParam, 修改POST参数
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"), poc.replacePostParam("a", "b"))
+// println(string(raw))
+// assert string(poc.GetHTTPPacketBody(raw)).Contains("a=b"), "post param a=b should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketPostParam(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketPostParam(packet, key, value)
+		},
+		)
+	}
+}
+
+// replaceAllPostParams 是一个请求选项参数，用于改变请求报文，修改所有POST请求参数，如果不存在则会增加，其接收一个map[string]string类型的参数，其中key为POST请求参数名，value为POST请求参数值
+// 参数:
+//   - values: POST 请求参数键值对表，会替换所有 POST 参数
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：整体替换所有 POST 参数(本地构建可验证)
+// ```
+// // 关键词: poc.replaceAllPostParams, 替换全部POST参数
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"), poc.replaceAllPostParams({"a":"b", "c":"d"}))
+// println(string(raw))
+// body = string(poc.GetHTTPPacketBody(raw))
+// assert body.Contains("a=b") && body.Contains("c=d"), "all post params should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceAllHttpPacketPostParams(values map[string]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceAllHTTPPacketPostParams(packet, values)
+		},
+		)
+	}
+}
+
+// replaceAllPostParamsWithoutEscape 是一个请求选项参数，用于改变请求报文，修改所有POST请求参数，如果不存在则会增加，其接收一个map[string]string类型的参数，其中key为POST请求参数名，value为POST请求参数值
+// 与 poc.replaceAllPostParams 类似，但是不会将参数值进行转义
+// 参数:
+//   - values: POST 请求参数键值对表（值不做 URL 转义）
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：替换所有 POST 参数且不转义(本地构建可验证)
+// ```
+// // 关键词: poc.replaceAllPostParamsWithoutEscape, POST参数不转义
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"), poc.replaceAllPostParamsWithoutEscape({"a":"{{}}", "c":"%%"}))
+// println(string(raw))
+// assert string(poc.GetHTTPPacketBody(raw)).Contains("a={{}}"), "value should not be escaped"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceAllHttpPacketPostParamsWithoutEscape(values map[string]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceAllHTTPPacketPostParamsWithoutEscape(packet, values)
+		},
+		)
+	}
+}
+
+func WithReplaceFullHttpPacketPostParamsWithoutEscape(values map[string][]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceFullHTTPPacketPostParamsWithoutEscape(packet, values)
+		},
+		)
+	}
+}
+
+// replaceFormEncoded 是一个请求选项参数，用于改变请求报文，修改请求体中的表单，如果不存在则会增加
+// 参数:
+//   - key: 表单字段名
+//   - value: 表单字段值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：设置 multipart 表单字段(本地构建可验证)
+// ```
+// // 关键词: poc.replaceFormEncoded, 表单字段
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"), poc.replaceFormEncoded("aaa", "bbb"))
+// println(string(raw))
+// assert string(raw).Contains("aaa"), "form field aaa should be set"
+// assert poc.GetHTTPPacketHeader(raw, "Content-Type").Contains("multipart/form-data"), "should be multipart form"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketFormEncoded(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketFormEncoded(packet, key, value)
+		},
+		)
+	}
+}
+
+// replaceUploadFile 是一个请求选项参数，用于改变请求报文，修改请求体中的上传的文件，其中第一个参数为表单名，第二个参数为文件名，第三个参数为文件内容，第四个参数是可选参数，为文件类型(Content-Type)，如果不存在则会增加
+// 参数:
+//   - formName: 表单字段名
+//   - fileName: 文件名
+//   - fileContent: 文件内容
+//   - contentType: 可选，文件类型(Content-Type)
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：构造文件上传请求(本地构建可验证)
+// ```
+// // 关键词: poc.replaceUploadFile, 文件上传, multipart
+// raw = poc.BuildRequest(poc.BasicRequest(),
+//     poc.replaceMethod("POST"),
+//     poc.replaceUploadFile("file", "phpinfo.php", "<?php phpinfo(); ?>", "application/x-php"), // 表单名/文件名/内容/类型
+// )
+// println(string(raw))
+// assert string(raw).Contains("phpinfo.php"), "filename should be in the multipart body"
+// assert string(raw).Contains("phpinfo()"), "file content should be in the multipart body"
+// ```
+// <|EXAMPLE_END|>
+func WithReplaceHttpPacketUploadFile(formName, fileName string, fileContent []byte, contentType ...string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.ReplaceHTTPPacketUploadFile(packet, formName, fileName, fileContent, contentType...)
+		},
+		)
+	}
+}
+
+// appendHeader 是一个请求选项参数，用于改变请求报文，添加请求头
+// 参数:
+//   - key: 请求头名称
+//   - value: 请求头的值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：追加请求头(本地构建可验证)
+// ```
+// // 关键词: poc.appendHeader, 追加请求头
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.appendHeader("AAA", "BBB"))
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "AAA") == "BBB", "header AAA should be appended"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendHeader(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketHeader(packet, key, value)
+		},
+		)
+	}
+}
+
+func WithAppendHeaderIfNotExist(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketHeaderIfNotExist(packet, key, value)
+		},
+		)
+	}
+}
+
+// appendHeaders 是一个请求选项参数，用于改变请求报文，添加请求头
+// 参数:
+//   - headers: 请求头键值对表，会逐个追加
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：批量追加请求头(本地构建可验证)
+// ```
+// // 关键词: poc.appendHeaders, 批量追加请求头
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.appendHeaders({"AAA": "BBB", "CCC": "DDD"}))
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "AAA") == "BBB", "header AAA should be appended"
+// assert poc.GetHTTPPacketHeader(raw, "CCC") == "DDD", "header CCC should be appended"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendHeaders(headers map[string]string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			for key, value := range headers {
+				packet = lowhttp.AppendHTTPPacketHeader(packet, key, value)
+			}
+			return packet
+		},
+		)
+	}
+}
+
+// appendCookie 是一个请求选项参数，用于改变请求报文，添加 Cookie 请求头中的值
+// 参数:
+//   - key: Cookie 名称
+//   - value: Cookie 的值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：追加 Cookie(本地构建可验证)
+// ```
+// // 关键词: poc.appendCookie, 追加Cookie
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.appendCookie("aaa", "bbb"))
+// println(string(raw))
+// assert string(raw).Contains("aaa=bbb"), "cookie aaa=bbb should be appended"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendCookie(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketCookie(packet, key, value)
+		},
+		)
+	}
+}
+
+// appendQueryParam 是一个请求选项参数，用于改变请求报文，添加 GET 请求参数
+// 参数:
+//   - key: GET 请求参数名
+//   - value: GET 请求参数值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：追加 GET 参数(本地构建可验证)
+// ```
+// // 关键词: poc.appendQueryParam, 追加GET参数
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.appendQueryParam("a", "b"))
+// println(string(raw))
+// assert string(raw).Contains("a=b"), "query param a=b should be appended"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendQueryParam(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketQueryParam(packet, key, value)
+		},
+		)
+	}
+}
+
+// appendPostParam 是一个请求选项参数，用于改变请求报文，添加 POST 请求参数
+// 参数:
+//   - key: POST 请求参数名
+//   - value: POST 请求参数值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：追加 POST 参数(本地构建可验证)
+// ```
+// // 关键词: poc.appendPostParam, 追加POST参数
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"), poc.appendPostParam("a", "b"))
+// println(string(raw))
+// assert string(poc.GetHTTPPacketBody(raw)).Contains("a=b"), "post param a=b should be appended"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendPostParam(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketPostParam(packet, key, value)
+		},
+		)
+	}
+}
+
+// appendPath 是一个请求选项参数，用于改变请求报文，在现有请求路径后添加请求路径
+// 参数:
+//   - path: 要追加到现有路径后的路径片段
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：在现有路径后追加片段(本地构建可验证)
+// ```
+// // 关键词: poc.appendPath, 追加路径
+// base = poc.BuildRequest(poc.BasicRequest(), poc.replacePath("/docs")) // 先把路径设为 /docs
+// raw = poc.BuildRequest(base, poc.appendPath("/api/poc"))               // 再追加 /api/poc
+// println(string(raw))
+// assert poc.GetHTTPRequestPath(raw) == "/docs/api/poc", "path should be /docs/api/poc"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendHttpPacketPath(path string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketPath(packet, path)
+		},
+		)
+	}
+}
+
+// appendFormEncoded 是一个请求选项参数，用于改变请求报文，添加请求体中的表单
+// 参数:
+//   - key: 表单字段名
+//   - value: 表单字段值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：追加 multipart 表单字段(本地构建可验证)
+// ```
+// // 关键词: poc.appendFormEncoded, 追加表单字段
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.replaceMethod("POST"), poc.appendFormEncoded("aaa", "bbb"))
+// println(string(raw))
+// assert string(raw).Contains("aaa"), "form field aaa should be appended"
+// assert poc.GetHTTPPacketHeader(raw, "Content-Type").Contains("multipart/form-data"), "should be multipart form"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendHttpPacketFormEncoded(key, value string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketFormEncoded(packet, key, value)
+		},
+		)
+	}
+}
+
+// appendUploadFile 是一个请求选项参数，用于改变请求报文，添加请求体中的上传的文件，其中第一个参数为表单名，第二个参数为文件名，第三个参数为文件内容，第四个参数是可选参数，为文件类型(Content-Type)
+// 参数:
+//   - fieldName: 表单字段名
+//   - fileName: 文件名
+//   - fileContent: 文件内容
+//   - contentType: 可选，文件类型(Content-Type)
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：追加上传文件字段(本地构建可验证)
+// ```
+// // 关键词: poc.appendUploadFile, 追加上传文件
+// raw = poc.BuildRequest(poc.BasicRequest(),
+//     poc.replaceMethod("POST"),
+//     poc.appendUploadFile("file", "phpinfo.php", "<?php phpinfo(); ?>", "image/jpeg"), // 表单名/文件名/内容/类型
+// )
+// println(string(raw))
+// assert string(raw).Contains("phpinfo.php"), "filename should be in the multipart body"
+// ```
+// <|EXAMPLE_END|>
+func WithAppendHttpPacketUploadFile(fieldName, fileName string, fileContent interface{}, contentType ...string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.AppendHTTPPacketUploadFile(packet, fieldName, fileName, fileContent, contentType...)
+		},
+		)
+	}
+}
+
+// deleteHeader 是一个请求选项参数，用于改变请求报文，删除请求头
+// 参数:
+//   - key: 要删除的请求头名称
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// poc.HTTP(`GET /get HTTP/1.1
+// Content-Type: application/json
+// AAA: BBB
+// Host: pie.dev
+//
+// `, poc.deleteHeader("AAA"))// 向 pie.dev 发起请求，删除AAA请求头
+// ```
+func WithDeleteHeader(key string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.DeleteHTTPPacketHeader(packet, key)
+		},
+		)
+	}
+}
+
+// deleteCookie 是一个请求选项参数，用于改变请求报文，删除 Cookie 中的值
+// 参数:
+//   - key: 要删除的 Cookie 名称
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// poc.HTTP(`GET /get HTTP/1.1
+// Content-Type: application/json
+// Cookie: aaa=bbb; ccc=ddd
+// Host: pie.dev
+//
+// `, poc.deleteCookie("aaa"))// 向 pie.dev 发起请求，删除Cookie中的aaa
+// ```
+func WithDeleteCookie(key string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.DeleteHTTPPacketCookie(packet, key)
+		},
+		)
+	}
+}
+
+// deleteQueryParam 是一个请求选项参数，用于改变请求报文，删除 GET 请求参数
+// 参数:
+//   - key: 要删除的 GET 请求参数名
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// poc.HTTP(`GET /get?a=b&c=d HTTP/1.1
+// Content-Type: application/json
+// Host: pie.dev
+//
+// `, poc.deleteQueryParam("a")) // 向 pie.dev 发起请求，删除GET请求参数a
+// ```
+func WithDeleteQueryParam(key string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.DeleteHTTPPacketQueryParam(packet, key)
+		},
+		)
+	}
+}
+
+// deletePostParam 是一个请求选项参数，用于改变请求报文，删除 POST 请求参数
+// 参数:
+//   - key: 要删除的 POST 请求参数名
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// poc.HTTP(`POST /post HTTP/1.1
+// Content-Type: application/json
+// Content-Length: 7
+// Host: pie.dev
+//
+// a=b&c=d`, poc.deletePostParam("a")) // 向 pie.dev 发起请求，删除POST请求参数a
+// ```
+func WithDeletePostParam(key string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.DeleteHTTPPacketPostParam(packet, key)
+		},
+		)
+	}
+}
+
+// deleteForm 是一个请求选项参数，用于改变请求报文，删除 POST 请求表单
+// 参数:
+//   - key: 要删除的表单字段名
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// poc.HTTP(`POST /post HTTP/1.1
+// Host: pie.dev
+// Content-Type: multipart/form-data; boundary=------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Length: 308
+//
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="aaa"
+//
+// bbb
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="ccc"
+//
+// ddd
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm--`, poc.deleteForm("aaa")) // 向 pie.dev 发起请求，删除POST请求表单aaa
+// ```
+func WithDeleteForm(key string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.PacketHandler = append(c.PacketHandler, func(packet []byte) []byte {
+			return lowhttp.DeleteHTTPPacketForm(packet, key)
+		},
+		)
+	}
+}
+
+// randomChunked 是一个请求选项参数，用于启用随机分块传输，默认不启用
+// 参数:
+//   - b: 是否启用随机分块传输
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// data = `
+// POST /post HTTP/1.1
+// Host: pie.dev
+// Content-Type: multipart/form-data; boundary=------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Length: 308
+//
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="aaa"
+//
+// bbb
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="ccc"
+//
+// ddd
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm--
+// `
+//
+// poc.HTTP(data,poc.randomChunked(true),poc.randomChunkedLength(10,25),poc.randomChunkedDelay(50,200))~
+// ```
+func WithEnableRandomChunked(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.EnableRandomChunked = b
+	}
+}
+
+// randomChunkedLength 是一个请求选项参数，用于设置随机分块传输的分块长度范围，默认最小长度为10，最大长度为25
+// 参数:
+//   - min: 分块最小长度
+//   - max: 分块最大长度
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// data = `
+// POST /post HTTP/1.1
+// Host: pie.dev
+// Content-Type: multipart/form-data; boundary=------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Length: 308
+//
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="aaa"
+//
+// bbb
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="ccc"
+//
+// ddd
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm--
+// `
+//
+// poc.HTTP(data,poc.randomChunked(true),poc.randomChunkedLength(10,25),poc.randomChunkedDelay(50,200))~
+// ```
+func WithRandomChunkedLength(min, max int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.MinChunkedLength = min
+		c.MaxChunkedLength = max
+	}
+}
+
+// randomChunkedDelay是一个请求选项参数，用于设置随机分块传输的分块延迟范围，默认最小延迟为50毫秒，最大延迟为100毫秒
+// 参数:
+//   - min: 分块最小延迟，单位为毫秒
+//   - max: 分块最大延迟，单位为毫秒
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// data = `
+// POST /post HTTP/1.1
+// Host: pie.dev
+// Content-Type: multipart/form-data; boundary=------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Length: 308
+//
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="aaa"
+//
+// bbb
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="ccc"
+//
+// ddd
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm--
+// `
+//
+// poc.HTTP(data,poc.randomChunked(true),poc.randomChunkedLength(10,25),poc.randomChunkedDelay(50,200))~
+// ```
+func WithRandomChunkedDelay(min, max int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.MinChunkDelay = time.Duration(min) * time.Millisecond
+		c.MaxChunkDelay = time.Duration(max) * time.Millisecond
+	}
+}
+
+// randomChunkedResultHandler 是一个请求选项参数，用于设置随机分块传输的结果处理函数
+// 处理函数接受四个参数，id为分块的ID，chunkRaw为分块的原始数据，totalTime为总耗时，chunkSendTime为分块发送的耗时
+// 参数:
+//   - f: 结果处理回调函数，参数依次为分块 ID、分块原始数据、总耗时、分块发送耗时
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// data = `
+// POST /post HTTP/1.1
+// Host: pie.dev
+// Content-Type: multipart/form-data; boundary=------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Length: 308
+//
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="aaa"
+//
+// bbb
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm
+// Content-Disposition: form-data; name="ccc"
+//
+// ddd
+// --------------------------OFHnlKtUimimGcXvRSxgCZlIMAyDkuqsxeppbIFm--
+// `
+//
+// poc.HTTP(data,poc.randomChunked(true),
+// poc.randomChunkedLength(10,25),
+// poc.randomChunkedDelay(50,200),
+//
+//	poc.randomChunkedResultHandler(func(id,data,totalTime,chunkTime){
+//		print(sprintf("id:%v\tdata:%s\ttotalTime:%vms\tdelay:%vms\n", id,data,totalTime,chunkTime))
+//	}))~
+//
+// ```
+func WithRandomChunkedResultHandler(f func(id int, chunkRaw []byte, totalTime time.Duration, chunkSendTime time.Duration)) PocConfigOption {
+	return func(c *PocConfig) {
+		c.ChunkedHandler = f
+	}
+}
+
+func FixPacketByPocOptions(packet []byte, opts ...PocConfigOption) []byte {
+	config := NewDefaultPoCConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+	return fixPacketByConfig(packet, config)
+}
+
+func fixPacketByConfig(packet []byte, config *PocConfig) []byte {
+	for _, fixFunc := range config.PacketHandler {
+		packet = fixFunc(packet)
+	}
+	return packet
+}
+
+func handleUrlAndConfig(urlStr string, opts ...PocConfigOption) (*PocConfig, error) {
+	// Honor the process-level proxy without declaring a new script parameter on
+	// every request. StringSlice registers metadata and made this hot path retain
+	// one cliExtraParams object per call (and race with concurrent Help reads).
+	proxy := cli.DefaultCliApp.PeekStringSlice("proxy")
+	config := NewDefaultPoCConfig()
+	config.Proxy = proxy
+	for _, opt := range opts {
+		opt(config)
+	}
+
+	host, port, err := utils.ParseStringToHostPort(urlStr)
+	if err != nil {
+		return config, utils.Errorf("parse url failed: %s", err)
+	}
+
+	if port == 443 || strings.HasPrefix(urlStr, "https://") || strings.HasPrefix(urlStr, "wss://") {
+		https := true
+		config.ForceHttps = &https
+	}
+
+	if config.Host == "" {
+		config.Host = host
+	}
+
+	if config.Port == 0 {
+		config.Port = port
+	}
+
+	if config.NoRedirect != nil && *config.NoRedirect {
+		config.RedirectTimes = nil
+	}
+	return config, nil
+}
+
+func dumpHTTPRequestPacket(i *http.Request) ([]byte, error) {
+	if i == nil {
+		return nil, utils.Error("nil request")
+	}
+
+	req := i.Clone(i.Context())
+	if i.URL != nil {
+		req.URL = new(url.URL)
+		*req.URL = *i.URL
+	}
+	req.Header = i.Header.Clone()
+
+	lowhttp.FixRequestHostAndPort(req)
+
+	raw, err := utils.DumpHTTPRequest(req, true)
+	if err != nil {
+		return nil, utils.Errorf("dump request out failed: %s", err)
+	}
+	return raw, nil
+}
+
+func handleRawPacketAndConfig(i interface{}, opts ...PocConfigOption) ([]byte, *PocConfig, error) {
+	var packet []byte
+	switch ret := i.(type) {
+	case string:
+		packet = []byte(ret)
+	case []byte:
+		packet = ret
+	case http.Request:
+		raw, err := dumpHTTPRequestPacket(&ret)
+		if err != nil {
+			return nil, nil, err
+		}
+		packet = raw
+	case *http.Request:
+		raw, err := dumpHTTPRequestPacket(ret)
+		if err != nil {
+			return nil, nil, err
+		}
+		packet = raw
+	case *http_struct.YakHttpRequest:
+		raw, err := dumpHTTPRequestPacket(ret.Request)
+		if err != nil {
+			return nil, nil, err
+		}
+		packet = raw
+	default:
+		return nil, nil, utils.Errorf("cannot support: %s", reflect.TypeOf(i))
+	}
+
+	// Keep raw-packet requests on the same non-registering proxy lookup as URL
+	// requests; both entry points are request hot paths.
+	proxy := cli.DefaultCliApp.PeekStringSlice("proxy")
+	config := NewDefaultPoCConfig()
+	config.Proxy = proxy
+	for _, opt := range opts {
+		opt(config)
+	}
+
+	// 根据config修改packet
+	packet = fixPacketByConfig(packet, config)
+
+	// 最先应该修复数据包
+	if config.FuzzParams != nil && len(config.FuzzParams) > 0 {
+		packets, err := mutate.QuickMutate(string(packet), consts.GetGormProfileDatabase(), mutate.MutateWithExtraParams(config.FuzzParams))
+		if err != nil {
+			return nil, config, utils.Errorf("fuzz parameters failed: %v\n\nParams: \n%v", err, spew.Sdump(config.FuzzParams))
+		}
+		if len(packets) <= 0 {
+			return nil, config, utils.Error("fuzzed packets empty!")
+		}
+
+		packet = []byte(packets[0])
+	}
+
+	https := config.IsHTTPS()
+	u, err := lowhttp.ExtractURLFromHTTPRequestRaw(packet, https)
+	if err != nil {
+		return nil, config, utils.Errorf("extract url failed: %s", err)
+	}
+
+	host, port, err := utils.ParseStringToHostPort(u.String())
+	if err != nil {
+		return nil, config, utils.Errorf("parse url failed: %s", err)
+	}
+
+	if port == 443 {
+		https = true
+		config.ForceHttps = &https
+	}
+
+	if config.Host == "" {
+		config.Host = host
+	}
+
+	if config.Port == 0 {
+		config.Port = port
+	}
+
+	if config.NoRedirect != nil && *config.NoRedirect {
+		config.RedirectTimes = nil
+	}
+
+	return packet, config, nil
+}
+
+func pochttp(packet []byte, config *PocConfig) (*lowhttp.LowhttpResponse, error) {
+	if config.Websocket {
+		if config.Timeout == nil || *config.Timeout <= 0 {
+			config.Timeout = &defaultTimeout
+		}
+		wsCtx, cancel := context.WithTimeout(context.Background(), *config.Timeout)
+		defer cancel()
+
+		https := config.IsHTTPS()
+
+		c, err := lowhttp.NewWebsocketClient(
+			packet,
+			lowhttp.WithWebsocketTLS(https),
+			lowhttp.WithWebsocketProxy(config.Proxy...),
+			lowhttp.WithWebsocketWithContext(wsCtx),
+			lowhttp.WithWebsocketFromServerHandler(func(bytes []byte) {
+				if config.WebsocketHandler != nil {
+					config.WebsocketHandler(bytes, cancel)
+				} else {
+					spew.Dump(bytes)
+				}
+			}),
+			lowhttp.WithWebsocketHost(config.Host),
+			lowhttp.WithWebsocketPort(config.Port),
+			lowhttp.WithWebsocketStrictMode(config.WebsocketStrictMode),
+		)
+		if err != nil {
+			return nil, err
+		}
+		c.Start()
+		if config.WebsocketClientHandler != nil {
+			config.WebsocketClientHandler(c)
+			c.Wait()
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "websocket handshake failed")
+		}
+		return &lowhttp.LowhttpResponse{
+			RawPacket: c.Response,
+		}, nil
+	}
+
+	opts := config.ToLowhttpOptions()
+	opts = append(opts, lowhttp.WithPacketBytes(packet))
+
+	response, err := lowhttp.HTTP(opts...)
+	return response, err
+}
+
+// HTTPEx 与 HTTP 类似，它发送请求并且返回响应结构体，请求结构体以及错误，它的第一个参数可以接收 []byte, string, http.Request 结构体，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如设置超时时间，或者修改请求报文等
+// 关于结构体中的可用字段和方法可以使用 desc 函数进行查看
+// 参数:
+//   - i: 请求源，可为原始报文 []byte/string 或 *http.Request
+//   - opts: 可选的请求选项，例如 poc.https、poc.timeout、poc.replaceHeader
+//
+// 返回值:
+//   - 响应结构体 LowhttpResponse
+//   - 请求结构体 *http.Request
+//   - 错误信息，请求失败时返回非空
+//
+// <|EXAMPLE_START|> 向本地 mock 服务发送请求并读取响应结构体(可本地验证, 不出网)
+// ```
+// host, port = tcp.MockServe(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // 起本地 mock 服务
+// rsp, req = poc.HTTPEx(f"GET / HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n")~
+// assert rsp.GetStatusCode() == 200, "should get 200 from local mock"
+// ```
+// <|EXAMPLE_END|>
+// <|EXAMPLE_START|> 向真实站点发送 HTTPS 请求并改写请求头
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// rsp, req = poc.HTTPEx(`GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n`, poc.https(true), poc.replaceHeader("AAA", "BBB"))~
+// desc(rsp) // 查看响应结构体中的可用字段
+// ```
+// <|EXAMPLE_END|>
+func HTTPEx(i interface{}, opts ...PocConfigOption) (rspInst *lowhttp.LowhttpResponse, reqInst *http.Request, err error) {
+	packet, config, err := handleRawPacketAndConfig(i, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	response, err := pochttp(packet, config)
+	if err != nil {
+		return nil, nil, err
+	}
+	request, err := lowhttp.ParseBytesToHttpRequest(response.RawRequest)
+	if err != nil {
+		return nil, nil, err
+	}
+	return response, request, nil
+}
+
+// BuildRequest 是一个用于辅助构建请求报文的工具函数，它第一个参数可以接收 []byte, string, http.Request 结构体，接下来可以接收零个到多个请求选项，修改请求报文的选项将被作用，最后返回构建好的请求报文
+// 参数:
+//   - i: 请求源，可为原始报文 []byte/string 或 *http.Request
+//   - opts: 可选的请求选项，仅修改请求报文的选项会生效
+//
+// 返回值:
+//   - 构建好的请求报文字节数组
+//
+// <|EXAMPLE_START|> 示例：用选项链在本地构建请求报文(不发包, 可本地验证)
+// ```
+// // 关键词: poc.BuildRequest, 本地构建报文, 选项链
+// // BuildRequest 只应用"修改请求报文"的选项并返回报文, 不会真正发请求, 适合本地拼包/调试。
+// raw = poc.BuildRequest(
+//     poc.BasicRequest(),                 // 基础 GET 模板
+//     poc.replaceHost("yaklang.com"),     // 改 Host
+//     poc.replacePath("/docs/api/poc"),   // 改路径
+//     poc.replaceMethod("POST"),          // 改方法
+//     poc.replaceBody("a=b", false),      // 改 body(第二个参数表示是否分块传输)
+// )
+// println(string(raw))                     // 打印拼好的完整请求报文
+// assert string(raw).Contains("POST /docs/api/poc"), "first line should be rebuilt"
+// assert poc.GetHTTPPacketHeader(raw, "Host") == "yaklang.com", "host should be replaced"
+// ```
+// <|EXAMPLE_END|>
+func BuildRequest(i interface{}, opts ...PocConfigOption) []byte {
+	packet, _, err := handleRawPacketAndConfig(i, opts...)
+	if err != nil {
+		log.Errorf("build request error: %s", err)
+	}
+	return packet
+}
+
+// HTTP 发送请求并且返回原始响应报文，原始请求报文以及错误，它的第一个参数可以接收 []byte, string, http.Request 结构体，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如设置超时时间，或者修改请求报文等
+// 参数:
+//   - i: 请求源，可为原始报文 []byte/string 或 *http.Request
+//   - opts: 可选的请求选项，例如 poc.https、poc.timeout、poc.replaceHeader
+//
+// 返回值:
+//   - 原始响应报文字节数组
+//   - 原始请求报文字节数组
+//   - 错误信息，请求失败时返回非空
+//
+// <|EXAMPLE_START|> 向本地 mock 服务发送原始报文请求(可本地验证, 不出网)
+// ```
+// host, port = tcp.MockServe(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // 起本地 mock 服务
+// rsp, req = poc.HTTP(f"GET / HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n")~
+// assert str.Contains(string(rsp), "200 OK"), "should receive mock response"
+// ```
+// <|EXAMPLE_END|>
+// <|EXAMPLE_START|> 向真实站点发送 HTTPS 请求并改写请求头
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// // 向 yaklang.com 发送 HTTPS GET 请求, 并添加请求头 AAA: BBB
+// rsp, req = poc.HTTP("GET / HTTP/1.1\r\nHost: www.yaklang.com\r\n\r\n", poc.https(true), poc.replaceHeader("AAA", "BBB"))~
+// ```
+// <|EXAMPLE_END|>
+func HTTP(i interface{}, opts ...PocConfigOption) (rsp []byte, req []byte, err error) {
+	packet, config, err := handleRawPacketAndConfig(i, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	response, err := pochttp(packet, config)
+	if err != nil {
+		return nil, nil, err
+	}
+	noFixContentLength := config.NoFixContentLength != nil && *config.NoFixContentLength
+	return response.RawPacket, lowhttp.FixHTTPPacketCRLF(response.RawRequest, noFixContentLength), err
+}
+
+// Do 向指定 URL 发送指定请求方法的请求并且返回响应结构体，请求结构体以及错误，它的是第一个参数是请求方法，第二个参数 URL 字符串，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如设置超时时间，或者修改请求报文等
+// 关于结构体中的可用字段和方法可以使用 desc 函数进行查看
+// 参数:
+//   - method: 请求方法，如 GET、POST
+//   - urlStr: 目标 URL 字符串
+//   - opts: 可选的请求选项，例如 poc.https、poc.timeout
+//
+// 返回值:
+//   - 响应结构体 LowhttpResponse
+//   - 请求结构体 *http.Request
+//   - 错误信息，请求失败时返回非空
+//
+// <|EXAMPLE_START|> 向本地 mock 服务发送指定方法请求(可本地验证, 不出网)
+// ```
+// host, port = tcp.MockServe(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // 起本地 mock 服务
+// rsp, req = poc.Do("GET", f"http://${host}:${port}/")~
+// assert rsp.GetStatusCode() == 200, "should get 200 from local mock"
+// ```
+// <|EXAMPLE_END|>
+// <|EXAMPLE_START|> 向真实站点发送指定方法的 HTTPS 请求
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// rsp, req = poc.Do("GET", "https://yaklang.com", poc.https(true))~ // 向 yaklang.com 发送 HTTPS GET 请求
+// desc(rsp) // 查看响应结构体中的可用字段
+// ```
+// <|EXAMPLE_END|>
+func Do(method string, urlStr string, opts ...PocConfigOption) (rspInst *lowhttp.LowhttpResponse, reqInst *http.Request, err error) {
+	config, err := handleUrlAndConfig(urlStr, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	https := config.IsHTTPS()
+	packet := lowhttp.UrlToRequestPacket(method, urlStr, nil, https)
+	packet = fixPacketByConfig(packet, config)
+
+	response, err := pochttp(packet, config)
+	if err != nil {
+		return nil, nil, err
+	}
+	request, err := lowhttp.ParseBytesToHttpRequest(response.RawRequest)
+	if err != nil {
+		return nil, nil, err
+	}
+	return response, request, nil
+}
+
+// Get 向指定 URL 发送 GET 请求并且返回响应结构体，请求结构体以及错误，它的第一个参数是 URL 字符串，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如对设置超时时间，或者修改请求报文等
+// 关于结构体中的可用字段和方法可以使用 desc 函数进行查看
+// 参数:
+//   - urlStr: 目标 URL 字符串
+//   - opts: 可选的请求选项，例如 poc.https、poc.timeout
+//
+// 返回值:
+//   - 响应结构体 LowhttpResponse
+//   - 请求结构体 *http.Request
+//   - 错误信息，请求失败时返回非空
+//
+// <|EXAMPLE_START|> 向本地 mock 服务发送 GET 请求(可本地验证, 不出网)
+// ```
+// host, port = tcp.MockServe(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // 起本地 mock 服务
+// rsp, req = poc.Get(f"http://${host}:${port}/")~
+// assert rsp.GetStatusCode() == 200, "should get 200 from local mock"
+// ```
+// <|EXAMPLE_END|>
+// <|EXAMPLE_START|> 向真实站点发送 HTTPS GET 请求
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// rsp, req = poc.Get("https://yaklang.com", poc.https(true))~ // 向 yaklang.com 发送 HTTPS GET 请求
+// desc(rsp) // 查看响应结构体中的可用字段
+// ```
+// <|EXAMPLE_END|>
+func DoGET(urlStr string, opts ...PocConfigOption) (rspInst *lowhttp.LowhttpResponse, reqInst *http.Request, err error) {
+	return Do("GET", urlStr, opts...)
+}
+
+// Post 向指定 URL 发送 POST 请求并且返回响应结构体，请求结构体以及错误，它的第一个参数是 URL 字符串，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如对设置超时时间，或者修改请求报文等
+// 关于结构体中的可用字段和方法可以使用 desc 函数进行查看
+// 参数:
+//   - urlStr: 目标 URL 字符串
+//   - opts: 可选的请求选项，例如 poc.https、poc.postParams
+//
+// 返回值:
+//   - 响应结构体 LowhttpResponse
+//   - 请求结构体 *http.Request
+//   - 错误信息，请求失败时返回非空
+//
+// <|EXAMPLE_START|> 向本地 mock 服务发送 POST 请求(可本地验证, 不出网)
+// ```
+// host, port = tcp.MockServe(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") // 起本地 mock 服务
+// rsp, req = poc.Post(f"http://${host}:${port}/login", poc.body("user=admin&pass=123"))~
+// assert rsp.GetStatusCode() == 200, "should get 200 from local mock"
+// ```
+// <|EXAMPLE_END|>
+// <|EXAMPLE_START|> 向真实站点发送 HTTPS POST 请求
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// rsp, req = poc.Post("https://yaklang.com", poc.https(true))~ // 向 yaklang.com 发送 HTTPS POST 请求
+// desc(rsp) // 查看响应结构体中的可用字段
+// ```
+// <|EXAMPLE_END|>
+func DoPOST(urlStr string, opts ...PocConfigOption) (rspInst *lowhttp.LowhttpResponse, reqInst *http.Request, err error) {
+	return Do("POST", urlStr, opts...)
+}
+
+// Head 向指定 URL 发送 HEAD 请求并且返回响应结构体，请求结构体以及错误，它的第一个参数是 URL 字符串，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如对设置超时时间，或者修改请求报文等
+// 关于结构体中的可用字段和方法可以使用 desc 函数进行查看
+// 参数:
+//   - urlStr: 目标 URL 字符串
+//   - opts: 可选的请求选项，例如 poc.https、poc.timeout
+//
+// 返回值:
+//   - 响应结构体 LowhttpResponse
+//   - 请求结构体 *http.Request
+//   - 错误信息，请求失败时返回非空
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// rsp,req = poc.Head("https://yaklang.com", poc.https(true))~ // 向yaklang.com发送一个基于HTTPS协议的HEAD请求
+// desc(rsp) // 查看响应结构体中的可用字段
+// ```
+func DoHEAD(urlStr string, opts ...PocConfigOption) (rspInst *lowhttp.LowhttpResponse, reqInst *http.Request, err error) {
+	return Do("HEAD", urlStr, opts...)
+}
+
+// Delete 向指定 URL 发送 DELETE 请求并且返回响应结构体，请求结构体以及错误，它的第一个参数是 URL 字符串，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如对设置超时时间，或者修改请求报文等
+// 关于结构体中的可用字段和方法可以使用 desc 函数进行查看
+// 参数:
+//   - urlStr: 目标 URL 字符串
+//   - opts: 可选的请求选项，例如 poc.https、poc.timeout
+//
+// 返回值:
+//   - 响应结构体 LowhttpResponse
+//   - 请求结构体 *http.Request
+//   - 错误信息，请求失败时返回非空
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// rsp,req = poc.Delete("https://yaklang.com", poc.https(true))~ // 向yaklang.com发送一个基于HTTPS协议的DELETE请求
+// desc(rsp) // 查看响应结构体中的可用字段
+// ```
+func DoDELETE(urlStr string, opts ...PocConfigOption) (rspInst *lowhttp.LowhttpResponse, reqInst *http.Request, err error) {
+	return Do("DELETE", urlStr, opts...)
+}
+
+// Options 向指定 URL 发送 OPTIONS 请求并且返回响应结构体，请求结构体以及错误，它的第一个参数是 URL 字符串，接下来可以接收零个到多个请求选项，用于对此次请求进行配置，例如对设置超时时间，或者修改请求报文等
+// 关于结构体中的可用字段和方法可以使用 desc 函数进行查看
+// 参数:
+//   - urlStr: 目标 URL 字符串
+//   - opts: 可选的请求选项，例如 poc.https、poc.timeout
+//
+// 返回值:
+//   - 响应结构体 LowhttpResponse
+//   - 请求结构体 *http.Request
+//   - 错误信息，请求失败时返回非空
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实 HTTPS 目标
+// rsp,req = poc.Options("https://yaklang.com", poc.https(true))~ // 向yaklang.com发送一个基于HTTPS协议的Options请求
+// desc(rsp) // 查看响应结构体中的可用字段
+// ```
+func DoOPTIONS(urlStr string, opts ...PocConfigOption) (rspInst *lowhttp.LowhttpResponse, reqInst *http.Request, err error) {
+	return Do("OPTIONS", urlStr, opts...)
+}
+
+// Websocket 实际上等价于`poc.HTTP(..., poc.websocket(true))`，用于快速发送请求并建立websocket连接并且返回原始响应报文，原始请求报文以及错误
+// 参数:
+//   - raw: websocket 握手请求源，可为原始报文 []byte/string 或 *http.Request
+//   - opts: 可选的请求选项，例如 poc.websocketFromServer、poc.websocketOnClient
+//
+// 返回值:
+//   - 原始响应报文字节数组
+//   - 原始请求报文字节数组
+//   - 错误信息，请求失败时返回非空
+//
+// Example:
+// ```
+// // 无法本地验证: 需要可达的真实 websocket 服务与本地代理
+// rsp, req, err = poc.Websocket(`GET / HTTP/1.1
+// Connection: Upgrade
+// Upgrade: websocket
+// Sec-Websocket-Version: 13
+// Sec-Websocket-Extensions: permessage-deflate; client_max_window_bits
+// Host: echo.websocket.events
+// Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7
+// Sec-Websocket-Key: L31R1As+71fwuXqhwhABuA==`,
+//
+//	poc.proxy("http://127.0.0.1:7890"), poc.websocketFromServer(func(rsp, cancel) {
+//		    dump(rsp)
+//		}), poc.websocketOnClient(func(c) {
+//		    c.WriteText("123")
+//		})
+//
+// )
+// time.Sleep(100)
+// ```
+func DoWebSocket(raw interface{}, opts ...PocConfigOption) (rsp []byte, req []byte, err error) {
+	opts = append(opts, WithWebsocket(true))
+	return HTTP(raw, opts...)
+}
+
+// Split 切割 HTTP 报文，返回响应头和响应体，其第一个参数是原始HTTP报文，接下来可以接收零个到多个回调函数，其在每次解析到请求头时回调
+// 参数:
+//   - raw: 原始 HTTP 报文字节数组
+//   - hook: 可选的回调函数，每解析到一行请求头时回调
+//
+// 返回值:
+//   - 报文头部字符串
+//   - 报文体字节数组
+//
+// <|EXAMPLE_START|> 示例：把报文切成 header 和 body 两部分
+// ```
+// // 关键词: poc.Split, 切分报文头与体
+// packet = `POST / HTTP/1.1
+// Content-Type: application/json
+// Host: www.example.com
+//
+// {"key": "value"}`
+// header, body = poc.Split(packet) // 第一个返回值是头部字符串, 第二个是 body 字节
+// println("--- header ---")
+// println(header)
+// println("--- body ---")
+// println(string(body))            // 预期输出: {"key": "value"}
+// assert string(body) == `{"key": "value"}`, "body should be split out correctly"
+// assert header.Contains("Content-Type: application/json"), "header should contain content-type"
+// ```
+// <|EXAMPLE_END|>
+func split(raw []byte, hook ...func(line string)) (headers string, body []byte) {
+	return lowhttp.SplitHTTPHeadersAndBodyFromPacket(raw, hook...)
+}
+
+// FixHTTPRequest 尝试对传入的HTTP请求报文进行修复，并返回修复后的请求
+// 参数:
+//   - raw: 原始 HTTP 请求报文字节数组
+//
+// 返回值:
+//   - 修复后的 HTTP 请求报文字节数组
+//
+// <|EXAMPLE_START|> 示例：修复请求报文(自动补齐 Content-Length 等)
+// ```
+// // 关键词: poc.FixHTTPRequest, 修复请求报文
+// // 这个请求声明了 Content-Length: 100, 但实际 body 只有 3 字节, FixHTTPRequest 会修正它
+// broken = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\n\r\nabc"
+// fixed = poc.FixHTTPRequest(broken)
+// println(string(fixed))
+// assert poc.GetHTTPPacketHeader(fixed, "Content-Length") == "3", "content-length should be fixed to real body length"
+// ```
+// <|EXAMPLE_END|>
+func fixHTTPRequest(raw []byte) []byte {
+	return lowhttp.FixHTTPRequest(raw)
+}
+
+// FixHTTPResponse 尝试对传入的 HTTP 响应报文进行修复，并返回修复后的响应
+// 参数:
+//   - r: 原始 HTTP 响应报文字节数组
+//
+// 返回值:
+//   - 修复后的 HTTP 响应报文字节数组
+//
+// <|EXAMPLE_START|> 示例：修复响应报文(规整 CRLF 与 Content-Length)
+// ```
+// // 关键词: poc.FixHTTPResponse, 修复响应报文
+// // 这个响应用了 LF 换行且未声明 Content-Length, FixHTTPResponse 会把它规整为标准报文
+// broken = "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nhello"
+// fixed = poc.FixHTTPResponse(broken)
+// println(string(fixed))
+// assert poc.GetStatusCodeFromResponse(fixed) == 200, "status code should still be 200"
+// assert string(poc.GetHTTPPacketBody(fixed)) == "hello", "body should be preserved"
+// ```
+// <|EXAMPLE_END|>
+func fixHTTPResponse(r []byte) []byte {
+	rsp, _, _ := lowhttp.FixHTTPResponse(r)
+	return rsp
+}
+
+// CurlToHTTPRequest 尝试将curl命令转换为HTTP请求报文，其返回值为bytes，即转换后的HTTP请求报文
+// 参数:
+//   - command: curl 命令字符串
+//
+// 返回值:
+//   - 转换后的 HTTP 请求报文字节数组
+//
+// <|EXAMPLE_START|> 示例：把 curl 命令转成 HTTP 请求报文
+// ```
+// // 关键词: poc.CurlToHTTPRequest, curl转报文
+// req = poc.CurlToHTTPRequest("curl -X POST -d 'a=b&c=d' http://example.com")
+// println(string(req))
+// assert poc.GetHTTPRequestMethod(req) == "POST", "method should be POST"
+// assert string(poc.GetHTTPPacketBody(req)) == "a=b&c=d", "body should come from -d"
+// ```
+// <|EXAMPLE_END|>
+func curlToHTTPRequest(command string) (req []byte) {
+	raw, err := lowhttp.CurlToRawHTTPRequest(command)
+	if err != nil {
+		log.Errorf(`CurlToHTTPRequest failed: %s`, err)
+	}
+	return raw
+}
+
+// HTTPRequestToCurl 尝试将 HTTP 请求报文转换为curl命令。第一个参数为是否使用HTTPS，第二个参数为HTTP请求报文，其返回值为string，即转换后的curl命令
+// 参数:
+//   - https: 是否使用 HTTPS
+//   - raw: HTTP 请求报文，可为 string 或 bytes
+//
+// 返回值:
+//   - 转换后的 curl 命令字符串
+//
+// <|EXAMPLE_START|> 示例：把 HTTP 请求报文转成 curl 命令
+// ```
+// // 关键词: poc.HTTPRequestToCurl, 报文转curl
+// cmd = poc.HTTPRequestToCurl(true, "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n") // 第一个参数表示是否 https
+// println(cmd)
+// assert cmd.Contains("curl"), "should produce a curl command"
+// assert cmd.Contains("https://example.com/api"), "should target the https url"
+// ```
+// <|EXAMPLE_END|>
+func httpRequestToCurl(https bool, raw any) (curlCommand string) {
+	cmd, err := lowhttp.GetCurlCommand(https, utils.InterfaceToBytes(raw))
+	if err != nil {
+		log.Errorf(`http2curl.GetCurlCommand(req): %v`, err)
+		return ""
+	}
+	return cmd.String()
+}
+
+// ExtractPostParams 尝试将 HTTP 请求报文中的各种 POST 参数(普通格式，表单格式，JSON格式，XML格式)提取出来，返回提取出来的 POST 参数与错误
+// 参数:
+//   - raw: 原始 HTTP 请求报文字节数组
+//
+// 返回值:
+//   - 提取出来的 POST 参数键值对表
+//   - 错误信息，无法提取时返回非空
+//
+// Example:
+// ```
+// params, err = poc.ExtractPostParams("POST / HTTP/1.1\r\nContent-Type: application/json\r\nHost: example.com\r\n\r\n{\"key\": \"value\"}")
+// dump(params) // {"key": "value"}
+// ```
+func ExtractPostParams(raw []byte) (map[string]string, error) {
+	_, body := lowhttp.SplitHTTPPacketFast(raw)
+	contentType := lowhttp.GetHTTPPacketHeader(raw, "Content-Type")
+	totalParams, useRaw, err := lowhttp.GetParamsFromBody(contentType, body)
+	if useRaw && err == nil {
+		err = utils.Error("cannot extract post params")
+	}
+	params := make(map[string]string)
+	for _, param := range totalParams.Items {
+		if len(param.Values) == 0 {
+			params[param.Key] = ""
+		} else {
+			params[param.Key] = param.Values[0]
+		}
+	}
+
+	return params, err
+}
+
+// ua 是一个请求选项参数，用于改变请求报文，添加 User-Agent 请求头中的值
+// 参数:
+//   - ua: User-Agent 请求头的值
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：设置 User-Agent(本地构建可验证)
+// ```
+// // 关键词: poc.ua, 设置UA
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.ua("Mozilla/5.0"))
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "User-Agent") == "Mozilla/5.0", "ua should be set"
+// ```
+// <|EXAMPLE_END|>
+func WithUserAgent(ua string) PocConfigOption {
+	return WithReplaceHttpPacketHeader("User-Agent", ua)
+}
+
+// cookie 是一个请求选项参数，用于改变请求报文，添加 Cookie 请求头中的值
+// 参数:
+//   - c: Cookie 字符串，或当提供 values 时作为 Cookie 名称
+//   - values: 可选，Cookie 的值（提供时 c 作为名称）
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// <|EXAMPLE_START|> 示例：设置 Cookie 请求头(本地构建可验证)
+// ```
+// // 关键词: poc.cookie, 设置Cookie
+// raw = poc.BuildRequest(poc.BasicRequest(), poc.cookie("a=b; c=d")) // 直接写整个 Cookie 串
+// println(string(raw))
+// assert poc.GetHTTPPacketHeader(raw, "Cookie") == "a=b; c=d", "cookie header should be set"
+// // 也可用键值形式: poc.cookie("a", "b")
+// ```
+// <|EXAMPLE_END|>
+func WithCookieFull(c string, values ...any) PocConfigOption {
+	if len(values) > 0 {
+		valueStrings := utils.InterfaceToStringSlice(values)
+		return WithReplaceHttpPacketCookie(c, strings.Join(valueStrings, ","))
+	}
+	return WithReplaceHttpPacketHeader("Cookie", c)
+}
+
+// gmTls 是一个请求选项参数，用于启用国密 TLS(GMTLS)，默认兼容模式同时尝试标准 TLS 与国密 TLS
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 启用国密 TLS，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实国密 TLS 目标
+// poc.Get("https://example.com", poc.gmTls(true))~
+// ```
+func WithGmTls() PocConfigOption {
+	enabled := true
+	return func(c *PocConfig) {
+		c.GmTLS = enabled
+	}
+}
+
+// gmTlsOnly 是一个请求选项参数，用于仅使用国密 TLS(GMTLS)，不再回退到标准 TLS
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 仅使用国密 TLS，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实国密 TLS 目标
+// poc.Get("https://example.com", poc.gmTlsOnly(true))~
+// ```
+func WithGmTlsOnly() PocConfigOption {
+	enabled := true
+	return func(c *PocConfig) {
+		c.GmTLSOnly = enabled
+	}
+}
+
+// gmTLSPrefer 是一个请求选项参数，用于在兼容模式下优先尝试国密 TLS(GMTLS)
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// // 优先使用国密 TLS，依赖网络，此处仅作示意
+// 无法本地验证: 需要可达的真实国密 TLS 目标
+// poc.Get("https://example.com", poc.gmTLSPrefer(true))~
+// ```
+func WithGmTLSPrefer() PocConfigOption {
+	enabled := true
+	return func(c *PocConfig) {
+		c.GmTLSPrefer = enabled
+	}
+}
+
+// WithGmTLSCipherSuite 指定国密 TLS 套件，使用 tls.GMTLS_* 常量（可传多个）。
+// 参数:
+//   - suites: 一个或多个国密 TLS 套件，使用 tls.GMTLS_* 常量
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实国密 TLS 目标
+// poc.Get("https://example.com", poc.gmTLS(true), poc.gmTLSCipherSuite(tls.GMTLS_ECC_SM4_CBC_SM3))
+// ```
+func WithGmTLSCipherSuite(suites ...int) PocConfigOption {
+	return func(c *PocConfig) {
+		c.GmTLSCipherSuites = make([]uint16, len(suites))
+		for i, id := range suites {
+			c.GmTLSCipherSuites[i] = uint16(id)
+		}
+	}
+}
+
+// WithGmTLSDisableCompatMode 关闭国密兼容模式；不传参等价于 true（仅单次四套）。
+// 参数:
+//   - disable: 可选，是否关闭兼容模式，默认为 true
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// poc.Get(url, poc.gmTLS(true)) // 默认兼容模式开启
+// poc.Get(url, poc.gmTLS(true), poc.gmTLSDisableCompatMode()) // 关闭兼容
+// poc.Get(url, poc.gmTLS(true), poc.gmTLSDisableCompatMode(false)) // 显式保持兼容开启
+// ```
+func WithGmTLSDisableCompatMode(disable ...bool) PocConfigOption {
+	v := true
+	if len(disable) > 0 {
+		v = disable[0]
+	}
+	return func(c *PocConfig) {
+		c.GmTLSDisableCompatMode = v
+	}
+}
+
+// fixQueryEscape 是一个请求选项参数，用于指定是否修复查询参数中的 URL 编码，默认为 false 即会自动修复URL编码
+// 参数:
+//   - b: 为 true 时不自动修复查询参数的 URL 编码
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.HTTP/poc.Get 等
+//
+// Example:
+// ```
+// 无法本地验证: 需要可达的真实 HTTP 目标
+// poc.HTTP(poc.BasicRequest(), poc.fixQueryEscape(true)) // 向 example.com 发起请求，如果查询参数中的 URL 编码不正确或不存在也不会自动修复URL编码
+// ```
+func WithFixQueryEscape(b bool) PocConfigOption {
+	return func(c *PocConfig) {
+		c.FixQueryEscape = &b
+	}
+}
+
+// downloadProgress 是一个下载选项参数，用于设置下载进度回调函数
+// 回调函数接收三个参数：已下载字节数、总字节数、下载百分比(0-100)
+// 参数:
+//   - callback: 进度回调函数，参数依次为已下载字节数、总字节数、百分比
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.Download 等
+//
+// Example:
+// ```
+// poc.Download("https://example.com/file.zip", poc.downloadProgress(func(downloaded, total, percent) {
+//
+//	println(sprintf("下载进度: %.2f%% (%d/%d)", percent, downloaded, total))
+//
+// }))
+// ```
+func WithDownloadProgress(callback func(downloaded int64, total int64, percent float64)) PocConfigOption {
+	return func(c *PocConfig) {
+		c.DownloadProgressCallback = callback
+	}
+}
+
+// downloadFinished 是一个下载选项参数，用于设置下载完成回调函数
+// 回调函数接收一个参数：保存的文件完整路径
+// 参数:
+//   - callback: 完成回调函数，参数为已保存文件的完整路径
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.Download 等
+//
+// Example:
+// ```
+// poc.Download("https://example.com/file.zip", poc.downloadFinished(func(filePath) {
+//
+//	println("下载完成: " + filePath)
+//
+// }))
+// ```
+func WithDownloadFinished(callback func(filePath string)) PocConfigOption {
+	return func(c *PocConfig) {
+		c.DownloadFinishedCallback = callback
+	}
+}
+
+// downloadFilename 是一个下载选项参数，用于手动指定保存的文件名
+// 如果不指定，将自动从 Content-Disposition 响应头或 URL 路径中提取文件名
+// 参数:
+//   - filename: 指定保存的文件名
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.Download 等
+//
+// Example:
+// ```
+// poc.Download("https://example.com/file.zip", poc.downloadFilename("my_file.zip"))
+// ```
+func WithDownloadFilename(filename string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.DownloadFilename = &filename
+	}
+}
+
+// downloadDir 是一个下载选项参数，用于指定文件保存目录
+// 如果不指定，将保存到默认的 yakit 下载目录
+// 参数:
+//   - dir: 文件保存目录
+//
+// 返回值:
+//   - 一个请求选项，作为可变参数传入 poc.Download 等
+//
+// Example:
+// ```
+// poc.Download("https://example.com/file.zip", poc.downloadDir("/tmp/downloads"))
+// ```
+func WithDownloadDir(dir string) PocConfigOption {
+	return func(c *PocConfig) {
+		c.DownloadDir = &dir
+	}
+}
+
+// getDownloadDir returns the download directory from config or default yakit downloads directory
+func getDownloadDir(config *PocConfig) string {
+	if config.DownloadDir != nil && *config.DownloadDir != "" {
+		return *config.DownloadDir
+	}
+	dir := filepath.Join(consts.GetDefaultYakitProjectsDir(), "downloads")
+	os.MkdirAll(dir, 0755)
+	return dir
+}
+
+// extractFilenameFromHeader extracts filename from Content-Disposition header
+func extractFilenameFromHeader(headerBytes []byte) string {
+	cd := lowhttp.GetHTTPPacketHeader(headerBytes, "Content-Disposition")
+	if cd == "" {
+		return ""
+	}
+	_, params, err := mime.ParseMediaType(cd)
+	if err != nil {
+		return ""
+	}
+	if filename := params["filename"]; filename != "" {
+		return filepath.Base(filename)
+	}
+	return ""
+}
+
+// extractFilenameFromURL extracts filename from URL path
+func extractFilenameFromURL(urlStr string) string {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return ""
+	}
+	urlPath := strings.TrimSuffix(u.Path, "/")
+	if urlPath == "" {
+		return ""
+	}
+	base := path.Base(urlPath)
+	if base == "/" || base == "." || base == "" {
+		return ""
+	}
+	// Check if it looks like a directory (no extension and not a filename pattern)
+	// For download purposes, if path ends with slash, it's likely a directory
+	if strings.HasSuffix(u.Path, "/") {
+		return ""
+	}
+	return base
+}
+
+// extractDownloadFilename determines the filename for download
+// Priority: user specified > Content-Disposition > URL path > default name
+func extractDownloadFilename(headerBytes []byte, urlStr string, config *PocConfig) string {
+	// 1. User specified filename
+	if config.DownloadFilename != nil && *config.DownloadFilename != "" {
+		return *config.DownloadFilename
+	}
+
+	// 2. From Content-Disposition header
+	if filename := extractFilenameFromHeader(headerBytes); filename != "" {
+		return filename
+	}
+
+	// 3. From URL path
+	if filename := extractFilenameFromURL(urlStr); filename != "" {
+		return filename
+	}
+
+	// 4. Generate default filename
+	return fmt.Sprintf("download_%d", time.Now().Unix())
+}
+
+// extractContentLength extracts Content-Length from response header
+func extractContentLength(headerBytes []byte) int64 {
+	cl := lowhttp.GetHTTPPacketHeader(headerBytes, "Content-Length")
+	if cl == "" {
+		return -1
+	}
+	size, err := strconv.ParseInt(cl, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return size
+}
+
+// RemoveSession 清除指定的 session，删除其关联的 cookiejar。
+// session 池本身有容量上限，但主动清理可以更早释放 cookie 数据。
+// 参数:
+//   - session: 要清除的 session 标识符
+//
+// Example:
+// ```
+// // 关键词: poc.RemoveSession, 按 session 名清理本地 cookiejar
+// // RemoveSession 只清理本地 session 缓存(cookiejar), 不发起任何网络请求, 可本地验证
+// poc.RemoveSession("user1") // 清除名为 user1 的 session, 释放其 cookiejar
+// println("session user1 removed") // 预期输出: session user1 removed
+// // 真实场景: 先用 poc.Get(url, poc.session("user1")) 登录并积累 cookie, 用完后再 RemoveSession 释放
+// ```
+func RemoveSession(session string) {
+	lowhttp.RemoveCookiejar(session)
+}
+
+// Download 从指定 URL 下载文件并保存到本地，返回保存的文件路径和错误
+// 支持进度回调、完成回调、自定义文件名和保存目录等选项
+// 参数:
+//   - urlStr: 目标文件的 URL 字符串
+//   - opts: 可选的请求/下载选项，例如 poc.downloadProgress、poc.downloadDir
+//
+// 返回值:
+//   - 已保存文件的本地路径
+//   - 错误信息，下载失败时返回非空
+//
+// Example:
+// ```
+// filename, err = poc.Download("https://example.com/file.zip")
+// filename, err = poc.Download("https://example.com/file.zip", poc.downloadProgress(func(downloaded, total, percent) {
+//
+//	println(sprintf("下载进度: %.2f%%", percent))
+//
+// }), poc.downloadFilename("my_file.zip"))
+// ```
+func Download(urlStr string, opts ...PocConfigOption) (string, error) {
+	return DownloadWithMethod("GET", urlStr, opts...)
+}
+
+// DownloadWithMethod 使用指定的 HTTP 方法从 URL 下载文件
+// 参数:
+//   - method: HTTP 请求方法，如 GET、POST
+//   - urlStr: 目标文件的 URL 字符串
+//   - opts: 可选的请求/下载选项，例如 poc.body、poc.downloadDir
+//
+// 返回值:
+//   - 已保存文件的本地路径
+//   - 错误信息，下载失败时返回非空
+//
+// Example:
+// ```
+// filename, err = poc.DownloadWithMethod("POST", "https://example.com/download", poc.body("token=xxx"))
+// ```
+func DownloadWithMethod(method string, urlStr string, opts ...PocConfigOption) (string, error) {
+	// 1. Parse config
+	config, err := handleUrlAndConfig(urlStr, opts...)
+	if err != nil {
+		return "", err
+	}
+
+	// 2. Force disable HTTPFlow save and enable stream mode
+	saveFalse := false
+	noBodyBufferTrue := true
+	config.SaveHTTPFlow = &saveFalse
+	config.NoBodyBuffer = &noBodyBufferTrue
+
+	// 3. Build request packet
+	https := config.IsHTTPS()
+	packet := lowhttp.UrlToRequestPacket(method, urlStr, nil, https)
+	packet = fixPacketByConfig(packet, config)
+
+	// 4. Prepare download variables
+	downloadDir := getDownloadDir(config)
+	var finalFilename string
+	var totalSize int64
+	var downloadedSize int64
+	var downloadErr error
+	var filePath string
+
+	// Save original stream handler if any
+	originalStreamHandler := config.BodyStreamHandler
+
+	// 5. Set up stream handler for download
+	config.BodyStreamHandler = func(headerBytes []byte, bodyReader io.ReadCloser) {
+		defer bodyReader.Close()
+
+		// Call original handler if exists
+		if originalStreamHandler != nil {
+			// Create a tee reader to pass data to original handler as well
+			// But for simplicity, we skip this for now
+		}
+
+		// 5.1 Get filename and total size from response header
+		finalFilename = extractDownloadFilename(headerBytes, urlStr, config)
+		totalSize = extractContentLength(headerBytes)
+
+		// 5.2 Create file
+		filePath = filepath.Join(downloadDir, finalFilename)
+		fp, err := os.Create(filePath)
+		if err != nil {
+			downloadErr = utils.Errorf("failed to create file %s: %v", filePath, err)
+			log.Errorf("Download: failed to create file %s: %v", filePath, err)
+			return
+		}
+		defer fp.Close()
+
+		// 5.3 Stream write with progress callback (throttled to 1s interval)
+		buffer := make([]byte, 32*1024) // 32KB buffer
+		var lastProgressTime time.Time
+		progressTriggered := false
+		progressInterval := time.Second // 1 second throttle
+
+		for {
+			n, readErr := bodyReader.Read(buffer)
+			if n > 0 {
+				_, writeErr := fp.Write(buffer[:n])
+				if writeErr != nil {
+					downloadErr = utils.Errorf("failed to write to file: %v", writeErr)
+					log.Errorf("Download: failed to write to file: %v", writeErr)
+					return
+				}
+				downloadedSize += int64(n)
+
+				// Trigger progress callback with throttling
+				// - First trigger: immediately on first data
+				// - Subsequent triggers: at most once per second
+				if config.DownloadProgressCallback != nil {
+					now := time.Now()
+					shouldTrigger := !progressTriggered || now.Sub(lastProgressTime) >= progressInterval
+					if shouldTrigger {
+						percent := 0.0
+						if totalSize > 0 {
+							percent = float64(downloadedSize) / float64(totalSize) * 100
+						}
+						config.DownloadProgressCallback(downloadedSize, totalSize, percent)
+						lastProgressTime = now
+						progressTriggered = true
+					}
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				downloadErr = utils.Errorf("failed to read response body: %v", readErr)
+				log.Errorf("Download: failed to read response body: %v", readErr)
+				return
+			}
+		}
+
+		// Always trigger final progress callback to ensure 100% is reported
+		if config.DownloadProgressCallback != nil && totalSize > 0 {
+			percent := float64(downloadedSize) / float64(totalSize) * 100
+			config.DownloadProgressCallback(downloadedSize, totalSize, percent)
+		}
+
+		// 5.4 Trigger finished callback
+		if config.DownloadFinishedCallback != nil {
+			config.DownloadFinishedCallback(filePath)
+		}
+
+		log.Infof("Download completed: %s (size: %d bytes)", filePath, downloadedSize)
+	}
+
+	// 6. Execute request
+	_, err = pochttp(packet, config)
+	if err != nil {
+		return "", err
+	}
+
+	// Check for download error
+	if downloadErr != nil {
+		return "", downloadErr
+	}
+
+	return filePath, nil
+}
+
+var PoCExports = map[string]interface{}{
+	"HTTP":          HTTP,
+	"HTTPEx":        HTTPEx,
+	"BasicRequest":  lowhttp.BasicRequest,
+	"BasicResponse": lowhttp.BasicResponse,
+	"BuildRequest":  BuildRequest,
+	"Get":           DoGET,
+	"Post":          DoPOST,
+	"Head":          DoHEAD,
+	"Delete":        DoDELETE,
+	"Options":       DoOPTIONS,
+	"Do":            Do,
+	// download, 用于下载文件
+	"Download":           Download,
+	"DownloadWithMethod": DownloadWithMethod,
+	// websocket，可以直接复用 HTTP 参数
+	"Websocket": DoWebSocket,
+	// session 管理
+	"RemoveSession": RemoveSession,
+
+	// options
+	"host":                   WithHost,
+	"port":                   WithPort,
+	"retryTimes":             WithRetryTimes,
+	"retryInStatusCode":      WithRetryInStatusCode,
+	"retryNotInStatusCode":   WithRetryNotInStausCode,
+	"retryWaitTime":          WithRetryWaitTime,
+	"retryMaxWaitTime":       WithRetryMaxWaitTime,
+	"redirectTimes":          WithRedirectTimes,
+	"noRedirect":             WithNoRedirect,
+	"noredirect":             WithNoRedirect,
+	"jsRedirect":             WithJSRedirect,
+	"redirect":               WithRedirect,
+	"redirectHandler":        WithRedirectHandler,
+	"https":                  WithForceHTTPS,
+	"http2":                  WithForceHTTP2,
+	"sni":                    WithSNI,
+	"params":                 WithParams,
+	"proxy":                  WithProxy,
+	"timeout":                WithTimeout,
+	"context":                WithContext,
+	"connPool":               WithConnPool,
+	"connectTimeout":         WithConnectTimeout,
+	"dnsServer":              WithDNSServers,
+	"dnsNoCache":             WithDNSNoCache,
+	"noFixContentLength":     WithNoFixContentLength,
+	"noBodyBuffer":           WithNoBodyBuffer,
+	"bodyStreamHandler":      WithBodyStreamReaderHandler,
+	"session":                WithSession,
+	"disableSession":         WithDisableSession,
+	"save":                   WithSave,
+	"saveSync":               WithSaveSync,
+	"saveHandler":            WithSaveHandler,
+	"afterSaveHandler":       WithAfterSaveHandler,
+	"useMitmRule":            WithMITMRule,
+	"source":                 WithSource,
+	"websocket":              WithWebsocket,
+	"websocketFromServer":    WithWebsocketHandler,
+	"websocketOnClient":      WithWebsocketClientHandler,
+	"websocketStrictMode":    WithWebsocketStrictMode,
+	"username":               WithUsername,
+	"password":               WithPassword,
+	"randomJA3":              WithRandomJA3,
+	"tlsFingerprint":         WithTLSFingerprint,
+	"tlsFingerprintProfiles": TLSFingerprintProfiles,
+	"http2Fingerprint":         WithHTTP2Fingerprint,
+	"http2FingerprintProfiles": HTTP2FingerprintProfiles,
+	"gmTls":                  WithGmTls,
+	"gmTlsOnly":              WithGmTlsOnly,
+	"gmTLSPrefer":            WithGmTLSPrefer,
+	"gmTLSCipherSuite":       WithGmTLSCipherSuite,
+	"gmTLSDisableCompatMode": WithGmTLSDisableCompatMode,
+	"fixQueryEscape":         WithFixQueryEscape,
+	// download options
+	"downloadProgress": WithDownloadProgress,
+	"downloadFinished": WithDownloadFinished,
+	"downloadFilename": WithDownloadFilename,
+	"downloadDir":      WithDownloadDir,
+
+	"json":       WithJSON,
+	"body":       WithBody,
+	"query":      WithQuery,
+	"postData":   WithPostData,
+	"postParams": WithPostParams,
+	"postparams": WithPostParams,
+	"header":     WithAppendHeader,
+	"ua":         WithUserAgent,
+	"useragent":  WithUserAgent,
+	"fakeua":     WithReplaceHttpPacketRandomUserAgent,
+	"uarand":     WithReplaceHttpPacketRandomUserAgent,
+	"runtimeID":  WithRuntimeId,
+	"fromPlugin": WithFromPlugin,
+	"cookie":     WithCookieFull,
+
+	// full options
+	"replaceFirstLine":                   WithReplaceHttpPacketFirstLine,
+	"replaceMethod":                      WithReplaceHttpPacketMethod,
+	"replaceHeader":                      WithReplaceHttpPacketHeader,
+	"replaceAllHeaders":                  WithReplaceAllHttpPacketHeaders,
+	"replaceHost":                        WithReplaceHttpPacketHost,
+	"replaceBasicAuth":                   WithReplaceHttpPacketBasicAuth,
+	"replaceUserAgent":                   WithReplaceHttpPacketUserAgent,
+	"replaceRandomUserAgent":             WithReplaceHttpPacketRandomUserAgent,
+	"replaceCookie":                      WithReplaceHttpPacketCookie,
+	"replaceCookies":                     WithReplaceHttpPacketCookies,
+	"replaceBody":                        WithReplaceHttpPacketBody,
+	"replaceAllQueryParams":              WithReplaceAllHttpPacketQueryParams,
+	"replaceAllQueryParamsWithoutEscape": WithReplaceAllHttpPacketQueryParamsWithoutEscape,
+	"replaceAllPostParams":               WithReplaceAllHttpPacketPostParams,
+	"replaceAllPostParamsWithoutEscape":  WithReplaceAllHttpPacketPostParamsWithoutEscape,
+	"replaceQueryParam":                  WithReplaceHttpPacketQueryParam,
+	"replacePostParam":                   WithReplaceHttpPacketPostParam,
+	"replacePath":                        WithReplaceHttpPacketPath,
+	"replacePathFunc":                    WithReplaceHttpPacketPathFunc,
+	"replaceFormEncoded":                 WithReplaceHttpPacketFormEncoded,
+	"replaceUploadFile":                  WithReplaceHttpPacketUploadFile,
+	"appendHeader":                       WithAppendHeader,
+	"appendHeaders":                      WithAppendHeaders,
+	"appendCookie":                       WithAppendCookie,
+	"appendQueryParam":                   WithAppendQueryParam,
+	"appendPostParam":                    WithAppendPostParam,
+	"appendPath":                         WithAppendHttpPacketPath,
+	"appendFormEncoded":                  WithAppendHttpPacketFormEncoded,
+	"appendUploadFile":                   WithAppendHttpPacketUploadFile,
+	"deleteHeader":                       WithDeleteHeader,
+	"deleteCookie":                       WithDeleteCookie,
+	"deleteQueryParam":                   WithDeleteQueryParam,
+	"deletePostParam":                    WithDeletePostParam,
+	"deleteForm":                         WithDeleteForm,
+	// random chunked
+	"randomChunked":              WithEnableRandomChunked,
+	"randomChunkedLength":        WithRandomChunkedLength,
+	"randomChunkedDelay":         WithRandomChunkedDelay,
+	"randomChunkedResultHandler": WithRandomChunkedResultHandler,
+
+	// split
+	"Split":           split,
+	"FixHTTPRequest":  fixHTTPRequest,
+	"FixHTTPResponse": fixHTTPResponse,
+
+	// packet helper
+	"ReplaceBody":              lowhttp.ReplaceHTTPPacketBody,
+	"FixHTTPPacketCRLF":        lowhttp.FixHTTPPacketCRLF,
+	"HTTPPacketForceChunked":   lowhttp.HTTPPacketForceChunked,
+	"ParseBytesToHTTPRequest":  lowhttp.ParseBytesToHttpRequest,
+	"ParseBytesToHTTPResponse": lowhttp.ParseBytesToHTTPResponse,
+	"ParseUrlToHTTPRequestRaw": lowhttp.ParseUrlToHttpRequestRaw,
+
+	"ReplaceHTTPPacketMethod":                      lowhttp.ReplaceHTTPPacketMethod,
+	"ReplaceHTTPPacketFirstLine":                   lowhttp.ReplaceHTTPPacketFirstLine,
+	"ReplaceHTTPPacketHeader":                      lowhttp.ReplaceHTTPPacketHeader,
+	"ReplaceHTTPPacketBody":                        lowhttp.ReplaceHTTPPacketBodyFast,
+	"ReplaceHTTPPacketJsonBody":                    lowhttp.ReplaceHTTPPacketJsonBody,
+	"ReplaceHTTPPacketCookie":                      lowhttp.ReplaceHTTPPacketCookie,
+	"ReplaceHTTPPacketCookies":                     lowhttp.ReplaceHTTPPacketCookies,
+	"ReplaceHTTPPacketHost":                        lowhttp.ReplaceHTTPPacketHost,
+	"ReplaceHTTPPacketBasicAuth":                   lowhttp.ReplaceHTTPPacketBasicAuth,
+	"ReplaceAllHTTPPacketQueryParams":              lowhttp.ReplaceAllHTTPPacketQueryParams,
+	"ReplaceAllHTTPPacketQueryParamsWithoutEscape": lowhttp.ReplaceAllHTTPPacketQueryParamsWithoutEscape,
+	"ReplaceAllHTTPPacketPostParams":               lowhttp.ReplaceAllHTTPPacketPostParams,
+	"ReplaceAllHTTPPacketPostParamsWithoutEscape":  lowhttp.ReplaceAllHTTPPacketPostParamsWithoutEscape,
+	"ReplaceHTTPPacketQueryParam":                  lowhttp.ReplaceHTTPPacketQueryParam,
+	"ReplaceHTTPPacketQueryParamWithoutEscape":     lowhttp.ReplaceHTTPPacketQueryParamWithoutEscape,
+	"ReplaceHTTPPacketPostParam":                   lowhttp.ReplaceHTTPPacketPostParam,
+	"ReplaceHTTPPacketPath":                        lowhttp.ReplaceHTTPPacketPath,
+	"ReplaceHTTPPacketPathFunc":                    lowhttp.ReplaceHTTPPacketPathFunc,
+	"ReplaceHTTPPacketFormEncoded":                 lowhttp.ReplaceHTTPPacketFormEncoded,
+	"ReplaceHTTPPacketUploadFile":                  lowhttp.ReplaceHTTPPacketUploadFile,
+	"AppendHTTPPacketHeader":                       lowhttp.AppendHTTPPacketHeader,
+	"AppendHTTPPacketCookie":                       lowhttp.AppendHTTPPacketCookie,
+	"AppendHTTPPacketQueryParam":                   lowhttp.AppendHTTPPacketQueryParam,
+	"AppendHTTPPacketPostParam":                    lowhttp.AppendHTTPPacketPostParam,
+	"AppendHTTPPacketPath":                         lowhttp.AppendHTTPPacketPath,
+	"AppendHTTPPacketFormEncoded":                  lowhttp.AppendHTTPPacketFormEncoded,
+	"AppendHTTPPacketUploadFile":                   lowhttp.AppendHTTPPacketUploadFile,
+	"DeleteHTTPPacketHeader":                       lowhttp.DeleteHTTPPacketHeader,
+	"DeleteHTTPPacketCookie":                       lowhttp.DeleteHTTPPacketCookie,
+	"DeleteHTTPPacketQueryParam":                   lowhttp.DeleteHTTPPacketQueryParam,
+	"DeleteHTTPPacketPostParam":                    lowhttp.DeleteHTTPPacketPostParam,
+	"DeleteHTTPPacketForm":                         lowhttp.DeleteHTTPPacketForm,
+
+	"GetAllHTTPPacketQueryParams":     lowhttp.GetAllHTTPRequestQueryParams,
+	"GetAllHTTPPacketQueryParamsFull": lowhttp.GetFullHTTPRequestQueryParams,
+	"GetAllHTTPPacketPostParams":      lowhttp.GetAllHTTPRequestPostParams,
+	"GetAllHTTPPacketPostParamsFull":  lowhttp.GetFullHTTPRequestPostParams,
+	"GetHTTPPacketQueryParam":         lowhttp.GetHTTPRequestQueryParam,
+	"GetHTTPPacketPostParam":          lowhttp.GetHTTPRequestPostParam,
+	"GetHTTPPacketCookieValues":       lowhttp.GetHTTPPacketCookieValues,
+	"GetHTTPPacketCookieFirst":        lowhttp.GetHTTPPacketCookieFirst,
+	"GetHTTPPacketCookie":             lowhttp.GetHTTPPacketCookie,
+	"GetHTTPPacketContentType":        lowhttp.GetHTTPPacketContentType,
+	"GetHTTPPacketCookies":            lowhttp.GetHTTPPacketCookies,
+	"GetHTTPPacketCookiesFull":        lowhttp.GetHTTPPacketCookiesFull,
+	"GetHTTPPacketHeaders":            lowhttp.GetHTTPPacketHeaders,
+	"GetHTTPPacketHeadersFull":        lowhttp.GetHTTPPacketHeadersFull,
+	"GetHTTPPacketHeader":             lowhttp.GetHTTPPacketHeader,
+	"GetHTTPPacketBody":               lowhttp.GetHTTPPacketBody,
+	"GetHTTPPacketFirstLine":          lowhttp.GetHTTPPacketFirstLine,
+	"GetStatusCodeFromResponse":       lowhttp.GetStatusCodeFromResponse,
+	"GetHTTPRequestMethod":            lowhttp.GetHTTPRequestMethod,
+	"GetHTTPRequestPath":              lowhttp.GetHTTPRequestPath,
+	"ParseMultiPartFormWithCallback":  lowhttp.ParseMultiPartFormWithCallback,
+	// ext for path
+	"GetHTTPRequestPathWithoutQuery": lowhttp.GetHTTPRequestPathWithoutQuery,
+	// extract url
+	"GetUrlFromHTTPRequest": lowhttp.GetUrlFromHTTPRequest,
+	// extract post params
+	"ExtractPostParams": ExtractPostParams,
+
+	"CurlToHTTPRequest": curlToHTTPRequest,
+	"HTTPRequestToCurl": httpRequestToCurl,
+	"IsResponse":        lowhttp.IsResp,
+
+	"AutoUnzipPacketEncoding": lowhttp.AutoUnzipPacketEncoding,
+}

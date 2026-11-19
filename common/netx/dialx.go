@@ -1,0 +1,584 @@
+package netx
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/yaklang/yaklang/common/consts"
+
+	"github.com/yaklang/yaklang/common/gmsm/gmtls"
+	"github.com/yaklang/yaklang/common/log"
+	"github.com/yaklang/yaklang/common/utils"
+)
+
+var currentCPS atomic.Int64
+var lastCPS atomic.Int64
+
+func GetDialxCPS() int64 {
+	return lastCPS.Load()
+}
+
+func init() {
+	go func() {
+		rpsTick := time.NewTicker(1 * time.Second)
+		for {
+			select {
+			case <-rpsTick.C:
+				lastCPS.Store(currentCPS.Load())
+				currentCPS.Store(0)
+			}
+		}
+	}()
+}
+
+// dialPlainTCPConnWithRetry just handle plain tcp connection
+// no tls here, but proxy here
+func dialPlainTCPConnWithRetry(target string, config *dialXConfig) (retConn net.Conn, err error) {
+	ctx := config.Context
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, config.Timeout)
+		defer cancel()
+	}
+	waitRetry := func(delay time.Duration) error {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+	defer func() {
+		if retConn != nil {
+			currentCPS.Add(1)
+		}
+	}()
+
+	var startTCP = time.Now()
+	defer func() {
+		if retConn != nil {
+			config.TraceInfo.SetTCPDuration(time.Since(startTCP))
+		}
+	}()
+
+	var retryMax int64 = 3
+	if config.EnableTimeoutRetry {
+		retryMax = config.TimeoutRetryMax
+	}
+
+	// do first as zero
+	var timeoutRetryCount int64 = -1
+	addTimeoutRetry := func() {
+		atomic.AddInt64(&timeoutRetryCount, 1)
+	}
+
+	var refuseErrorRetryCount int64 = -1
+	addRefuseErrorRetry := func() {
+		atomic.AddInt64(&refuseErrorRetryCount, 1)
+	}
+
+	minWait, maxWait := config.TimeoutRetryMinWait, config.TimeoutRetryMaxWait
+	if minWait > maxWait {
+		minWait, maxWait = maxWait, minWait
+	}
+
+	var lastError error
+RETRY:
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if timeoutRetryCount > retryMax || refuseErrorRetryCount > retryMax {
+		if retryMax > 0 {
+			// 保留底层错误（connection refused / no route 等）：
+			// 上层（如爆破的目标不可达判定）依赖错误字符串分类，
+			// 丢弃 cause 会导致 refused 被误判为普通失败。
+			if lastError != nil {
+				return nil, fmt.Errorf("timeout retry(%v) or refuse retry(%v) > max(%v): %w", timeoutRetryCount, refuseErrorRetryCount, retryMax, lastError)
+			}
+			return nil, fmt.Errorf("timeout retry(%v) or refuse retry(%v) > max(%v)", timeoutRetryCount, refuseErrorRetryCount, retryMax)
+		}
+		if lastError != nil {
+			return nil, lastError
+		}
+		return nil, fmt.Errorf("i/o timeout for %v", target)
+	}
+
+	// handle plain
+	// not need to upgrade
+	var conn net.Conn
+
+	if len(config.Proxy) == 0 && config.EnableSystemProxyFromEnv && FixProxy(GetProxyFromEnv()) != "" {
+		config.Proxy = append(config.Proxy, FixProxy(GetProxyFromEnv()))
+	}
+
+	DnsConfig := NewDefaultReliableDNSConfig()
+	for _, o := range config.DNSOpts {
+		o(DnsConfig)
+	}
+
+	if DnsConfig.DisabledDomain != nil {
+		host, _, err := utils.ParseStringToHostPort(target)
+		if err == nil && DnsConfig.DisabledDomain.Contains(host) {
+			return nil, utils.Errorf("disallow domain %v by config(check your yakit system/network config)", target)
+		}
+	}
+
+	if len(config.Proxy) <= 0 || config.ForceDisableProxy {
+		if len(config.Proxy) == 0 && !config.ForceDisableProxy && config.ForceProxy {
+			return nil, utils.Errorf("force proxy but no proxy available for target: %v", target)
+		}
+
+		if config.Debug {
+			log.Infof("dial %s without proxy", target)
+		}
+		host, port, err := utils.ParseStringToHostPort(target)
+		if err != nil {
+			return nil, utils.Errorf("invalid target %#v, cannot find host:port", target)
+		}
+
+		// Resolve hostname to IP for dialing
+		ip := host
+		if net.ParseIP(utils.FixForParseIP(host)) == nil {
+			// not valid ip
+			ip = lookupFirstWithContext(ctx, host, config.DNSOpts...)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if ip == "" {
+			return nil, utils.Errorf("cannot resolve %v", target)
+		}
+
+		// handle ip address
+		if config.DisallowAddress != nil {
+			if config.DisallowAddress.Contains(ip) {
+				return nil, utils.Errorf("disallow address %v by config(check your yakit system/network config)", ip)
+			}
+		}
+
+		dialTarget := utils.HostPort(ip, port)
+
+		// Handle strong host mode: bind to specific local IP address
+		var localAddr *net.TCPAddr
+		if config.StrongHostMode && config.StrongLocalAddrIP != "" {
+			// Validate that StrongLocalAddrIP is actually an IP address
+			localIP := net.ParseIP(utils.FixForParseIP(config.StrongLocalAddrIP))
+			if localIP == nil {
+				log.Warnf("strong host mode: StrongLocalAddrIP '%s' is not a valid IP address, ignoring", config.StrongLocalAddrIP)
+			} else {
+				localAddr = &net.TCPAddr{
+					IP:   localIP,
+					Port: 0, // Let system choose port
+				}
+				if config.Debug {
+					log.Debugf("strong host mode: binding to local address %s", localAddr.String())
+				}
+			}
+		}
+
+		// Use TCPLocalAddr if explicitly set (takes precedence over strong host mode)
+		if config.TCPLocalAddr != nil {
+			localAddr = config.TCPLocalAddr
+			if config.Debug {
+				log.Debugf("using explicit TCPLocalAddr: %s", localAddr.String())
+			}
+		}
+
+		// Dial with local address binding if specified
+		if config.Dialer != nil {
+			conn, err = config.Dialer(config.Timeout, dialTarget)
+		} else if localAddr != nil {
+			// Use net.Dialer to bind to local address
+			dialer := &net.Dialer{
+				Timeout:   config.Timeout,
+				LocalAddr: localAddr,
+			}
+			conn, err = dialer.DialContext(ctx, "tcp", dialTarget)
+		} else {
+			conn, err = (&net.Dialer{Timeout: config.Timeout}).DialContext(ctx, "tcp", dialTarget)
+		}
+		if err != nil {
+			if config.Debug {
+				log.Errorf("dial %s failed: %v", target, err)
+			}
+
+			if config.StrongHostMode && config.StrongLocalAddrIP != "" {
+				log.Infof("strong host mode dial failed target [%s] |strong host [%s] |failed reason [%s]", target, localAddr, err.Error())
+			}
+
+			lastError = err
+			var opError *net.OpError
+			switch {
+			case errors.As(err, &opError):
+				if opError.Timeout() && config.EnableTimeoutRetry {
+					if err := waitRetry(utils.JitterBackoff(minWait, maxWait, int(timeoutRetryCount+1))); err != nil {
+						return nil, err
+					}
+					addTimeoutRetry()
+					goto RETRY
+				}
+				if strings.Contains(opError.Error(), "refused") {
+					if err := waitRetry(utils.JitterBackoff(minWait, maxWait, int(timeoutRetryCount+1))); err != nil {
+						return nil, err
+					}
+					addRefuseErrorRetry()
+					goto RETRY
+				}
+			}
+			return nil, err
+		}
+		return conn, nil
+	}
+
+	var errs error
+	proxyTarget := target
+	if config.ResolveBeforeProxy {
+		host, port, splitErr := net.SplitHostPort(target)
+		if splitErr != nil {
+			return nil, splitErr
+		}
+		if net.ParseIP(host) == nil {
+			ip := lookupFirstWithContext(ctx, host, config.DNSOpts...)
+			if ip == "" {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("cannot resolve proxy target %q locally", host)
+			}
+			if config.DisallowAddress != nil && config.DisallowAddress.Contains(ip) {
+				return nil, fmt.Errorf("disallow address %q by config", ip)
+			}
+			proxyTarget = net.JoinHostPort(ip, port)
+		}
+	}
+	for _, proxy := range config.Proxy {
+		conn, err := connectForceProxy(ctx, proxyTarget, proxy, config)
+		if err != nil {
+			log.Errorf("proxy conn failed: %s", err)
+			lastError = err
+			var opError *net.OpError
+			switch {
+			case errors.As(err, &opError):
+				if opError.Timeout() && config.EnableTimeoutRetry {
+					time.Sleep(utils.JitterBackoff(minWait, maxWait, int(timeoutRetryCount+1)))
+					addTimeoutRetry()
+					goto RETRY
+				}
+				// 代理 connection refused：该代理明确不可用，直接跳到
+				// 池中下一个代理。历史上此处 goto RETRY 从头重试同一
+				// 坏代理——仅因重试超限错误曾被包装成非 OpError 字符串
+				// 而碰巧落入 continue 分支；错误携带 cause 后该缺陷即
+				// 显现（MITM 下游代理池永远回退不到健康代理）。
+				if strings.Contains(opError.Error(), "refused") {
+					addRefuseErrorRetry()
+				}
+			}
+			errs = utils.JoinErrors(errs, err)
+			continue
+		}
+		return conn, nil
+	}
+	return nil, utils.Wrapf(errs, "connect: %v failed: no proxy available (in %v)", target, config.Proxy)
+}
+
+/*
+DialX is netx dial with more options
+
+Proxy is a list of proxy servers, if empty, no proxy will be used, otherwise retry with each proxy until success (no redirect)
+*/
+func DialX(target string, opt ...DialXOption) (net.Conn, error) {
+	config := &dialXConfig{
+		Timeout:             10 * time.Second,
+		TLSTimeout:          5 * time.Second,
+		EnableTimeoutRetry:  false,
+		TimeoutRetryMax:     3,
+		TimeoutRetryMinWait: 100 * time.Millisecond,
+		TimeoutRetryMaxWait: 500 * time.Millisecond,
+		DisallowAddress:     utils.NewHostsFilter(),
+		TLSNextProto:        []string{"http/1.1"},
+	}
+
+	// default init
+	defaultDialXOptionsMutex.Lock()
+	for _, o := range defaultDialXOptions {
+		o(config)
+	}
+	defaultDialXOptionsMutex.Unlock()
+
+	// user init
+	for _, o := range opt {
+		o(config)
+	}
+
+	startDialConn := time.Now() // dial all time
+	defer func() {
+		if config.TraceInfo != nil {
+			config.TraceInfo.SetTotalDuration(time.Since(startDialConn))
+		}
+	}()
+
+	clientHelloSpec := config.ClientHelloSpec
+	var clientHelloProfile *ClientHelloProfile
+	if clientHelloSpec == nil && config.TLSFingerprint != "" {
+		var err error
+		clientHelloProfile, err = GetClientHelloProfile(config.TLSFingerprint)
+		if err != nil {
+			return nil, err
+		}
+	}
+	useTls := config.EnableTLS || config.GMTLSSupport
+
+	if !useTls {
+		if config.Debug {
+			log.Infof("dial %s without tls", target)
+		}
+		return dialPlainTCPConnWithRetry(target, config)
+	}
+
+	// Enable TLS as default
+	strategies := []TLSStrategy{TLS_Strategy_Ordinary}
+	if config.GMTLSSupport {
+		if config.GMTLSOnly {
+			strategies = []TLSStrategy{TLS_Strategy_GMDail, TLS_Strategy_Ordinary}
+		} else if config.GMTLSPrefer {
+			strategies = []TLSStrategy{TLS_Strategy_GMDail, TLS_Strategy_Ordinary}
+		} else {
+			strategies = []TLSStrategy{TLS_Strategy_Ordinary, TLS_Strategy_GMDail}
+		}
+	}
+
+	sni := utils.ExtractHost(target)
+
+	minVer, maxVer := consts.GetGlobalTLSVersion()
+	var tlsConfig = &gmtls.Config{
+		ServerName:         sni,
+		MinVersion:         minVer, // nolint[:staticcheck]
+		MaxVersion:         maxVer,
+		InsecureSkipVerify: true,
+		Renegotiation:      gmtls.RenegotiateFreelyAsClient,
+	}
+	if config.ShouldOverrideTLSConfig {
+		tlsConfig = config.TLSConfig
+		if tlsConfig.ServerName == "" { // sni is empty , default sni require not empty
+			tlsConfig.ServerName = sni
+		}
+	}
+	if config.ShouldOverrideSNI {
+		tlsConfig.ServerName = config.SNI
+		// Also update sni variable so it's passed correctly to UpgradeToTLSConnectionWithTimeout
+		sni = config.SNI
+	}
+
+	tlsTimeout := 10 * time.Second
+	if config.TLSTimeout > 0 {
+		tlsTimeout = config.TLSTimeout
+	}
+
+	errs := make([]error, 0, len(strategies))
+	for _, strategy := range strategies {
+		tempTlsConfig := tlsConfig.Clone()
+		if config.Debug {
+			log.Infof("dial %v with tls strategy: %v, SNI: %s", target, strategy, tempTlsConfig.ServerName)
+		}
+		var tlsConn net.Conn
+		var tlsErr error
+		var tlsHandshakeDur time.Duration
+
+		switch strategy {
+		case TLS_Strategy_Ordinary:
+			tempTlsConfig.GMSupport = nil
+			tlsConn, tlsHandshakeDur, tlsErr = dialTLSWithRetry(target, config, tempTlsConfig, sni, tlsTimeout, clientHelloSpec, clientHelloProfile, strategy)
+		case TLS_Strategy_GMDail:
+			if len(errs) > 0 {
+				config.TraceInfo.AddTLSRetryTip("普通 TLS 失败，已尝试国密 TLS 兼容握手")
+			} else {
+				config.TraceInfo.AddTLSRetryTip("已尝试国密 TLS 兼容握手")
+			}
+			tlsConn, tlsHandshakeDur, tlsErr = dialTLSWithGMTLSCipherFallback(target, config, tempTlsConfig, sni, tlsTimeout)
+		default:
+			return nil, utils.Errorf("unknown tls strategy %v", strategy)
+		}
+
+		if tlsErr != nil {
+			errs = append(errs, tlsErr)
+			continue
+		}
+		config.TraceInfo.SetTLSHandshakeDuration(tlsHandshakeDur)
+		return tlsConn, nil
+	}
+	if len(errs) > 0 {
+		lastErr := errs[len(errs)-1]
+		displayErr := lastErr
+		retrySummary := ""
+		tlsReason := ""
+		tlsSuggestion := ""
+		var retryErr *tlsRetryError
+		if errors.As(lastErr, &retryErr) {
+			if retryErr.LastError() != nil {
+				displayErr = retryErr.LastError()
+			}
+			tlsReason = retryErr.Reason()
+			retrySummary = retryErr.RetrySummary()
+			tlsSuggestion = retryErr.suggestion
+		}
+		_, reasonCN, suggestion := getFriendlyTLSError(displayErr)
+		if tlsReason != "" {
+			reasonCN = tlsReason
+		}
+		if tlsSuggestion != "" {
+			suggestion = "建议: " + tlsSuggestion
+		}
+		errLines := []string{fmt.Sprintf("TLS连接失败(%s): %s", target, reasonCN)}
+		if displayErr != nil {
+			errLines = append(errLines, fmt.Sprintf("原始错误: %v", displayErr))
+		}
+		if retrySummary != "" {
+			errLines = append(errLines, fmt.Sprintf("TLS重试: %s", retrySummary))
+		}
+		if suggestion != "" {
+			errLines = append(errLines, suggestion)
+		}
+		return nil, utils.Error(strings.Join(errLines, "\n"))
+	}
+	return nil, utils.Error("unknown tls strategy error, BUG here!")
+}
+
+// dialPlainUdpConn get abstract udp conn, with global netx config (disallow address, etc).
+// A caller context bounds DNS and the dial. Direct UDP has no handshake, so a
+// cancelled context must be checked before DialUDP returns a connected socket.
+func dialPlainUdpConn(target string, config *dialXConfig) (udpConn *net.UDPConn, remoteAddr *net.UDPAddr, err error) {
+	ctx := context.Background()
+	if config != nil && config.Context != nil {
+		ctx = config.Context
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	host, port, err := utils.ParseStringToHostPort(target)
+	if err != nil {
+		return nil, nil, utils.Errorf("invalid target %#v, cannot find host:port", target)
+	}
+
+	host = utils.FixForParseIP(host)
+	ipIns := net.ParseIP(host)
+	if ipIns == nil {
+		host = lookupFirstWithContext(ctx, host, config.DNSOpts...)
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if ipIns = net.ParseIP(host); ipIns == nil {
+			return nil, nil, utils.Errorf("cannot resolve %v", target)
+		}
+	}
+
+	// handle ip address
+	if config.DisallowAddress != nil {
+		if config.DisallowAddress.Contains(host) {
+			return nil, nil, utils.Errorf("disallow address %v by config(check your yakit system/network config)", host)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	remoteAddr = &net.UDPAddr{
+		IP:   ipIns,
+		Port: port,
+	}
+
+	if config.JustListen {
+		udpConn, err = net.ListenUDP("udp", config.LocalAddr)
+		return
+	}
+
+	var timeout time.Duration
+	if config.Timeout > 0 {
+		timeout = config.Timeout
+	}
+	conn, err := (&net.Dialer{Timeout: timeout, LocalAddr: config.LocalAddr}).DialContext(ctx, "udp", remoteAddr.String())
+	if err != nil {
+		return nil, remoteAddr, err
+	}
+	udpConn, _ = conn.(*net.UDPConn)
+	if udpConn == nil {
+		_ = conn.Close()
+		return nil, remoteAddr, utils.Errorf("udp dial returned %T", conn)
+	}
+	return udpConn, remoteAddr, nil
+}
+
+func DialUdpX(target string, opt ...DialXOption) (*net.UDPConn, *net.UDPAddr, error) {
+	config := &dialXConfig{
+		DisallowAddress: utils.NewHostsFilter(),
+	}
+
+	// default init
+	defaultDialXOptionsMutex.Lock()
+	for _, o := range defaultDialXOptions {
+		o(config)
+	}
+	defaultDialXOptionsMutex.Unlock()
+
+	// user init
+	for _, o := range opt {
+		o(config)
+	}
+	return dialPlainUdpConn(target, config)
+}
+
+func getFriendlyTLSError(err error) (en, cn, suggestion string) {
+	if err == nil {
+		return "Unknown Error", "未知错误", ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "EOF"), strings.Contains(msg, "unexpected EOF"):
+		return "Connection Closed by Remote", "连接被远程关闭(目标服务器主动断开连接)",
+			"建议: 1.检查目标是否支持HTTPS 2.尝试切换TLS指纹 3.检查是否与其他代理软件冲突: 如Clash/V2Ray开启了TUN或Fake-IP模式请尝试关闭"
+	case strings.Contains(msg, "permission denied"):
+		return "Permission Denied", "连接被系统拒绝(权限不足或被防火墙拦截)",
+			"建议: 1.检查防火墙设置 2.尝试以管理员权限运行 3.国产系统(如银河麒麟)请检查「安全中心」-「网络保护」-「应用程序联网」是否拦截了本程序"
+	case strings.Contains(msg, "connection refused"):
+		return "Connection Refused", "目标服务器拒绝连接(端口未开放或服务未启动)",
+			"建议: 1.确认目标端口正确 2.确认目标服务已启动"
+	case strings.Contains(msg, "connection reset"):
+		return "Connection Reset", "连接被重置(可能被防火墙或安全设备拦截)",
+			"建议: 1.尝试切换TLS指纹 2.检查是否被WAF拦截 3.尝试使用代理"
+	case strings.Contains(msg, "i/o timeout"), strings.Contains(msg, "deadline exceeded"):
+		return "Connection Timeout", "连接超时(网络不通或目标无响应)",
+			"建议: 1.检查网络连接 2.确认目标可达 3.尝试增加超时时间"
+	case strings.Contains(msg, "no such host"):
+		return "DNS Lookup Failed", "域名解析失败(DNS无法解析该域名)",
+			"建议: 1.检查域名拼写 2.尝试更换DNS服务器 3.检查网络连接"
+	case strings.Contains(msg, "certificate"), strings.Contains(msg, "x509"):
+		return "Certificate Verify Failed", "证书验证失败",
+			"建议: 1.目标使用自签名证书属正常现象 2.如目标为国密站点可尝试开启「国密TLS」"
+	case strings.Contains(msg, "handshake failure"):
+		return "TLS Handshake Failed", "TLS握手失败(协议不兼容)",
+			"建议: 1.尝试切换TLS指纹 2.如目标为国密站点可尝试开启「国密TLS」 3.检查TLS版本兼容性"
+	case strings.Contains(msg, "network is unreachable"):
+		return "Network Unreachable", "网络不可达",
+			"建议: 1.检查网络连接 2.检查路由配置"
+	case strings.Contains(msg, "no route to host"):
+		return "No Route to Host", "无法路由到目标主机",
+			"建议: 1.检查目标IP是否正确 2.检查网络和路由配置"
+	case strings.Contains(msg, "protocol version"):
+		return "TLS Version Mismatch", "TLS协议版本不兼容",
+			"建议: 1.尝试切换TLS指纹 2.如目标为国密站点可尝试开启「国密TLS」"
+	case strings.Contains(msg, "closed"):
+		return "Connection Closed", "连接已关闭",
+			"建议: 1.尝试切换TLS指纹 2.检查是否与其他代理软件冲突: 如Clash/V2Ray开启了TUN或Fake-IP模式请尝试关闭"
+	default:
+		return "Connection Failed", "连接失败",
+			"建议: 1.尝试切换TLS指纹 2.检查网络连接"
+	}
+}

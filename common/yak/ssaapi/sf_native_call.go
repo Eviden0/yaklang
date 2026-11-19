@@ -1,0 +1,1764 @@
+package ssaapi
+
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/yaklang/yaklang/common/utils/memedit"
+	"github.com/yaklang/yaklang/common/yak/java/template2java"
+	"github.com/yaklang/yaklang/common/yak/java/templateconst"
+
+	"github.com/gobwas/glob"
+	"github.com/yaklang/yaklang/common/utils/yakunquote"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+
+	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssa/lifetime"
+
+	_ "github.com/yaklang/yaklang/common/syntaxflow/sfbuildin"
+)
+
+const (
+	// NativeCall_GetReturns is used to get the returns of a value
+	NativeCall_GetReturns = "getReturns"
+
+	// NativeCall_GetFormalParams is used to get the formal params of a value
+	NativeCall_GetFormalParams = "getFormalParams"
+
+	// NativeCall_GetFunc is used to get the function of a value
+	// find current function instruction which contains the value
+	NativeCall_GetFunc = "getFunc"
+
+	// NativeCall_GetCall is used to get the call of a value, generally used to get the call of an opcode
+	NativeCall_GetCall = "getCall"
+
+	// NativeCall_GetCallee is used to get the caller of a value
+	// find the caller instruction which contains the value
+	NativeCall_GetCallee = "getCallee"
+
+	// NativeCall_SearchFunc is used to search the call of a value, generally used to search the call of a function
+	// if the input is a call already, check the 'call' 's method(function) 's other call(search mode)
+	//
+	// searchCall is not like getCall, search call will search all function name(from call) in the program
+	NativeCall_SearchFunc = "searchFunc"
+
+	// NativeCall_GetObject is used to get the object of a value
+	NativeCall_GetObject = "getObject"
+
+	// NativeCall_GetMembers is used to get the members of a value
+	NativeCall_GetMembers = "getMembers"
+
+	// NativeCall_GetMemberByKey is used to get the members of a value by key
+	// example: <getMemberByKey(key="")>
+	NativeCall_GetMemberByKey = "getMemberByKey"
+
+	// NativeCall_GetSiblings is used to get the siblings of a value
+	NativeCall_GetSiblings = "getSiblings"
+
+	// NativeCall_TypeName is used to get the type name of a value
+	NativeCall_TypeName = "typeName"
+
+	// NativeCall_FullTypeName is used to get the full type name of a value
+	NativeCall_FullTypeName = "fullTypeName"
+
+	// NativeCall_Name is used to get the function name of a value
+	NativeCall_Name = "name"
+
+	// NativeCall_String is used to get the function name of a value
+	NativeCall_String = "string"
+
+	// NativeCall_Include is used to include a syntaxflow-rule
+	NativeCall_Include = "include"
+
+	// NativeCall_Eval is used to eval a new syntaxflow rule
+	NativeCall_Eval = "eval"
+
+	// NativeCall_Fuzztag is used to eval a new yaklang fuzztag template, the variables is in SFFrameResult
+	NativeCall_Fuzztag = "fuzztag"
+
+	// NativeCall_Show just show the value, do nothing
+	NativeCall_Show = "show"
+
+	// NativeCall_Slice just show the value, do nothing
+	// example: <slice(start=0)>
+	NativeCall_Slice = "slice"
+
+	// NativeCall_Regexp is used to regexp, group is available
+	//   you can use <regexp(`...`, group: 1)> to extract
+	NativeCall_Regexp = "regexp"
+
+	// NativeCall_StrLower is used to convert a string to lower case
+	NativeCall_StrLower = "strlower"
+
+	// NativeCall_StrUpper is used to convert a string to upper case
+	NativeCall_StrUpper = "strupper"
+
+	// NativeCall_Var is used to put vars to variables
+	NativeCall_Var = "var"
+
+	// NativeCall_MyBatisSink is used to find MyBatis Sink for default searching
+	NativeCall_MyBatisSink = "mybatisSink"
+
+	// NativeCall_FreeMarkerSink is used to find FreeMarker Sink for default searching
+	NativeCall_FreeMarkerSink = "freeMarkerSink"
+
+	// NativeCall_OpCodes is used to get the opcodes of a value
+	NativeCall_OpCodes = "opcodes"
+
+	// NativeCall_SourceCode is used to get the source code of a value
+	NativeCall_SourceCode = "sourceCode"
+
+	// NativeCall_ScanPrevious is used to scan previous opcode of a value
+	NativeCall_ScanPrevious = "scanPrevious"
+
+	// NativeCall_ScanNext is used to scan next
+	NativeCall_ScanNext = "scanNext"
+
+	//NativeCall_ScanInstruction is used to scan current block's instruction
+	NativeCall_ScanInstruction = "scanInstruction"
+
+	//NativeCall_DeleteVariable is used to delete a variable
+	NativeCall_DeleteVariable = "delete"
+
+	// NativeCall_Forbid is used to forbid a value, if values existed, report critical error.
+	NativeCall_Forbid = "forbid"
+
+	// NativeCall_Self is used to get self value
+	NativeCall_Self = "self"
+
+	// NativeCall_DataFlow is used to get data flow
+	// if u want to fetch dataflow, call <dataflow...> after --> or #->
+	// use it like: $data<dataflow(<<<CODE
+	// *?{opcode: call && <getCallee><name>?{name} }
+	// CODE)>
+	NativeCall_DataFlow = "dataflow"
+
+	// NativeCall_DataflowParam* are actual-parameter keys for <dataflow(...)> and matching keys on scan-style natives.
+	NativeCall_DataflowParamCode                   = "code"
+	NativeCall_DataflowParamInclude                = "include"
+	NativeCall_DataflowParamExclude                = "exclude"
+	NativeCall_DataflowParamHook                   = "hook"
+	NativeCall_DataflowParamUntil                  = "until"
+	NativeCall_DataflowParamEnd                    = "end"
+	NativeCall_DataflowParamDest                   = "dest"
+	NativeCall_DataflowParamDestination            = "destination"
+	NativeCall_DataflowParamOnlyReachable          = "only_reachable"
+	NativeCall_DataflowParamOnlyReachableCamel     = "onlyReachable"
+	NativeCall_DataflowParamOnlyReachableKebab     = "only-reachable"
+	NativeCall_DataflowParamOnlyReachableMode      = "only_reachable_mode"
+	NativeCall_DataflowParamOnlyReachableModeCamel = "onlyReachableMode"
+	NativeCall_DataflowParamStrict                 = "strict"
+	NativeCall_DataflowParamIcfg                   = "icfg"
+
+	// CFG native calls
+	NativeCall_GetCFG             = "getCfg"
+	NativeCall_CFGGuards          = "cfgGuards"
+	NativeCall_CFGDominates       = "cfgDominates"
+	NativeCall_CFGPostDom         = "cfgPostDominates"
+	NativeCall_CFGReachable       = "cfgReachable"
+	NativeCall_CFGReachPath       = "cfgReachPath"
+	NativeCall_CFGCondition       = "cfgCondition"
+	NativeCall_CFGConditionValues = "cfgConditionValues"
+
+	// NativeCall_ReachabilityGuard reports mustExecute(from-entry) for a target point and optional predicates.
+	NativeCall_ReachabilityGuard = "reachabilityGuard"
+
+	// NativeCall_Const is used to search const value
+	NativeCall_Const = "const"
+
+	// NativeCall_VersionIn is used to get the version in
+	NativeCall_VersionIn = "versionIn"
+
+	// NativeCall_IsSanitizeName checks for potential sanitization function names
+	NativeCall_IsSanitizeName = "isSanitizeName"
+
+	// NativeCall_Java_UnEscape_Output  is used to show output in java template languages that has not been escape,
+	// and is generally used to audit XSS vulnerabilities
+	NativeCall_Java_UnEscape_Output = "javaUnescapeOutput"
+
+	NativeCall_Foeach_Func_Inst = "foreach_function_inst"
+
+	NativeCall_GetFilenameByContent = "FilenameByContent"
+
+	NativeCall_GetFullFileName = "getFullFileName"
+
+	NativeCall_GetUsers = "getUsers"
+
+	NativeCall_GetPredecessors = "getPredecessors"
+
+	NativeCall_GetActualParams = "getActualParams"
+
+	NativeCall_GetActualParamLen = "getActualParamLen"
+
+	//getCurrentBlueprint is used to get the current blueprint. only function can use it
+	NativeCall_GetCurrentBlueprint = "getCurrentBlueprint"
+
+	NativeCall_ExtendsBy = "extendsBy"
+
+	NativeCall_GetBlurpint = "getBluePrint"
+
+	NativeCall_GetParentBlueprint = "getParentsBlueprint"
+
+	NativeCall_GetInterfaceBlueprint = "getInterfaceBlueprint"
+
+	NativeCall_GetRootParentBlueprint = "getRootParentBlueprint"
+
+	NativeCall_Length = "len"
+
+	NativeCall_GetRoot = "root"
+
+	// NativeCall_MatchRegexpPath checks whether a regex literal (e.g. from app.use())
+	// can be bypassed by uppercasing a string route path (e.g. from app.get()).
+	// Usage: $regexVar<matchRegexpPath(target="$routeVar")>
+	// Returns the regex values that have a bypass risk against the target string paths.
+	NativeCall_MatchRegexpPath = "matchRegexpPath"
+
+	// NativeCall_NPD finds null-pointer dereference sites (independent of UAF).
+	// Usage:
+	//   - *<npd()> as $npd                      // all NPD sites
+	//   - $ptr<npd()> as $npd                   // NPD related to $ptr
+	//   - <npd(target=$ptr)> as $npd            // same, named target (receiver may be *)
+	NativeCall_NPD = "npd"
+)
+
+var nativeCallLength = sfvm.ValuesNativeCall(func(group sfvm.Values, slotSource sfvm.ValueOperator, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (sfvm.Values, error) {
+	count := 0
+	_ = group.Recursive(func(operator sfvm.ValueOperator) error {
+		if utils.IsNil(operator) || operator.IsEmpty() {
+			return nil
+		}
+		count++
+		return nil
+	})
+
+	if utils.IsNil(slotSource) {
+		slotSource, _ = group.First()
+	}
+	if utils.IsNil(slotSource) {
+		return sfvm.NewEmptyValues(), nil
+	}
+
+	result := slotSource.NewConst(count)
+	if utils.IsNil(result) {
+		return sfvm.NewEmptyValues(), nil
+	}
+	return sfvm.ValuesOf(result), nil
+})
+
+var nativeCallSlice = sfvm.ValuesNativeCall(func(group sfvm.Values, slotSource sfvm.ValueOperator, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (sfvm.Values, error) {
+	start := params.GetInt(0, "start")
+	index := params.GetInt(0, "index")
+
+	if index == -1 && start == -1 {
+		return nil, utils.Errorf("start or index is required")
+	}
+
+	collectByRange := func(values sfvm.Values) sfvm.Values {
+		if index != -1 {
+			if index >= 0 && index < len(values) {
+				return sfvm.ValuesOf(values[index])
+			}
+			return sfvm.NewEmptyValues()
+		}
+		if start != -1 {
+			if start < 0 || start >= len(values) {
+				return sfvm.NewEmptyValues()
+			}
+			return sfvm.NewValues(values[start:])
+		}
+		return sfvm.NewEmptyValues()
+	}
+
+	return collectByRange(group), nil
+})
+
+func init() {
+	registerNativeCall(NativeCall_GetRoot, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []sfvm.ValueOperator
+		prog, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		var getRoot func(value ssa.Value)
+		getRoot = func(value ssa.Value) {
+			if utils.IsNil(value) {
+				return
+			}
+			call, isCall := ssa.ToCall(value)
+			if isCall {
+				if method, ok := call.GetValueById(call.Method); ok && method != nil {
+					getRoot(method)
+				}
+				return
+			}
+			obj := value.GetObject()
+			if utils.IsNil(obj) {
+				newValue, err2 := prog.NewValue(value)
+				if err2 != nil {
+					return
+				}
+				result = append(result, newValue)
+				return
+			}
+			getRoot(obj)
+		}
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			switch ret := operator.(type) {
+			case *Program:
+				return nil
+			case *Value:
+				getRoot(ret.getValue())
+			}
+			return nil
+		})
+		return true, sfvm.NewValues(result), nil
+	}))
+
+	registerNativeCall(NativeCall_GetRootParentBlueprint, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []sfvm.ValueOperator
+		prog, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		existed := make(map[int64]*Value)
+		walkCurrentBlueprint(v, func(source *Value, blueprint *ssa.Blueprint) {
+			for _, parent := range blueprint.GetRootParentBlueprints() {
+				val, err := prog.NewValue(parent.Container())
+				if err != nil || val == nil {
+					continue
+				}
+				val.AppendPredecessor(source, frame.WithPredecessorContext("getRootParentBlueprint"))
+				if current, ok := existed[val.GetId()]; ok {
+					sfvm.MergeAnchor(source, current)
+					continue
+				}
+				sfvm.MergeAnchor(source, val)
+				existed[val.GetId()] = val
+				result = append(result, val)
+			}
+		})
+		if len(result) == 0 {
+			return false, nil, utils.Errorf("no parents blueprint found")
+		}
+		return true, sfvm.NewValues(result), nil
+	}))
+	registerNativeCall(NativeCall_Length, nc_func(nativeCallLength))
+
+	registerNativeCall(NativeCall_GetInterfaceBlueprint, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []sfvm.ValueOperator
+		prog, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		existed := make(map[int64]*Value)
+		walkCurrentBlueprint(v, func(source *Value, blueprint *ssa.Blueprint) {
+			for _, parent := range blueprint.GetAllInterfaceBlueprints() {
+				val, err := prog.NewValue(parent.Container())
+				if err != nil || val == nil {
+					continue
+				}
+				val.AppendPredecessor(source, frame.WithPredecessorContext("getInterfaceBlueprint"))
+				if current, ok := existed[val.GetId()]; ok {
+					sfvm.MergeAnchor(source, current)
+					continue
+				}
+				sfvm.MergeAnchor(source, val)
+				existed[val.GetId()] = val
+				result = append(result, val)
+			}
+		})
+		if len(result) == 0 {
+			return false, nil, utils.Errorf("no parents blueprint found")
+		}
+		return true, sfvm.NewValues(result), nil
+	}))
+
+	registerNativeCall(NativeCall_GetParentBlueprint, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []sfvm.ValueOperator
+		prog, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		existed := make(map[int64]*Value)
+		walkCurrentBlueprint(v, func(source *Value, blueprint *ssa.Blueprint) {
+			for _, parent := range blueprint.GetAllParentsBlueprint() {
+				val, err := prog.NewValue(parent.Container())
+				if err != nil || val == nil {
+					continue
+				}
+				val.AppendPredecessor(source, frame.WithPredecessorContext("getParentBlueprint"))
+				if current, ok := existed[val.GetId()]; ok {
+					sfvm.MergeAnchor(source, current)
+					continue
+				}
+				sfvm.MergeAnchor(source, val)
+				existed[val.GetId()] = val
+				result = append(result, val)
+			}
+		})
+		if len(result) == 0 {
+			return false, nil, utils.Errorf("no parents blueprint found")
+		}
+		return true, sfvm.NewValues(result), nil
+	}))
+
+	registerNativeCall(NativeCall_GetBlurpint, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []sfvm.ValueOperator
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			switch ret := operator.(type) {
+			case *Value:
+				_, isBlueprint := ssa.ToClassBluePrintType(ret.getValue().GetType())
+				if isBlueprint {
+					result = append(result, ret)
+				}
+			default:
+				return nil
+			}
+			return nil
+		})
+		return true, sfvm.NewValues(result), nil
+	}))
+	registerNativeCall(NativeCall_ExtendsBy, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		/*
+		*a<extendsBy($b)> 判断a是否继承自b
+		 */
+		var result []sfvm.ValueOperator
+		var extends []*ssa.Blueprint
+		name := params.GetString(0)
+		val, ok := frame.GetSymbolByName(name)
+		if !ok {
+			return false, nil, utils.Errorf("can't find symbol %s", name)
+		}
+		val.Recursive(func(operator sfvm.ValueOperator) error {
+			switch ret := operator.(type) {
+			case *Value:
+				typ, isBlueprint := ssa.ToClassBluePrintType(ret.getValue().GetType())
+				if isBlueprint {
+					extends = append(extends, typ)
+				}
+			default:
+				return nil
+			}
+			return nil
+		})
+		check := func(p ssa.Type) bool {
+			typ, isBlueprint := ssa.ToClassBluePrintType(p)
+			if isBlueprint {
+				return false
+			}
+			for _, extend := range extends {
+				if typ.CheckExtendedBy(extend) {
+					return true
+				}
+			}
+			return false
+		}
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			switch ret := operator.(type) {
+			case *Value:
+				node := ret.getValue()
+				if check(node.GetType()) {
+					result = append(result, ret)
+				}
+			default:
+				return nil
+			}
+			return nil
+		})
+		return true, sfvm.NewValues(result), nil
+	}))
+	registerNativeCall(NativeCall_GetCurrentBlueprint, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []sfvm.ValueOperator
+		prog, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		existed := make(map[int64]*Value)
+		walkCurrentBlueprint(v, func(source *Value, blueprint *ssa.Blueprint) {
+			val, err := prog.NewValue(blueprint.Container())
+			if err != nil || val == nil {
+				return
+			}
+			val.AppendPredecessor(source, frame.WithPredecessorContext("getCurrentBlueprint"))
+			if current, ok := existed[val.GetId()]; ok {
+				sfvm.MergeAnchor(source, current)
+				return
+			}
+			sfvm.MergeAnchor(source, val)
+			existed[val.GetId()] = val
+			result = append(result, val)
+		})
+		if len(result) == 0 {
+			return false, nil, utils.Errorf("no blueprint found")
+		}
+		return true, sfvm.NewValues(result), nil
+	}))
+
+	registerNativeCall(NativeCall_GetActualParams, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		result, err := v.GetCallActualParams(0, true)
+		if err != nil {
+			return false, nil, err
+		}
+		return true, result, nil
+	}), nc_desc("获取实际参数"))
+	registerNativeCall(NativeCall_GetUsers, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		requestedDepth := params.GetInt(0, "depth")
+		steps := requestedDepth
+		if steps <= 0 {
+			steps = 1
+		}
+
+		current := v
+		for step := 0; step < steps; step++ {
+			var next []sfvm.ValueOperator
+			err := current.Recursive(func(operator sfvm.ValueOperator) error {
+				ret, ok := operator.(*Value)
+				if !ok || ret == nil {
+					return nil
+				}
+				users := ToSFVMValues(ret.GetUsers())
+				sfvm.MergeAnchor(ret, users...)
+				_ = users.AppendPredecessor(ret, frame.WithPredecessorContext(fmt.Sprintf("getUsers(depth=%d)", requestedDepth)))
+				next = append(next, users...)
+				return nil
+			})
+			if err != nil {
+				return false, nil, err
+			}
+			current = sfvm.NewValues(next)
+			if current.IsEmpty() {
+				break
+			}
+		}
+		if current.IsEmpty() {
+			return false, nil, nil
+		}
+		return true, current, nil
+	}), nc_desc("获取值的Users"))
+
+	// NativeCall_GetPredecessors is used to get the predecessors of a value
+	// <getPredecessors()> =  <getPredecessors(1)>
+	registerNativeCall(NativeCall_GetPredecessors, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []*Value
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			switch ret := operator.(type) {
+			case *Value:
+				result = append(result, ret)
+			}
+			return nil
+		})
+		if len(result) == 0 {
+			return false, nil, utils.Errorf("no value found")
+		}
+		// default param is depth, depth default = 1
+		depth := params.GetInt(0, "depth")
+		if depth == -1 {
+			depth = 1
+		}
+
+		// get v.GetPredecessors() through depth
+		// this is tree
+		visited := make(map[*Value]struct{})
+		var allFoundPredecessors []sfvm.ValueOperator
+		currentLevel := make([]*Value, 0, len(result))
+
+		// Initialize visited and currentLevel with start nodes
+		for _, node := range result {
+			if _, exists := visited[node]; !exists {
+				visited[node] = struct{}{}
+				currentLevel = append(currentLevel, node)
+			}
+		}
+
+		// Traverse predecessors level by level up to the specified depth
+		for d := 0; d < depth; d++ {
+			if len(currentLevel) == 0 {
+				break // No more nodes to explore
+			}
+			nextLevel := make([]*Value, 0)
+			for _, node := range currentLevel {
+				predecessors := node.GetPredecessors() // Assuming GetPredecessors returns []*Value
+				for _, p := range predecessors {
+					pred := p.Node
+					if _, exists := visited[pred]; !exists {
+						visited[pred] = struct{}{}
+						allFoundPredecessors = append(allFoundPredecessors, pred)
+						nextLevel = append(nextLevel, pred)
+					}
+				}
+			}
+			currentLevel = nextLevel
+		}
+
+		if len(allFoundPredecessors) == 0 {
+			return false, nil, utils.Errorf("no predecessors found within depth %d", depth)
+		}
+
+		return true, sfvm.NewValues(allFoundPredecessors), nil
+
+	}), nc_desc("获取值的前驱节点"))
+
+	// NativeCall_GetFullFileName is used to get the full file name, the input is a file name. eg.
+	// <getFullFileName(filename="xxx")>
+	registerNativeCall(NativeCall_GetFullFileName, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		// TODO:目前使用的是文件整个路径去匹配，而不是仅文件名匹配，后续可以考虑优化、并支持搜索文件夹名
+		var rs []sfvm.ValueOperator
+		targetName := params.GetString("filename")
+		if targetName == "" {
+			return false, nil, utils.Errorf("filename is empty")
+		}
+		program, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		p := program.Program
+		if p == nil {
+			return false, nil, utils.Errorf("program is nil")
+		}
+		overlay := fetchProgramOverlay(v)
+		matchFilename := func(f func(filename string) bool) {
+			appendMatch := func(owner *Program, s string, me *memedit.MemEditor) {
+				if owner == nil || !f(s) {
+					return
+				}
+				rs = append(rs, owner.NewConstValue(s, me.GetFullRange()))
+			}
+			if overlay != nil {
+				// Incremental scans resolve names against every visible layer.
+				overlay.forEachVisibleFile(true, false, func(entry overlayFileEntry) bool {
+					appendMatch(entry.Program, entry.Path, entry.Editor)
+					return true
+				})
+				return
+			}
+			program.ForEachAllFile(func(s string, me *memedit.MemEditor) bool {
+				appendMatch(program, s, me)
+				return true
+			})
+		}
+		if compile, err := glob.Compile(targetName); err == nil {
+			matchFilename(func(filename string) bool {
+				return compile.Match(filename)
+			})
+		}
+		if r, err := regexp.Compile(targetName); err == nil {
+			matchFilename(func(filename string) bool {
+				return r.MatchString(filename)
+			})
+		}
+		matchFilename(func(filename string) bool {
+			return strings.EqualFold(filename, targetName)
+		})
+		return true, sfvm.NewValues(rs), nil
+	}))
+	registerNativeCall(NativeCall_GetFilenameByContent, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var rs []sfvm.ValueOperator
+
+		program, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		prog := program.Program
+		overlay := fetchProgramOverlay(v)
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			switch ret := operator.(type) {
+			case *Program:
+				return nil
+			case *Value:
+				if ret == nil || ret.getValue() == nil {
+					return nil
+				}
+				vr := ret.getValue().GetRange()
+				if vr == nil {
+					log.Errorf("node range is nil")
+					return nil
+				}
+				editor := vr.GetEditor()
+				if editor == nil {
+					log.Errorf("node editor is nil")
+					return nil
+				}
+				// A base-layer value is not in the top program's FileList, so an
+				// incremental scan must check the overlay's visible file set.
+				visible := false
+				if overlay != nil {
+					visible = overlay.isVisibleFile(editor.GetUrl(), ret.GetProgramName())
+				} else if prog != nil {
+					_, visible = prog.FileList[editor.GetUrl()]
+				}
+				if !visible {
+					log.Errorf("program filelist not found this file")
+					return nil
+				}
+				owner := ret.ParentProgram
+				if owner == nil {
+					owner = program
+				}
+				rs = append(rs, owner.NewConstValue(editor.GetFilename(), editor.GetFullRange()))
+			}
+			return nil
+		})
+		return true, sfvm.NewValues(rs), nil
+	}))
+	//<foreach_function_inst(hook=`xxx` as $result)> as $result
+	registerNativeCall(NativeCall_Foeach_Func_Inst, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var result []sfvm.ValueOperator
+		prog, err := fetchProgram(v)
+		if err != nil {
+			return false, nil, err
+		}
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			value, ok := operator.(*Value)
+			if !ok {
+				return nil
+			}
+			function, flag := ssa.ToFunction(value.getValue())
+			if !flag {
+				return nil
+			}
+			enter, ok := function.GetBasicBlockByID(function.EnterBlock)
+			if !ok || enter == nil {
+				return nil
+			}
+			result1 := searchAlongBasicBlock(enter.GetBlock(), prog, frame, params, Next)
+			result = append(result, result1...)
+			return nil
+		})
+		return true, sfvm.NewValues(result), nil
+	}))
+	registerNativeCall(NativeCall_Java_UnEscape_Output, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var res []sfvm.ValueOperator
+
+		// 模板语言输出的标志位
+		flag := templateconst.JAVA_REQUEST_PATH
+		unEscapeKey := templateconst.JAVA_UNESCAPE_OUTPUT_PRINT
+
+		// typeCarriesRequestPath reports whether a type mentions the servlet request
+		// path. `any` is excluded on purpose: it is the "unresolved" placeholder and
+		// would match nothing anyway, but skipping it keeps the check honest.
+		typeCarriesRequestPath := func(t ssa.Type) bool {
+			if t == nil {
+				return false
+			}
+			for _, name := range t.GetFullTypeNames() {
+				if strings.Contains(name, flag) {
+					return true
+				}
+			}
+			return false
+		}
+
+		// inTemplateService reports whether the enclosing function is the container
+		// generated by template2java for a JSP/template page. That function always
+		// declares HttpServletRequest/HttpServletResponse parameters, so it is a
+		// stable signal that the print() call came from template output -- unlike the
+		// value's own type, which is frequently just `any` before resolution.
+		inTemplateService := func(call *Value) bool {
+			if call == nil || call.IsNil() {
+				return false
+			}
+			inst := call.GetSSAInst()
+			if inst == nil {
+				return false
+			}
+			fn := inst.GetFunc()
+			if fn == nil {
+				return false
+			}
+			if fn.GetName() == template2java.JAVA_TEMPLATE_SERVER_NAME ||
+				fn.GetVerboseName() == template2java.JAVA_TEMPLATE_SERVER_NAME {
+				return true
+			}
+			for _, paramID := range fn.Params {
+				param, ok := fn.GetValueById(paramID)
+				if !ok || param == nil {
+					continue
+				}
+				if typeCarriesRequestPath(param.GetType()) {
+					return true
+				}
+			}
+			return false
+		}
+
+		shouldCollect := func(method *Value, call *Value) bool {
+			// Prefer call-site context; fall back to the method's own type when the
+			// call has no enclosing template service (e.g. values reloaded from DB).
+			if inTemplateService(call) {
+				return true
+			}
+			if method == nil || method.IsNil() {
+				return false
+			}
+			wrapper := method.GetType()
+			if wrapper == nil {
+				return false
+			}
+			return typeCarriesRequestPath(wrapper.t)
+		}
+
+		getCalledAndCheck := func(value *Value) []sfvm.ValueOperator {
+			var vals []sfvm.ValueOperator
+			visited := make(map[int64]struct{})
+			var walk func(v *Value)
+			walk = func(v *Value) {
+				if v == nil || v.IsNil() {
+					return
+				}
+				if _, ok := visited[v.GetId()]; ok {
+					return
+				}
+				visited[v.GetId()] = struct{}{}
+
+				callInst := v.GetCalledBy()
+				callInst.ForEach(func(call *Value) {
+					if !shouldCollect(v, call) {
+						return
+					}
+					// GetCallArgs() 返回 Values，需要转换为 sfvm.ValueOperator
+					vals = append(vals, ToSFVMValues(call.GetCallArgs())...)
+				})
+
+				if v.IsPhi() || v.IsSideEffect() {
+					for _, vv := range GetValues(v) {
+						walk(vv)
+					}
+				}
+			}
+			walk(value)
+
+			return vals
+		}
+
+		match, outValue, err := v.GlobMatch(frame.GetContext(), ssadb.NameMatch, `out`)
+		if !match || err != nil {
+			return false, nil, utils.Errorf("no value found")
+		}
+		match, printValue, err := outValue.GlobMatch(frame.GetContext(), ssadb.KeyMatch, unEscapeKey)
+		if !match || err != nil {
+			return false, nil, utils.Errorf("no value found")
+		}
+
+		for _, item := range printValue {
+			value, ok := item.(*Value)
+			if !ok {
+				continue
+			}
+			vals := getCalledAndCheck(value)
+			res = append(res, vals...)
+		}
+
+		if len(res) > 0 {
+			return true, sfvm.NewValues(res), nil
+		}
+		return false, nil, nil
+	}), nc_desc("获取Java模板语言中未转义的输出"))
+
+	registerNativeCall(NativeCall_IsSanitizeName, nc_func(nativeCallSanitizeNames), nc_desc("检查是否为潜在的过滤函数名称"))
+
+	registerNativeCall(NativeCall_VersionIn, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		gt := params.GetString("greaterThan")  // <
+		ge := params.GetString("greaterEqual") // <=
+		if gt != "" && ge != "" {
+			return false, nil, utils.Errorf("lt and le cannot be used at the same time")
+		}
+		vstart := "0.0.0"
+		geFlag := false
+		if gt != "" {
+			vstart = gt
+		} else if ge != "" {
+			vstart = ge
+			geFlag = true
+		}
+
+		lt := params.GetString("lessThan")  // >
+		le := params.GetString("lessEqual") // >=
+		if lt != "" && le != "" {
+			return false, nil, utils.Errorf("gt and ge cannot be used at the same time")
+		}
+		vend := "99999999.999.999"
+		leFlag := false
+		if lt != "" {
+			vend = lt
+		} else if le != "" {
+			vend = le
+			leFlag = true
+		}
+		vstart = yakunquote.TryUnquote(vstart)
+		vend = yakunquote.TryUnquote(vend)
+		compareIn := func(version string) bool {
+			c1, err := utils.VersionCompare(version, vstart)
+			if err != nil {
+				return false
+			}
+			c2, err := utils.VersionCompare(vend, version)
+			if c1 == 0 && !geFlag {
+				return false
+			}
+			if c2 == 0 && !leFlag {
+				return false
+			}
+			return c1 != -1 && c2 != -1
+		}
+
+		var results []sfvm.ValueOperator
+		// Values 不再实现 ValueOperator，直接使用 Recursive 遍历所有值
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			val, ok := operator.(*Value)
+			if !ok {
+				return nil
+			}
+			ssaValue := val.GetSSAInst()
+			if ssaValue.GetOpcode() != ssa.SSAOpcodeConstInst {
+				return nil
+			}
+			ver := fmt.Sprint(ssaValue)
+			if compareIn(ver) {
+				results = append(results, val)
+			}
+			return nil
+		})
+		if len(results) > 0 {
+			return true, sfvm.NewValues(results), nil
+		}
+		return false, nil, utils.Error("not value in version range")
+	}), nc_desc("获取版本信息"))
+	registerNativeCall(NativeCall_Const, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		var (
+			results    []sfvm.ValueOperator
+			mode, rule string
+		)
+
+		appendResult := func(source sfvm.ValueOperator, matched sfvm.Values) {
+			if matched.IsEmpty() {
+				return
+			}
+			sfvm.MergeAnchor(source, matched...)
+			results = append(results, matched...)
+		}
+
+		constHandler := func(operator sfvm.ValueOperator) {
+			switch mode {
+			case "e":
+				if match, valueOperator, err := operator.ExactMatch(frame.GetContext(), ssadb.ConstType, rule); match && err == nil {
+					appendResult(operator, valueOperator)
+				}
+			case "g":
+				if match, valueOperator, err := operator.GlobMatch(frame.GetContext(), ssadb.ConstType, rule); match && err == nil {
+					appendResult(operator, valueOperator)
+				}
+			case "r":
+				if match, valueOperator, err := operator.RegexpMatch(frame.GetContext(), ssadb.ConstType, rule); match && err == nil {
+					appendResult(operator, valueOperator)
+				}
+			}
+		}
+		getRule := func(preMode ...string) string {
+			for _, s := range preMode {
+				if params.GetString(s) != "" {
+					mode = s
+					return params.GetString(s)
+				}
+			}
+			mode = ""
+			return yakunquote.TryUnquote(params.GetString(0))
+		}
+		autoMode := func(rule string) {
+			if _, err := glob.Compile(rule); err == nil {
+				mode = "g"
+				return
+			}
+			if _, err := regexp.Compile(rule); err == nil {
+				mode = "r"
+				return
+			}
+			mode = "e"
+		}
+		rule = getRule("g", "r", "e")
+		if mode == "" {
+			autoMode(rule)
+		}
+
+		v.Recursive(func(operator sfvm.ValueOperator) error {
+			switch ret := operator.(type) {
+			case *Program:
+				constHandler(ret)
+			case *ProgramOverLay:
+				constHandler(ret)
+			case *Value:
+				if ret.IsConstInst() {
+					constHandler(ret)
+				}
+			}
+			return nil
+		})
+		return true, sfvm.NewValues(results), nil
+	}))
+	registerNativeCall(NativeCall_DataFlow, nc_func(nativeCallDataFlow), nc_desc(`数据流路径过滤（include/exclude 子规则）。可选 only_reachable="$cfgVar"：对结果按 CFG 点对点可达性过滤；可与 icfg/max_depth/max_nodes 同用（icfg 打开时护栏默认生效）。`))
+	registerNativeCall(NativeCall_Self, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		return true, v, nil
+	}))
+	registerNativeCall(NativeCall_Forbid, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		name := params.GetString(0, "var")
+		if name != "" {
+			result, _ := frame.GetSFResult()
+			if result != nil {
+				vars, ok := result.SymbolTable.Get(name)
+				if ok && haveResult(vars) {
+					return false, nil, utils.Wrapf(sfvm.CriticalError, "forbid sf-var: %v", name)
+				}
+				if vars, ok := result.SymbolTable.Get(name); ok && haveResult(vars) {
+					return false, nil, utils.Wrapf(sfvm.CriticalError, "forbid sf-var: %v", name)
+				}
+			}
+			if vars, ok := frame.GetSymbolTable().Get(name); ok && haveResult(vars) {
+				return false, nil, utils.Wrapf(sfvm.CriticalError, "forbid sf-var: %v", name)
+			}
+			return true, v, nil
+		}
+
+		if haveResult(v) {
+			return false, nil, utils.Wrapf(sfvm.CriticalError, "forbid")
+		}
+		return true, v, nil
+	}))
+	registerNativeCall(NativeCall_DeleteVariable, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		name := params.GetString("name", 0)
+		if name != "" {
+			frame.GetSymbolTable().Delete(name)
+			result, _ := frame.GetSFResult()
+			if result != nil {
+				result.SymbolTable.Delete(name)
+				result.AlertSymbolTable.Delete(name)
+				delete(result.GetRule().AlertDesc, name)
+			}
+		}
+		return true, v, nil
+	}))
+	registerNativeCall(NativeCall_ScanNext, nc_func(nativeCallScan(Next)))
+	registerNativeCall(NativeCall_ScanPrevious, nc_func(nativeCallScan(Previous)))
+	registerNativeCall(NativeCall_ScanInstruction, nc_func(nativeCallScan(Current)))
+	registerNativeCall(NativeCall_SourceCode, nc_func(nativeCallSourceCode))
+	registerNativeCall(NativeCall_OpCodes, nc_func(nativeCallOpCodes))
+
+	//nativeCall-slice
+	registerNativeCall(NativeCall_Slice, nc_func(nativeCallSlice))
+	registerNativeCall(NativeCall_MyBatisSink, nc_func(nativeCallMybatisXML), nc_desc("Fins MyBatis Sink for default searching"))
+	registerNativeCall(NativeCall_FreeMarkerSink, nc_func(nativeCallFreeMarker))
+	registerNativeCall(NativeCall_Var, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		varName := params.GetString(0)
+		//log.Info("syntax flow native call 'as' to", varName)
+
+		var vals []sfvm.ValueOperator
+		result, ok := frame.GetSymbolTable().Get(varName)
+		if ok && haveResult(result) {
+			_ = result.Recursive(func(operator sfvm.ValueOperator) error {
+				_, ok := operator.(*Value)
+				if ok {
+					vals = append(vals, operator)
+				}
+				return nil
+			})
+		}
+		_ = v.Recursive(func(operator sfvm.ValueOperator) error {
+			_, ok := operator.(*Value)
+			if ok {
+				vals = append(vals, operator)
+			}
+			return nil
+		})
+		frame.GetSymbolTable().Set(varName, sfvm.NewValues(vals))
+		return true, v, nil
+	}), nc_desc(`put vars to variables`))
+	registerNativeCall(NativeCall_MatchRegexpPath, nc_func(nativeCallMatchRegexpPath), nc_desc(`检查正则表达式路径（如 app.use() 中的 /\/admin\/.*/）是否能被大小写绕过。
+用法: $regexVar<matchRegexpPath(target="$routeVar")>
+输入是正则字面量值集合，target 参数是目标字符串路径变量名。
+如果存在字符串路径（大小写不敏感）能被大写攻击URL命中，但中间件正则（大小写敏感）无法拦截，则输出该正则值（bypass风险）。`))
+	registerNativeCall(NativeCall_StrLower, nc_func(nativeCallStrLower), nc_desc(`convert a string to lower case`))
+	registerNativeCall(NativeCall_StrUpper, nc_func(nativeCallStrUpper), nc_desc(`convert a string to upper case`))
+	registerNativeCall(NativeCall_Regexp, nc_func(nativeCallRegexp), nc_desc(`regexp a string, group is available`))
+
+	registerNativeCall(NativeCall_Show, nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+		idx := 0
+		_ = v.Recursive(func(operator sfvm.ValueOperator) error {
+			if ret, ok := operator.(*Value); ok {
+				_ = ret
+				log.Debugf("-%3d: %v\n", idx, ret.String())
+				idx++
+			}
+			return nil
+		})
+		return true, v, nil
+	}), nc_desc(`show the value, do nothing`))
+
+	registerNativeCall(
+		NativeCall_Eval,
+		nc_func(nativeCallEval),
+		nc_desc(`eval a new syntaxflow rule, you can use this to eval dynamic rule`),
+	)
+
+	registerNativeCall(
+		NativeCall_Fuzztag,
+		nc_func(nativeCallFuzztag),
+		nc_desc(`eval a new yaklang fuzztag template, the variables is in SFFrameResult`),
+	)
+
+	registerNativeCall(
+		NativeCall_Include,
+		nc_func(nativeCallInclude),
+		nc_desc(`include a syntaxflow-rule`),
+	)
+
+	registerNativeCall(
+		NativeCall_String,
+		nc_func(nativeCallString),
+		nc_desc(`获取输入指令的字符串表示`),
+	)
+
+	registerNativeCall(
+		NativeCall_Name,
+		nc_func(nativeCallName),
+		nc_desc(`获取输入指令的名称表示，例如函数名，变量名，或者字段名等`),
+	)
+
+	registerNativeCall(
+		NativeCall_TypeName,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			/*
+				java.io.File #-> File
+			*/
+			var vals []sfvm.ValueOperator
+			var tmpMap = make(map[string]sfvm.ValueOperator)
+			addVals := func(val *Value, typ string) {
+				if typ == "" {
+					return
+				}
+				if existed, ok := tmpMap[typ]; ok {
+					_ = existed.AppendPredecessor(val, frame.WithPredecessorContext("typeName"))
+					sfvm.MergeAnchor(val, existed)
+					return
+				}
+				vx := val.NewConstValue(typ, val.GetRange())
+				vx.AppendPredecessor(val, frame.WithPredecessorContext("typeName"))
+				sfvm.MergeAnchor(val, vx)
+				tmpMap[typ] = vx
+				vals = append(vals, vx)
+			}
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				// <typeName> on a large project matches a huge value set (e.g. every
+				// call/instruction); addVals -> AppendPredecessor per element is the
+				// dominant CPU/alloc cost (see pprof: AppendPredecessor/ValueCompare).
+				// Re-check the per-rule ctx + total-work budget here so the
+				// --rule-timeout / --rule-work-limit budgets bail this loop instead
+				// of the rule running for hours inside one opcode.
+				if err := frame.GetConfig().BailCheck(); err != nil {
+					return err
+				}
+				switch val := operator.(type) {
+				case *Value:
+					typ := val.GetType()
+					if typ == nil || typ.t == nil {
+						return utils.Errorf("native call type name failed: the value have %s no type", val.String())
+					}
+					fts := typ.t.GetFullTypeNames()
+					if len(fts) == 0 {
+						addVals(val, typ.String())
+					} else {
+						for _, ft := range fts {
+							ft = yakunquote.TryUnquote(ft)
+							index := strings.Index(ft, ":")
+							if index != -1 {
+								ft = ft[:index]
+								addVals(val, ft)
+							}
+							lastIndex := strings.LastIndex(ft, ".")
+							if lastIndex != -1 && len(ft) > lastIndex+1 {
+								addVals(val, ft[lastIndex+1:])
+							}
+							addVals(val, ft)
+						}
+					}
+				}
+				return nil
+			})
+			if len(vals) > 0 {
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value found")
+		}),
+		nc_desc(`获取输入指令的类型名称表示，例如int，string，或者自定义类型等：
+
+在 Java 中，会尽可能关联到类名或导入名称，可以根据这个确定使用的类行为。
+`),
+	)
+
+	registerNativeCall(
+		NativeCall_FullTypeName,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			var tmpMap = make(map[string]sfvm.ValueOperator)
+			addVals := func(val *Value, typ string, rangeIf *memedit.Range) {
+				if typ == "" {
+					return
+				}
+				if existed, ok := tmpMap[typ]; ok {
+					_ = existed.AppendPredecessor(val, frame.WithPredecessorContext("fullTypeName"))
+					sfvm.MergeAnchor(val, existed)
+					return
+				}
+				results := val.NewConstValue(typ, rangeIf)
+				results.AppendPredecessor(val, frame.WithPredecessorContext("fullTypeName"))
+				sfvm.MergeAnchor(val, results)
+				tmpMap[typ] = results
+				vals = append(vals, results)
+			}
+			err := v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				typ := val.GetType()
+				if typ == nil || typ.t == nil {
+					return utils.Errorf("native call type name failed: the value have %s no type", val.String())
+				}
+				fts := typ.t.GetFullTypeNames()
+				if len(fts) == 0 {
+					addVals(val, typ.String(), val.GetRange())
+				} else {
+					for _, ft := range fts {
+						ft = yakunquote.TryUnquote(ft)
+						addVals(val, ft, val.GetRange())
+					}
+				}
+
+				return nil
+			})
+			if err != nil {
+				return false, nil, err
+			}
+			if len(vals) > 0 {
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value found")
+		}),
+		nc_desc(`获取输入指令的完整类型名称表示，例如int，string，或者自定义类型等
+
+特殊地，在 Java 中，会尽可能使用全限定类名，例如 com.alibaba.fastjson.JSON, 也会尽可能包含 sca 版本`),
+	)
+
+	registerNativeCall(
+		NativeCall_GetFormalParams,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				if val.getOpcode() == ssa.SSAOpcodeFunction {
+					rets, ok := ssa.ToFunction(val.getValue())
+					if !ok {
+						return nil
+					}
+					for _, param := range rets.Params {
+						param, ok := rets.GetValueById(param)
+						if !ok || param == nil {
+							continue
+						}
+						newVal := val.NewValue(param)
+						if newVal != nil {
+							newVal.AppendPredecessor(val, frame.WithPredecessorContext("getFormalParams"))
+							sfvm.MergeAnchor(val, newVal)
+							vals = append(vals, newVal)
+						}
+					}
+				}
+				return nil
+			})
+			if len(vals) > 0 {
+				// fmt.Println("getFormalParams: ", vals)
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value(formal params) found")
+		}),
+		nc_desc(`获取输入指令的形参，输入必须是一个函数指令`),
+	)
+
+	registerNativeCall(
+		NativeCall_GetReturns,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				originIns := val.getValue()
+				funcIns, ok := ssa.ToFunction(originIns)
+				if !ok {
+					return nil
+				}
+				for _, ret := range funcIns.Return {
+					ret, ok := funcIns.GetValueById(ret)
+					if !ok || ret == nil {
+						continue
+					}
+					retVal, ok := ssa.ToReturn(ret)
+					if !ok {
+						continue
+					}
+					for _, retIns := range retVal.Results {
+						retIns, ok := funcIns.GetValueById(retIns)
+						if !ok || retIns == nil {
+							continue
+						}
+						new := val.NewValue(retIns)
+						if new != nil {
+							new.AppendPredecessor(val, frame.WithPredecessorContext("getReturns"))
+							sfvm.MergeAnchor(val, new)
+							vals = append(vals, new)
+						}
+					}
+				}
+				return nil
+			})
+			if len(vals) > 0 {
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value(returns) found")
+		}),
+		nc_desc(`获取输入指令的返回值，输入必须是一个函数指令`),
+	)
+
+	registerNativeCall(
+		NativeCall_GetCallee,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+
+				if val.IsCall() {
+					call := val.GetCallee()
+					if call != nil {
+						call.AppendPredecessor(val, frame.WithPredecessorContext("getCallee"))
+						sfvm.MergeAnchor(val, call)
+						vals = append(vals, call)
+					}
+				}
+				return nil
+			})
+			if len(vals) > 0 {
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value(callers) found")
+		}),
+		nc_desc(`获取输入指令的调用者，输入必须是一个调用指令(call)`),
+	)
+
+	registerNativeCall(
+		NativeCall_GetFunc,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				f := val.GetFunction()
+				if f != nil {
+					f.AppendPredecessor(val, frame.WithPredecessorContext("getFunc"))
+					sfvm.MergeAnchor(val, f)
+					vals = append(vals, f)
+				}
+				return nil
+			})
+			if len(vals) > 0 {
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value(func) found")
+		}),
+		nc_desc("获取输入指令的所在的函数，输入可以是任何指令"),
+	)
+
+	registerNativeCall(
+		NativeCall_GetSiblings,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				obj := val.GetObject()
+				if obj == nil {
+					return nil
+				}
+				for _, elements := range obj.GetMembers() {
+					for _, newVal := range elements {
+						if newVal == nil {
+							continue
+						}
+						newVal.AppendPredecessor(val, frame.WithPredecessorContext("getSiblings"))
+						sfvm.MergeAnchor(val, newVal)
+						vals = append(vals, newVal)
+					}
+				}
+				return nil
+			})
+			if len(vals) > 0 {
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value(siblings) found")
+		}),
+		nc_desc("获取输入指令的兄弟指令，一般说的是如果这个指令是一个对象的成员，可以通过这个指令获取这个对象的其他成员。"),
+	)
+
+	registerNativeCall(
+		NativeCall_GetMembers,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var rets []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				for _, members := range val.GetMembers() {
+					for _, member := range members {
+						if member == nil {
+							continue
+						}
+						member.AppendPredecessor(val, frame.WithPredecessorContext("getMembers"))
+						sfvm.MergeAnchor(val, member)
+						rets = append(rets, member)
+					}
+				}
+				return nil
+			})
+			if len(rets) > 0 {
+				return true, sfvm.NewValues(rets), nil
+			}
+			return false, nil, utils.Error("no value(members) found")
+		}),
+		nc_desc("获取输入指令的成员指令，一般说的是如果这个指令是一个对象，可以通过这个指令获取这个对象的成员。"),
+	)
+
+	registerNativeCall(
+		NativeCall_GetMemberByKey,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var rets []sfvm.ValueOperator
+			key := actualParams.GetString(0, "key")
+
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+
+				if ret, ok := val.GetMembersByString(key); ok {
+					ret.AppendPredecessor(val, frame.WithPredecessorContext("getMemberByKey"))
+					sfvm.MergeAnchor(val, ret...)
+					rets = append(rets, ret...)
+				}
+
+				return nil
+			})
+			if len(rets) > 0 {
+				return true, sfvm.NewValues(rets), nil
+			}
+			return false, nil, utils.Error("no value(members) found")
+		}),
+		nc_desc("获取输入指令的成员指令，一般说的是如果这个指令是一个对象，可以通过这个指令获取这个对象的某个特定的成员。"),
+	)
+
+	registerNativeCall(
+		NativeCall_GetObject,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var ret []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				obj := resolveGetObject(val)
+				if obj != nil {
+					obj.AppendPredecessor(val, frame.WithPredecessorContext("getObject"))
+					sfvm.MergeAnchor(val, obj)
+					ret = append(ret, obj)
+					return nil
+				}
+				return nil
+			})
+			if len(ret) > 0 {
+				return true, sfvm.NewValues(ret), nil
+			}
+			return false, nil, utils.Error("no value(parent object) found")
+		}),
+		nc_desc(`获取输入指令的父对象，一般说的是如果这个指令是一个成员，可以通过这个指令获取这个成员的父对象。`),
+	)
+	registerNativeCall(
+		NativeCall_GetCall,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				val, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				for _, u := range val.GetUsers() {
+					if u.getOpcode() == ssa.SSAOpcodeCall {
+						u.AppendPredecessor(val, frame.WithPredecessorContext("getCall"))
+						sfvm.MergeAnchor(val, u)
+						vals = append(vals, u)
+					}
+				}
+				return nil
+			})
+			if len(vals) > 0 {
+				return true, sfvm.NewValues(vals), nil
+			}
+			return false, nil, utils.Error("no value(call) found")
+		}),
+		nc_desc(`获取输入指令的调用指令，输入必须是一个函数指令`),
+	)
+	registerNativeCall(
+		NativeCall_SearchFunc,
+		nc_func(func(v sfvm.Values, frame *sfvm.SFFrame, actualParams *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			var vals []sfvm.ValueOperator
+			v.Recursive(func(operator sfvm.ValueOperator) error {
+				if val, ok := operator.(*Value); ok {
+					switch ins := val.getOpcode(); ins {
+					case ssa.SSAOpcodeParameterMember:
+						param, ok := ssa.ToParameterMember(val.getValue())
+						if ok {
+							funcName := param.GetFunc().GetName()
+							if val.ParentProgram == nil {
+								return utils.Error("ParentProgram is nil")
+							}
+							ok, next, _ := val.ParentProgram.ExactMatch(frame.GetContext(), ssadb.BothMatch, funcName)
+							if ok {
+								vals = append(vals, next...)
+							}
+						}
+					case ssa.SSAOpcodeParameter:
+						param, ok := ssa.ToParameter(val.getValue())
+						if ok {
+							funcIns := param.GetFunc()
+							funcName := funcIns.GetName()
+							if m := funcIns.GetMethodName(); m != "" {
+								funcName = m
+							}
+							if val.ParentProgram == nil {
+								return utils.Error("ParentProgram is nil")
+							}
+							ok, next, _ := val.ParentProgram.ExactMatch(frame.GetContext(), ssadb.BothMatch, funcName)
+							if ok {
+								next.AppendPredecessor(val, frame.WithPredecessorContext("searchCall: "+funcName))
+								vals = append(vals, next...)
+							}
+						}
+					case ssa.SSAOpcodeCall:
+						callee := val.GetCallee()
+						if callee == nil {
+							return nil
+						}
+
+						log.Warn("callee: ", callee.GetName(), callee.GetVerboseName(), callee.String())
+
+						methodName := callee.GetName()
+						if obj := callee.GetObject(); obj != nil {
+							methodName, _ = strings.CutPrefix(methodName, fmt.Sprintf("#%d.", obj.GetId()))
+						}
+
+						prog := val.ParentProgram
+						if prog == nil {
+							return utils.Error("ParentProgram is nil")
+						}
+						haveNext, next, _ := prog.ExactMatch(frame.GetContext(), ssadb.BothMatch, methodName)
+						if haveNext && next != nil {
+							next.Recursive(func(operator sfvm.ValueOperator) error {
+								callee, ok := operator.(*Value)
+								if !ok {
+									return nil
+								}
+								vals = append(vals, callee)
+								return nil
+							})
+						}
+					case ssa.SSAOpcodeConstInst:
+						// name := val.GetName()
+						funcName := val.String()
+						if str, err := strconv.Unquote(funcName); err == nil {
+							funcName = str
+						}
+						ok, next, _ := val.ParentProgram.ExactMatch(frame.GetContext(), ssadb.BothMatch, funcName)
+						if ok {
+							next.AppendPredecessor(val, frame.WithPredecessorContext("searchCall: "+funcName))
+							vals = append(vals, next...)
+						}
+					default:
+						//for _, call := range val.GetCalledBy() {
+						//	call.AppendPredecessor(val, frame.WithPredecessorContext("searchCall"))
+						//	funcIns := call.GetCallee()
+						//	name := funcIns.GetName()
+						//	log.Info(name)
+						//	vals = append(vals, call)
+						//}
+					}
+				}
+				return nil
+			})
+
+			if len(vals) == 0 {
+				return false, sfvm.NewEmptyValues(), utils.Errorf("no value found")
+			}
+			return true, sfvm.NewValues(vals), nil
+		}),
+		nc_desc(`搜索输入指令的调用指令，输入可以是任何指令，但是会尽可能搜索到调用这个指令的调用指令`),
+	)
+
+	// ---- CFG helpers (intra-procedural, stage-1) ----
+	registerNativeCall(NativeCall_GetCFG, nc_func(nativeCallGetCFG), nc_desc(`返回输入命中点所属基本块的 SSA Value（BasicBlock），作为 cfg* 系列 native call 的统一锚点；下游会自动扩展为内部 CfgCtx（func/block/inst）。`))
+	registerNativeCall(NativeCall_CFGGuards, nc_func(nativeCallCFGGuards), nc_desc(`CFG guard：链上 cfg 为 sink；链上可为 SSA value（隐式同 <getCfg>）或 CfgCtx。同函数内扫两路分支：头块须 CFG 可达 sink；若真分支不可达 sink 且假分支可达（或对称），则输出 GuardPredicateValue（截断侧 kind 在分支区域内扫 return/panic/break/continue）。若无此类分支则输出 kind=none 的合成 cfgGuard（便于过滤不断链）。String 形如 cfgGuard(...)。polarity/kind 见 GuardKind*。可用 ?{opcode: return} / ?{opcode: panic} / ?{opcode: jump} 作为 Kind 的别名过滤（对应 earlyReturn / earlyPanic / earlyBreak+earlyContinue）；建议替代 .kind?{have:"earlyReturn"}。可选参数：在 native 内写 <cfgGuards(opcode: return)> 或 <cfgGuards(return)>（首参等价于 opcode:），与链式 <cfgGuards()>?{opcode: return} 过滤一致；无参数时行为不变。详见 control_flow_limitations.md cfgGuards 一节。`))
+	registerNativeCall(NativeCall_CFGDominates, nc_func(nativeCallCFGDominates), nc_desc(`CFG 支配（必经 target）：从函数入口沿控制流到当前 cfg 是否必经 target cfg；等价于图论上 target 支配当前点（同函数内）。同基本块且当前点与 target 的 InstID 均落在该块 Insts 中时按指令序细化。链上可为 SSA value（隐式同 <getCfg>）或 CfgCtx。config：target="$var" 或 target: $var（target 可为 getCfg 结果或 SSA value）。`))
+	registerNativeCall(NativeCall_CFGPostDom, nc_func(nativeCallCFGPostDominates), nc_desc(`CFG 后支配（必经 target）：从当前 cfg 沿控制流走向函数出口是否必经 target cfg；等价于图论上 target 后支配当前点（同函数内，最小虚拟出口）。同基本块且当前点与 target 的 InstID 均落在该块 Insts 中时按指令序细化。链上可为 SSA value（隐式同 <getCfg>）或 CfgCtx。config：target="$var" 或 target: $var。`))
+	registerNativeCall(NativeCall_CFGReachable, nc_func(nativeCallCFGReachable), nc_desc(`CFG 可达性：当前 cfg 是否可达 target cfg。链上可为 SSA value（隐式同 <getCfg>）或 CfgCtx。config：target="$var" 或 target: $var（target 可为 getCfg 结果或 SSA value）；可选 icfg=true；可选 max_depth/max_nodes。`))
+	registerNativeCall(NativeCall_CFGReachPath, nc_func(nativeCallCFGReachPath), nc_desc(`CFG 最短路径证据：从当前 cfg 到 target 的 (函数,块) 链；不可达返回空字符串。链上与 target 解析同 cfgReachable；其余 config 同 cfgReachable。`))
+	registerNativeCall(NativeCall_CFGCondition, nc_func(nativeCallCFGCondition), nc_desc(`CFG 条件摘要：返回当前 block 的条件证据（inst/value/source/schema）。config 参数：无。`))
+	registerNativeCall(NativeCall_CFGConditionValues, nc_func(nativeCallCFGConditionValues), nc_desc(`CFG 条件 value 集：返回当前 block 条件关联的 value 列表。config 参数：无。`))
+	registerNativeCall(NativeCall_ReachabilityGuard, nc_func(nativeCallReachabilityGuard), nc_desc(`可达性守卫（mustExecute）：从函数入口起 target 是否在每条出路上必执行。返回值（可多项）：入口全路径必达且 cfgPostDominates 成立时仅返回布尔常量 true；入口 CFG 不可达 target 时返回 false；否则返回到达 target 时路径上的条件 SSA value 列表（CondValueID 顺序，嵌套 if/loop/switch 等可能对应多项）。跨 Program/跨函数/无入口信息时返回 false。必达判定依赖后支配，merge 块上可能保守。管道上可选同函数 SSA 作锚；必填 target="$to"。mode 仅 mustExecute。`))
+	registerNativeCall(NativeCall_UAF, nc_func(nativeCallUAF), nc_desc(`Use-After-Free 检测：基于堆对象生命周期分析。Double-free 视为 UAF 子类一并返回。用法：*<uaf()> 扫描全程序；<uaf(target=$ptr)> 或 $ptr<uaf()> 仅返回与选定指针相关的命中；free?(* #-> <uaf()>) 保留指针存在 UAF 风险的 free 调用；可选 kind="double-free" / kind="uaf" 过滤。当前支持 C（malloc/calloc/realloc + free），过程内 + 简单拷贝别名 + 浅 free-param summary。`))
+	registerNativeCall(NativeCall_NPD, nc_func(nativeCallNPD), nc_desc(`空指针解引用（NPD）检测：独立于 UAF。路径上跟踪指针空性（Null/MaybeNull），在 *p / p->f 等成员解引用处报警。用法：*<npd()> 扫描全程序；<npd(target=$ptr)> 或 $ptr<npd()> 仅返回与选定指针相关的命中。不将 call 实参视为解引用。当前支持 C 过程内。`))
+	registerNativeCall(NativeCall_DoubleFree, nc_func(nativeCallDoubleFree), nc_desc(`Double-Free 检测：UAF 子类，仅返回二次 free 命中点。用法同 uaf：*<doubleFree()> / <doubleFree(target=$ptr)> / $ptr<doubleFree()>。`))
+	registerNativeCall(NativeCall_HeapAlloc, nc_func(nativeCallHeapAlloc), nc_desc(`堆分配点查询：返回 malloc/calloc/realloc 等注册的堆对象。用法：*<heapAlloc()> / <heapAlloc(target=$ptr)> / $ptr<heapAlloc()>。`))
+	registerNativeCall(NativeCall_FreeCall, nc_func(nativeCallFreeCall), nc_desc(`释放调用查询：返回 free / RegisterKill 调用点。用法：*<freeCall()> / <freeCall(target=$ptr)> / $ptr<freeCall()>。`))
+	registerNativeCall(NativeCall_DerefSite, nc_func(nativeCallDerefSite), nc_desc(`显式解引用点查询：返回 c2ssa RegisterDeref 记录的 *p 加载点。用法：*<derefSite()> / <derefSite(target=$ptr)> / $ptr<derefSite()>。`))
+	registerNativeCall(NativeCall_MemLeak, nc_func(nativeCallMemLeak), nc_desc(`内存泄漏检测：堆对象在函数出口仍可能 Alive，且未通过 return 逃逸。用法：*<memLeak()> / <memLeak(target=$ptr)> / $ptr<memLeak()>。形式参数不报告。`))
+	registerNativeCall(NativeCall_NullCheck, nc_func(nativeCallNullCheck), nc_desc(`空指针检查条件：返回 if (p) / if (!p) / p==NULL / p!=NULL 等条件 SSA。用法：*<nullCheck()> / <nullCheck(target=$ptr)> / $ptr<nullCheck()>。`))
+	registerNativeCall(NativeCall_PointsTo, nc_func(nativeCallPointsTo), nc_desc(`may-points-to：返回指针可能指向的抽象对象（函数内 OUT 并集）。用法：$p<pointsTo()>。`))
+	registerNativeCall(NativeCall_Aliases, nc_func(nativeCallAliases), nc_desc(`may-alias：保留与 target 可能同对象的 receiver。用法：$a<aliases(target=$b)>。`))
+}
+
+func nativeCallNPD(vs sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+	return runLifetimeNativeCall(vs, frame, params, "npd",
+		func(prog *ssa.Program, seeds []ssa.Value, full bool) []*lifetime.Finding {
+			if full {
+				return lifetime.FindNPDUses(prog)
+			}
+			return lifetime.FindNPDUsesRelated(prog, seeds)
+		},
+		func(kind string) bool {
+			return kind == lifetime.KindNPD
+		},
+	)
+}
+
+func fetchProgram(v any) (*Program, error) {
+	var values sfvm.Values
+	switch ret := v.(type) {
+	case sfvm.Values:
+		values = ret
+	case sfvm.ValueOperator:
+		values = sfvm.ValuesOf(ret)
+	default:
+		return nil, utils.Errorf("unsupported program source: %T", v)
+	}
+	var parent *Program
+	values.Recursive(func(operator sfvm.ValueOperator) error {
+		switch ret := operator.(type) {
+		case *Value:
+			parent = ret.ParentProgram
+			return utils.Error("normal abort")
+		case *Program:
+			parent = ret
+			return utils.Error("normal abort")
+		case *ProgramOverLay:
+			if ret != nil {
+				if top := ret.topProgram(); top != nil {
+					parent = top
+					return utils.Error("normal abort")
+				}
+			}
+		case *StructQueryTarget:
+			if ret != nil && ret.ResultProgram() != nil {
+				parent = ret.ResultProgram()
+				return utils.Error("normal abort")
+			}
+		}
+		return nil
+	})
+	if parent == nil {
+		return nil, utils.Error("no parent program found")
+	}
+	return parent, nil
+}
+
+func isProgram(v any) bool {
+	switch ret := v.(type) {
+	case *Program:
+		return true
+	case sfvm.Values:
+		ok := false
+		_ = ret.Recursive(func(operator sfvm.ValueOperator) error {
+			_, ok = operator.(*Program)
+			return utils.Error("normal abort")
+		})
+		return ok
+	case sfvm.ValueOperator:
+		_, ok := ret.(*Program)
+		return ok
+	}
+	return false
+}
+
+func registerNativeCall(name string, options ...func(*NativeCallDocument)) {
+	if name == "" {
+		return
+	}
+	n := &NativeCallDocument{
+		Name: name,
+	}
+	for _, o := range options {
+		o(n)
+	}
+	NativeCallDocuments[name] = n
+	fn := n.Function
+	if fn != nil {
+		wrapped := func(v sfvm.Values, frame *sfvm.SFFrame, params *sfvm.NativeCallActualParams) (bool, sfvm.Values, error) {
+			ok, vals, err := fn(v, frame, params)
+			if !ok || err != nil {
+				return ok, vals, err
+			}
+			bound := structBoundFromConfig(frame.GetConfig())
+			if bound == nil {
+				return ok, vals, nil
+			}
+			return true, filterSFVMValuesByStructBound(bound, vals), nil
+		}
+		sfvm.RegisterNativeCall(n.Name, wrapped)
+		return
+	}
+	sfvm.RegisterNativeCall(n.Name, n.Function)
+}
+
+func haveResult(operator sfvm.Values) bool {
+	if utils.IsNil(operator) {
+		return false
+	}
+	haveResultFlag := false
+	_ = operator.Recursive(func(operator sfvm.ValueOperator) error {
+		switch operator.(type) {
+		case *Value, *CfgCtxValue, *GuardPredicateValue:
+			haveResultFlag = true
+			return utils.Error("abort")
+		}
+		return nil
+	})
+	return haveResultFlag
+}

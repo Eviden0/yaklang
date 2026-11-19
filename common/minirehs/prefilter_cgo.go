@@ -1,0 +1,257 @@
+//go:build cgo
+
+package minirehs
+
+/*
+#cgo CFLAGS: -O3 -std=gnu11 -Wall
+
+#include <stdint.h>
+#include <stddef.h>
+
+typedef struct mrehs_pf mrehs_pf;
+mrehs_pf *mrehs_pf_new_teddy(int32_t numLit, const uint8_t *litFlat,
+                             const int32_t *litOff, int32_t indexed);
+mrehs_pf *mrehs_pf_new(const int32_t *next, int32_t numStates,
+                       const int32_t *outOff, const int32_t *outFlat,
+                       int32_t outFlatLen, int32_t numLit,
+                       const uint8_t *litFlat, const int32_t *litOff);
+void mrehs_pf_free(mrehs_pf *pf);
+int32_t mrehs_pf_scan(const mrehs_pf *pf, const uint8_t *data, size_t len,
+                      int32_t *outPairs, int32_t capPairs);
+int32_t mrehs_pf_scan_scalar(const mrehs_pf *pf, const uint8_t *data, size_t len,
+                             int32_t *outPairs, int32_t capPairs);
+int32_t mrehs_pf_use_teddy(const mrehs_pf *pf);
+int32_t mrehs_pf_teddy_m(const mrehs_pf *pf);
+int32_t mrehs_pf_indexed_confirm(const mrehs_pf *pf);
+
+#include "native/teddy.c"
+*/
+import "C"
+
+import (
+	"unsafe"
+)
+
+const cgoPrefilterInitialPairCapacity = 8192
+
+// simdPrefilterAvailable 在 CGO SIMD 构建下为 true (用于档位标注).
+func simdPrefilterAvailable() bool { return true }
+
+// engineTier 是 SIMD 预过滤构建的引擎档位.
+const engineTier = 2
+
+// newPrefilter 在 cgo 构建 (CGO_ENABLED=1, 无需额外 tag) 下默认返回 Teddy SIMD 预过滤;
+// 构造失败则优雅退化到纯 Go 标量 Aho-Corasick, 保证功能一致. CGO_ENABLED=0 时见 prefilter_nocgo.go.
+//
+// Teddy 默认化的"只赚不亏"门控: 仅当 Teddy 真正激活 (全部必需字面量长度 >= 2, 见 build_teddy
+// 的 M=min(最短字面量,4)>=2 条件) 时才用 cgo SIMD 预过滤——此时 SSSE3/NEON 一次 16 字节的指纹
+// 扫描显著快于逐字节 AC；C 内核在 nibble 指纹后还有精确双字节前缀门，避免低熵输入把
+// 每个位置都退化成 confirm。若字面量集含长度 1 字面量 (Teddy 退化为 C-AC), 则改用纯 Go 标量 AC:
+// 此时无 SIMD 收益, 走 cgo 只会白付每报文一次跨界成本 (实测真实对抗集 3.47->3.24 MB/s 的小幅回归),
+// 退回纯 Go 既避免回归, 又保持"标量孪生兜底"的可移植语义. 正确性: 两条路径命中集合逐项一致
+// (teddy_cgo_test.go: Teddy SIMD == 标量孪生 == 纯 Go AC), 预过滤只决定验证哪些位置, 不改判定.
+func newPrefilter(li *literalIndex) prefilter {
+	for _, lit := range li.literals {
+		if len(lit) < 2 {
+			return newScalarPrefilter(li)
+		}
+	}
+	if p := newCGOPrefilter(li); p != nil {
+		if p.useTeddy() {
+			return p
+		}
+		p.release() // Teddy 未激活 (含长度 1 字面量): 释放 cgo 资源, 退回纯 Go 标量 AC 避免跨界开销.
+	}
+	return newScalarPrefilter(li)
+}
+
+// cgoPrefilter 用 C Teddy 内核扫描；只有回退路径构建 AC 表。
+type cgoPrefilter struct {
+	handle  *C.mrehs_pf
+	li      *literalIndex
+	builtAC bool // construction diagnostic: Teddy-only databases never need AC tables
+}
+
+func newCGOPrefilter(li *literalIndex) *cgoPrefilter {
+	return newCGOPrefilterWithIndex(li, true)
+}
+
+// The alternate constructor keeps a same-binary benchmark of the original
+// confirmation algorithm. Production always selects the indexed constructor.
+func newCGOPrefilterWithIndex(li *literalIndex, indexed bool) *cgoPrefilter {
+	if li.empty() {
+		return nil
+	}
+	litFlat, litOff := flattenLiterals(li.literals)
+	var litFlatPtr *C.uint8_t
+	if len(litFlat) > 0 {
+		litFlatPtr = (*C.uint8_t)(unsafe.Pointer(&litFlat[0]))
+	}
+	indexFlag := C.int32_t(0)
+	if indexed {
+		indexFlag = 1
+	}
+	if handle := C.mrehs_pf_new_teddy(C.int32_t(len(li.literals)), litFlatPtr, (*C.int32_t)(unsafe.Pointer(&litOff[0])), indexFlag); handle != nil {
+		return &cgoPrefilter{handle: handle, li: li}
+	}
+	// 复用纯 Go 的 Aho-Corasick 构建, 得到不可变转移/输出表, 再拷贝进 C 内存.
+	b := newACBuilder()
+	for id, lit := range li.literals {
+		b.add(lit, int32(id))
+	}
+	ac := b.build(len(li.literals))
+
+	numStates := len(ac.outOff) - 1
+	if numStates <= 0 || len(ac.next) == 0 {
+		return nil
+	}
+
+	var outFlatPtr *C.int32_t
+	if len(ac.outFlat) > 0 {
+		outFlatPtr = (*C.int32_t)(unsafe.Pointer(&ac.outFlat[0]))
+	}
+	handle := C.mrehs_pf_new(
+		(*C.int32_t)(unsafe.Pointer(&ac.next[0])),
+		C.int32_t(numStates),
+		(*C.int32_t)(unsafe.Pointer(&ac.outOff[0])),
+		outFlatPtr,
+		C.int32_t(len(ac.outFlat)),
+		C.int32_t(ac.numLit),
+		litFlatPtr,
+		(*C.int32_t)(unsafe.Pointer(&litOff[0])),
+	)
+	if handle == nil {
+		return nil
+	}
+	return &cgoPrefilter{
+		handle:  handle,
+		li:      li,
+		builtAC: true,
+	}
+}
+
+// flattenLiterals 把字面量集合拼接为连续字节 + 偏移表 (litOff 长度 len+1, litOff[0]=0,
+// 第 j 条 = litFlat[litOff[j]:litOff[j+1]]). 供 C 侧 Teddy 零依赖地读取.
+func flattenLiterals(lits []string) (litFlat []byte, litOff []int32) {
+	litOff = make([]int32, len(lits)+1)
+	total := 0
+	for _, l := range lits {
+		total += len(l)
+	}
+	litFlat = make([]byte, 0, total)
+	for i, l := range lits {
+		litFlat = append(litFlat, l...)
+		litOff[i+1] = int32(len(litFlat))
+	}
+	return litFlat, litOff
+}
+
+func (p *cgoPrefilter) simd() bool { return true }
+
+func (p *cgoPrefilter) indexedConfirm() bool {
+	return p.handle != nil && C.mrehs_pf_indexed_confirm(p.handle) != 0
+}
+
+// useTeddy / teddyM 暴露 C 侧 Teddy 启用状态与指纹长度 (供测试与可观测).
+func (p *cgoPrefilter) useTeddy() bool {
+	return p.handle != nil && C.mrehs_pf_use_teddy(p.handle) != 0
+}
+func (p *cgoPrefilter) teddyM() int {
+	if p.handle == nil {
+		return 0
+	}
+	return int(C.mrehs_pf_teddy_m(p.handle))
+}
+
+func (p *cgoPrefilter) scanHits(data []byte, sc *scratch) []litHit {
+	return p.scanHitsImpl(data, sc, false)
+}
+
+// scanHitsScalar 强制走 C 标量孪生 (Teddy 标量 / AC), 仅供差分测试对照 SIMD 分发.
+func (p *cgoPrefilter) scanHitsScalar(data []byte, sc *scratch) []litHit {
+	return p.scanHitsImpl(data, sc, true)
+}
+
+func (p *cgoPrefilter) scanHitsImpl(data []byte, sc *scratch, scalar bool) []litHit {
+	return p.scanHitsImplWithInitialPairCapacity(data, sc, scalar, cgoPrefilterInitialPairCapacity)
+}
+
+func (p *cgoPrefilter) scanHitsImplWithInitialPairCapacity(
+	data []byte,
+	sc *scratch,
+	scalar bool,
+	maxInitialPairs int,
+) []litHit {
+	sc.hits = sc.hits[:0]
+	if p.handle == nil || len(data) == 0 {
+		return sc.hits
+	}
+	// C 内核在读取时原位折叠 ASCII 大写字母，避免为每个并发正文扩一份等长小写缓冲。
+	// 非 ASCII 与标点保持原字节，命中偏移仍严格对应原始 data。
+
+	// cpairs 复用为 (end,litID) 对缓冲。大多数正文没有字面量命中，不应仅因
+	// packet 很大就为每个并发 scratch 预留等比例内存。C 内核会返回未截断的
+	// 命中总数，因此首次缓冲有界；只有真实高命中输入才按精确数量扩容并重扫。
+	capPairs := len(data)/8 + 64
+	if maxInitialPairs > 0 && capPairs > maxInitialPairs {
+		capPairs = maxInitialPairs
+	}
+	if cap(sc.cpairs) < capPairs*2 {
+		sc.cpairs = make([]int32, capPairs*2)
+	} else {
+		// Reuse the capacity already earned by earlier dense records. Passing
+		// the initial estimate again would force a second complete C scan on
+		// every record even though the retained buffer is large enough.
+		capPairs = cap(sc.cpairs) / 2
+	}
+	sc.cpairs = sc.cpairs[:capPairs*2]
+
+	scan := func(cap int) int {
+		if scalar {
+			return int(C.mrehs_pf_scan_scalar(
+				p.handle,
+				(*C.uint8_t)(unsafe.Pointer(&data[0])),
+				C.size_t(len(data)),
+				(*C.int32_t)(unsafe.Pointer(&sc.cpairs[0])),
+				C.int32_t(cap),
+			))
+		}
+		return int(C.mrehs_pf_scan(
+			p.handle,
+			(*C.uint8_t)(unsafe.Pointer(&data[0])),
+			C.size_t(len(data)),
+			(*C.int32_t)(unsafe.Pointer(&sc.cpairs[0])),
+			C.int32_t(cap),
+		))
+	}
+
+	got := scan(capPairs)
+	// 命中数超过缓冲容量时扩容重扫一次, 保证不漏报.
+	if got > capPairs {
+		capPairs = got
+		if cap(sc.cpairs) < capPairs*2 {
+			sc.cpairs = make([]int32, capPairs*2)
+		} else {
+			sc.cpairs = sc.cpairs[:capPairs*2]
+		}
+		got = scan(capPairs)
+		if got > capPairs {
+			got = capPairs
+		}
+	}
+
+	for i := 0; i < got; i++ {
+		sc.hits = append(sc.hits, litHit{
+			end:   sc.cpairs[i*2],
+			litID: sc.cpairs[i*2+1],
+		})
+	}
+	return sc.hits
+}
+
+func (p *cgoPrefilter) release() {
+	if p.handle != nil {
+		C.mrehs_pf_free(p.handle)
+		p.handle = nil
+	}
+}

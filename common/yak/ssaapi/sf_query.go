@@ -1,0 +1,919 @@
+package ssaapi
+
+import (
+	"context"
+
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/yak/ssa/ssadb"
+
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+
+	"github.com/yaklang/yaklang/common/yak/ssa"
+
+	"github.com/samber/lo"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfdb"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfpattern"
+	"github.com/yaklang/yaklang/common/syntaxflow/sfvm"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/diagnostics"
+	"github.com/yaklang/yaklang/common/utils/omap"
+)
+
+type SyntaxFlowQueryInstance interface {
+	SyntaxFlowWithError(i string, opts ...QueryOption) (*SyntaxFlowResult, error)
+	SyntaxFlowRule(rule *schema.SyntaxFlowRule, opts ...QueryOption) (*SyntaxFlowResult, error)
+	GetProgramName() string
+	GetLanguage() ssaconfig.Language
+	IsIncrementalCompile() bool
+	IsBaseProgram() bool
+	GetBaseProgramName() string
+	Recompile(inputOpt ...ssaconfig.Option) error
+}
+
+var _ SyntaxFlowQueryInstance = (*Program)(nil)
+var _ SyntaxFlowQueryInstance = (*ProgramOverLay)(nil)
+
+var DefaultInputVar = "input"
+
+type queryConfig struct {
+	// check if exist in database just use this
+	useCache bool
+	// input
+	program *Program
+	value   sfvm.Values // use this
+	//  rule
+	ruleContent string
+	ruleName    string
+	rule        *schema.SyntaxFlowRule // use this
+
+	// runtime
+	vm    *sfvm.SyntaxFlowVirtualMachine
+	frame *sfvm.SFFrame
+	// ruleLoader is borrowed from the scan's rulePreparation when a product
+	// scan set it. Nil means this query has no shared instruction cache.
+	ruleLoader *sfvm.RuleLoader
+
+	// sourceResultCallback lets source-mode bounded hit batches stream to a
+	// consumer immediately. The fallback aggregate path is retained for callers
+	// that do not provide a result callback.
+	sourceResultCallback func(*SyntaxFlowResult)
+
+	// sourceScanRuntime is the scan-owned pre-scan. A nil runtime means this
+	// query builds one for its own direct file searches; either way the frame
+	// and its later opcodes stay on this query.
+	sourceScanRuntime *sfpattern.SourceScanRuntime
+
+	// structBound, when set by QueryWithStruct, allows mode=struct frames to run.
+	structBound *structBound
+
+	// runtime config
+	opts []sfvm.Option // config
+	// config       *sfvm.Config
+	// parentResult *sfvm.SFFrameResult
+
+	// save
+	kind   schema.SyntaxflowResultKind
+	taskID string
+
+	// onRisk receives each risk this query builds, plus the optional audit
+	// writers for that finding. When it is set the query does not write the
+	// risk row itself.
+	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
+	// onRiskValue receives the same decisions with the live value that produced
+	// the risk. Report consumers need it to rebuild the data-flow graph: a
+	// memory-only result has no audit rows to reload it from.
+	onRiskValue []func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)
+
+	// noFinalize leaves the finished result to the caller: no risk is built
+	// and no consumer is notified. A rule that runs once per unit merges the
+	// unit frames and finalizes the merged result exactly once.
+	noFinalize bool
+
+	// control
+	ctx context.Context
+
+	*ssaconfig.Config
+}
+
+func (config *queryConfig) GetFrame() (*sfvm.SFFrame, error) {
+	if frame := config.frame; frame != nil {
+		return frame, nil
+	}
+	// get vm
+	vm := config.vm
+	if vm == nil {
+		vm = sfvm.NewSyntaxFlowVirtualMachine()
+	}
+
+	// use rule compiled
+	if config.rule != nil {
+		frame, resave, err := config.ruleLoader.Load(vm, config.rule)
+		if err != nil {
+			return nil, utils.Errorf("SyntaxflowQuery: load rule %s error: %v", config.rule.RuleName, err)
+		}
+		if resave {
+			// Persist recompiled opcodes only for rules already stored in the
+			// profile DB. Task-local / ephemeral rules (ID==0) must not Create
+			// into syntax_flow_rules / syntax_flow_groups — that races on shared
+			// group names and floods scan logs with UNIQUE constraint errors.
+			if config.rule.ID > 0 {
+				sfdb.MigrateSyntaxFlow("", config.rule)
+			}
+		}
+		return frame, nil
+	}
+
+	// use rule content
+	if config.ruleContent != "" {
+		// compile rule
+		frame, err := vm.Compile(config.ruleContent)
+		if err != nil {
+			return nil, utils.Errorf("SyntaxflowQuery: compile rule error: %v", err)
+		}
+		return frame, nil
+	}
+
+	// use rule name
+	if config.ruleName != "" {
+		rule, err := sfdb.GetRule(config.ruleName)
+		if err != nil {
+			return nil, utils.Errorf("SyntaxflowQuery: load rule %s from db error: %v", config.ruleName, err)
+		}
+		frame, resave, err := config.ruleLoader.Load(vm, rule)
+		if resave {
+			// save rule to db
+			sfdb.MigrateSyntaxFlow("", rule)
+		}
+		if err != nil {
+			return nil, utils.Errorf("SyntaxflowQuery: load rule %s to sfvm error: %v", config.ruleName, err)
+		}
+		return frame, nil
+	}
+
+	// no rule
+	return nil, utils.Errorf("SyntaxflowQuery: rule is nil")
+}
+
+type queryDatabaseContextKey struct{}
+
+func QuerySyntaxflow(opt ...QueryOption) (*SyntaxFlowResult, error) {
+	c, _ := ssaconfig.New(ssaconfig.ModeProjectBase | ssaconfig.ModeSyntaxFlow)
+	config := &queryConfig{
+		Config: c,
+	}
+	for _, o := range opt {
+		o(config)
+	}
+	// A program carries the risk callbacks of its scan; explicit query options
+	// come first so a caller can also drive a standalone program through one scan.
+	if config.program != nil && config.program.config != nil {
+		config.onRisk = append(config.program.config.onRisk, config.onRisk...)
+		config.onRiskValue = append(config.program.config.onRiskValue, config.onRiskValue...)
+	}
+	process := func(f float64, msg string) {
+		if callBack := config.GetSyntaxFlowProcessCallback(); callBack != nil {
+			callBack(f, msg)
+		}
+	}
+	process(0, "start query syntaxflow")
+	if config.program != nil {
+		prevBound := config.program.structBound
+		prevActive := config.program.structScanActive
+		if config.structBound != nil {
+			config.program.structBound = config.structBound
+			config.program.structScanActive = true
+		}
+		defer func() {
+			config.program.structBound = prevBound
+			config.program.structScanActive = prevActive
+		}()
+	}
+	// handler input  value
+	value := config.value
+	if len(value) == 0 {
+		return nil, utils.Errorf("SyntaxflowQuery: value is nil")
+	}
+
+	// set cache and have programName and kind
+	if config.useCache && (config.program != nil && config.kind != "") {
+		ruleContent := ""
+		if config.ruleContent != "" {
+			ruleContent = config.ruleContent
+		} else if config.rule != nil {
+			ruleContent = config.rule.Content
+		} else if config.ruleName != "" {
+			rule, err := sfdb.GetRule(config.ruleName)
+			if err != nil {
+				return nil, utils.Errorf("SyntaxflowQuery: load rule %s from db error: %v", config.ruleName, err)
+			}
+			config.rule = rule
+			ruleContent = rule.Content
+		} else {
+			return nil, utils.Errorf("SyntaxflowQuery: rule is nil")
+		}
+		if ret, err := LoadResultByRuleContent(config.program.GetProgramName(), ruleContent, config.kind); err == nil && ret != nil {
+			process(1, "get result from database cache")
+			return ret, nil
+		}
+	}
+
+	process(0, "load or compile syntaxflow rule ")
+	// get runtime frame
+	frame, err := config.GetFrame()
+	if err != nil {
+		return nil, err
+	}
+
+	// Nested dataflow queries may share a VM config with the parent. Restore
+	// its context before returning so cancelling this query cannot poison it.
+	parent := config.ctx
+	if parent == nil {
+		parent = frame.GetContext()
+	}
+	previousContext := frame.GetContext()
+	defer func() { sfvm.WithContext(previousContext)(frame.GetConfig()) }()
+	// All nested queries belong to one rule lifetime. Dataflow checks retain
+	// contexts while traversing subsequent paths, so a completed child must
+	// not cancel a context still needed by its siblings or parent.
+	queryCtx := parent
+	if parent.Value(queryDatabaseContextKey{}) == nil {
+		ctx, cancelQuery := context.WithCancelCause(parent)
+		defer cancelQuery(nil)
+		queryCtx = context.WithValue(ctx, queryDatabaseContextKey{}, true)
+		queryCtx = ssadb.WithQueryErrorHandler(queryCtx, func(err error) {
+			cancelQuery(utils.Wrap(err, "SSA database search failed"))
+		})
+	}
+	config.ctx = queryCtx
+	config.opts = append(config.opts, sfvm.WithContext(config.ctx))
+
+	// Overlay incremental scan uses dual-source IR routing (base exclude + owner
+	// include). Do NOT skip base IR or merge audit_results cache — effective
+	// scan scope remains the full aggregated file view (~4000 files).
+
+	total := len(frame.Codes) + 1
+	handler := 0
+	config.opts = append(config.opts, sfvm.WithProcessCallback(func(i int, s string) {
+		if handler < i {
+			handler = i
+		}
+		process(float64(handler)/float64(total), s)
+	}))
+
+	// runtime
+	var res *sfvm.SFFrameResult
+	if sfvm.FrameIsSourceMode(frame) {
+		root := existingPatternRoot(config)
+		if root == nil {
+			files, ferr := collectFilesForSourceMode(config)
+			if ferr != nil {
+				return nil, ferr
+			}
+			root = sfpattern.NewRoot(files)
+		}
+		if config.sourceScanRuntime != nil {
+			config.sourceScanRuntime.Use(root)
+			root.SetFileFilterMatcher(config.sourceScanRuntime.Matcher(queryCtx))
+		} else {
+			owned, plan, startErr := sfpattern.StartFrameRuntime(queryCtx, frame, root)
+			if startErr != nil {
+				log.Warnf("source pre-scan: single rule stays on the per-search matcher: %v", startErr)
+			}
+			if owned != nil {
+				defer plan.Close()
+				defer owned.Close()
+				root.SetFileFilterMatcher(owned.Matcher(queryCtx))
+			}
+		}
+		if config.program != nil && root.GetProgramName() == "" {
+			root.SetProgramName(config.program.GetProgramName())
+		}
+		res, err = executeSourceFrameBatches(frame, root, config)
+	} else if sfvm.FrameIsStructMode(frame) {
+		if config.structBound == nil {
+			if config.program == nil {
+				return nil, utils.Errorf("struct rule requires QueryWithStruct")
+			}
+			// A rule-object query and a rule-content query both land here
+			// after the frame is compiled, so the program dispatches the
+			// struct rule to its own units and returns one merged result.
+			merged, merr := config.program.queryProgramStructRule(config, frame.GetRule())
+			if merr != nil {
+				return nil, merr
+			}
+			if ferr := finalizeProgramRuleResult(merged); ferr != nil {
+				return merged, ferr
+			}
+			return merged, nil
+		}
+		res, err = frame.Feed(value, config.opts...)
+	} else if config.structBound != nil {
+		return nil, utils.Errorf("QueryWithStruct only accepts struct rules")
+	} else {
+		res, err = frame.Feed(value, config.opts...)
+	}
+	if cause := context.Cause(queryCtx); cause != nil {
+		return nil, utils.Wrap(cause, "SyntaxflowQuery: query interrupted (context done)")
+	}
+	if err != nil {
+		return nil, utils.Wrap(err, "SyntaxflowQuery: query rule failed")
+	}
+	if config.sourceResultCallback != nil && sfvm.FrameIsSourceMode(frame) {
+		return nil, nil
+	}
+
+	var ret *SyntaxFlowResult
+	ret = CreateResultFromQuery(res, config.Config)
+	ret.onRisk = config.onRisk
+	ret.onRiskValue = config.onRiskValue
+	ret.dbKind = config.kind
+
+	defer process(1, "end query syntaxflow")
+	if config.program != nil {
+		ret.program = config.program
+		if config.noFinalize {
+			// The caller merges this frame with its siblings and publishes the
+			// merged result, so nothing is built or delivered here.
+			ret.TaskID = config.taskID
+			return ret, nil
+		}
+		if err := publishQueryResult(ret, config); err != nil {
+			return ret, err
+		}
+	}
+
+	return ret, nil
+}
+
+func executeSourceFrameBatches(
+	frame *sfvm.SFFrame,
+	root *sfvm.PatternRoot,
+	config *queryConfig,
+) (*sfvm.SFFrameResult, error) {
+	batchSize := sfpattern.DefaultSourceHitBatchSize
+	var accumulated *sfvm.SFFrameResult
+	for offset := 0; ; offset += batchSize {
+		root.SetSourceHitBatch(offset, batchSize)
+		batchResult, err := frame.Feed(sfvm.ValuesOf(root), config.opts...)
+		if err != nil {
+			return nil, err
+		}
+		if config.sourceResultCallback != nil {
+			result := CreateResultFromQuery(batchResult, config.Config)
+			result.program = config.program
+			result.TaskID = config.taskID
+			result.onRisk = config.onRisk
+			result.onRiskValue = config.onRiskValue
+			result.dbKind = config.kind
+			_ = result.CreateRisk()
+			config.sourceResultCallback(result)
+			_, _, total := root.SourceHitBatch()
+			if total == 0 || offset+batchSize >= total {
+				return nil, nil
+			}
+			continue
+		}
+		if accumulated == nil {
+			accumulated = sfvm.NewSFFrameResultAccumulator(batchResult)
+		} else {
+			accumulated.MergeByResult(batchResult)
+		}
+		_, _, total := root.SourceHitBatch()
+		if total == 0 || offset+batchSize >= total {
+			return accumulated, nil
+		}
+	}
+}
+
+type QueryOption func(*queryConfig)
+
+func QueryWithProgram(program *Program) QueryOption {
+	return func(c *queryConfig) {
+		c.program = program
+		// Only override c.value if it's not already a ProgramOverLay.
+		if len(c.value) == 1 {
+			if _, isOverlay := c.value[0].(*ProgramOverLay); isOverlay {
+				return
+			}
+		}
+		c.value = sfvm.ValuesOf(program)
+	}
+}
+
+func QueryWithPrograms(programs Programs) QueryOption {
+	return func(c *queryConfig) {
+		c.value = sfvm.NewValues(lo.Map(programs, func(p *Program, _ int) sfvm.ValueOperator {
+			return p
+		}))
+		c.program, _ = lo.Find(programs, func(item *Program) bool {
+			return item.GetProgramKind() == ssa.Application
+		})
+	}
+}
+
+func QueryWithValue(value sfvm.ValueOperator) QueryOption {
+	return QueryWithValues(sfvm.ValuesOf(value))
+}
+
+func QueryWithValues(values sfvm.Values) QueryOption {
+	return func(c *queryConfig) {
+		c.value = values
+		if len(values) == 0 {
+			c.program = nil
+			return
+		}
+		c.program, _ = fetchProgram(values[0])
+	}
+}
+
+// QueryWithStruct binds a compile-unit structure scan: stamps structBound on
+// the query and ResultProgram, and feeds a StructQueryTarget if c.value is empty.
+func QueryWithStruct(unit *ssa.CompileUnit) QueryOption {
+	return func(c *queryConfig) {
+		if unit == nil {
+			return
+		}
+		var ssaProg *ssa.Program
+		if c.program != nil {
+			ssaProg = c.program.Program
+		}
+		bound := newStructBound(unit, ssaProg)
+		c.structBound = bound
+		if len(c.value) == 0 && c.program != nil {
+			c.value = sfvm.ValuesOf(NewStructQueryTarget(c.program, unit, bound))
+		}
+		if c.program != nil {
+			c.program.structBound = bound
+			c.program.structScanActive = true
+		}
+		c.opts = append(c.opts,
+			sfvm.WithRuntimeOption(bound),
+			sfvm.WithRuntimeOption(WithStructBound(bound)),
+		)
+	}
+}
+
+// QueryWithRuleLoader reuses scan-local decoded instructions, never a frame.
+func QueryWithRuleLoader(loader *sfvm.RuleLoader) QueryOption {
+	return func(c *queryConfig) { c.ruleLoader = loader }
+}
+
+// QueryWithSourceScanRuntime supplies direct-search results from a scan-owned
+// runtime. Queries that do not set one still pre-scan that frame's own direct
+// searches; this option is how several rules share a single pre-scan.
+func QueryWithSourceScanRuntime(runtime *sfpattern.SourceScanRuntime) QueryOption {
+	return func(c *queryConfig) {
+		c.sourceScanRuntime = runtime
+	}
+}
+
+func QueryWithRule(rule *schema.SyntaxFlowRule) QueryOption {
+	return func(c *queryConfig) {
+		c.rule = rule
+	}
+}
+
+func QueryWithRuleContent(rule string) QueryOption {
+	return func(c *queryConfig) {
+		c.ruleContent = rule
+	}
+}
+
+func QueryWithVM(vm *sfvm.SyntaxFlowVirtualMachine) QueryOption {
+	return func(c *queryConfig) {
+		c.vm = vm
+	}
+}
+
+func QueryWithFrame(f *sfvm.SFFrame) QueryOption {
+	return func(c *queryConfig) {
+		c.frame = f
+	}
+}
+
+func QueryWithSave(kind schema.SyntaxflowResultKind) QueryOption {
+	return func(c *queryConfig) {
+		c.kind = kind
+		c.SetSyntaxFlowResultSaveDataBase()
+	}
+}
+
+func QueryWithMemory() QueryOption {
+	return func(c *queryConfig) {
+		c.SetSyntaxFlowResultSaveMemory()
+	}
+}
+
+func QueryWithRuleDiagnosticsRecorder(recorder ...*diagnostics.Recorder) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithDiagnostics(true, recorder...))
+	}
+}
+
+// QueryWithTaskID 为 SyntaxFlow 查询绑定扫描任务 ID（导出名为 syntaxflow.withExecTaskID）
+// 参数:
+//   - taskID: 关联的扫描任务 ID
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withExecTaskID("task-uuid")
+// println(opt)
+// ```
+func QueryWithTaskID(taskID string) QueryOption {
+	return func(c *queryConfig) {
+		c.taskID = taskID
+	}
+}
+
+// QueryWithOnRisk registers another callback that receives each risk this
+// query builds. audits are optional writers for that finding's graph; the
+// callback's owner decides whether the finding is created or replaces an
+// earlier one, and runs those writers in its own transaction.
+func QueryWithOnRisk(fn func(*schema.SSARisk, ...func(*gorm.DB) error)) QueryOption {
+	return func(c *queryConfig) {
+		if c == nil || fn == nil {
+			return
+		}
+		c.onRisk = append(c.onRisk, fn)
+	}
+}
+
+// QueryWithOnRiskValue registers a callback that receives each risk together
+// with the live value that produced it. Report writers use it to generate the
+// data-flow graph without reloading audit rows from the database.
+func QueryWithOnRiskValue(fn func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)) QueryOption {
+	return func(c *queryConfig) {
+		if c == nil || fn == nil {
+			return
+		}
+		c.onRiskValue = append(c.onRiskValue, fn)
+	}
+}
+
+// publishQueryResult stores a database result or keeps a memory result, and
+// builds its risks either way. A registered callback receives each risk
+// instead of this function writing the risk row.
+func publishQueryResult(ret *SyntaxFlowResult, config *queryConfig) error {
+	if ret == nil || config == nil {
+		return nil
+	}
+	process := func(f float64, msg string) {
+		if callBack := config.GetSyntaxFlowProcessCallback(); callBack != nil {
+			callBack(f, msg)
+		}
+	}
+	total := 4
+	switch kind := config.GetSyntaxFlowResultKind(); kind {
+	case ssaconfig.SFResultSaveDatabase:
+		process(float64(total-1)/float64(total), "save result")
+		if _, err := ret.SaveWithContext(config.ctx, config.kind, config.taskID); err != nil {
+			return utils.Wrap(err, "SyntaxflowQuery: save to DB failed")
+		}
+		cacheKind := kind
+		if config.IsNoSaveRisk() {
+			cacheKind = ssaconfig.SFResultSaveMemory
+		}
+		setResultToCache(cacheKind, ret)
+	case ssaconfig.SFResultSaveMemory:
+		id := getResultCacheId()
+		ret.SetResultID(id)
+		ret.TaskID = config.taskID
+		if err := ret.CreateRisk(); err != nil {
+			return err
+		}
+		setResultToCache(kind, ret)
+	}
+	return nil
+}
+
+// QueryWithNoFinalize runs the frame and returns its result without building
+// risks or notifying consumers. Callers that merge several executions of one
+// rule (for example one per compile unit) use it and finalize the merged
+// result themselves.
+func QueryWithNoFinalize() QueryOption {
+	return func(c *queryConfig) {
+		if c != nil {
+			c.noFinalize = true
+		}
+	}
+}
+
+func QueryWithRuleName(names string) QueryOption {
+	return func(c *queryConfig) {
+		c.ruleName = names
+	}
+}
+
+func QueryWithProjectId(id uint64) QueryOption {
+	return func(c *queryConfig) {
+		if c.Config == nil {
+			c.Config, _ = ssaconfig.New(ssaconfig.ModeProjectBase | ssaconfig.ModeSyntaxFlow)
+		}
+		ssaconfig.WithProjectID(id)(c.Config)
+	}
+}
+func QueryWithSFOption(opt sfvm.Option) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, opt)
+	}
+}
+
+func QueryWithSFConfig(config *sfvm.Config) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithConfig(config))
+		c.ctx = config.GetContext()
+	}
+}
+
+func QueryWithInitVar(result *omap.OrderedMap[string, sfvm.Values]) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithInitialContextVars(result))
+	}
+}
+
+func QueryWithInitInputVar(value sfvm.ValueOperator) QueryOption {
+	return QueryWithInitInputValues(sfvm.ValuesOf(value))
+}
+
+func QueryWithInitInputValues(value sfvm.Values) QueryOption {
+	return func(c *queryConfig) {
+		result := omap.NewOrderedMap(map[string]sfvm.Values{})
+		result.Set(DefaultInputVar, value)
+		c.opts = append(c.opts, sfvm.WithInitialContextVars(result))
+	}
+}
+
+// QueryWithContext 为 SyntaxFlow 查询设置上下文（导出名为 syntaxflow.withContext）
+// 参数:
+//   - ctx: 上下文，用于控制查询的取消与超时
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withContext(context.Background())
+// println(opt)
+// ```
+func QueryWithContext(ctx context.Context) QueryOption {
+	return func(c *queryConfig) {
+		c.ctx = ctx
+		c.opts = append(c.opts, sfvm.WithContext(ctx))
+	}
+}
+
+// QueryWithWorkBudget attaches a per-rule total-work budget to the SyntaxFlow
+// query's sfvm.Config. The budget bounds cumulative fanout work (per
+// <typeName>/<getReturns>/.../dataflow source element) across the rule's
+// opcodes; exceeding it cancels the rule ctx (budget.cancel) so the rule bails
+// with partial results instead of hanging for hours on huge value-set fanout.
+// The scan runner creates the budget alongside the rule ctx and passes it here;
+// cancel should be the rule ctx's CancelFunc. nil budget = no limit.
+func QueryWithWorkBudget(b *sfvm.RuleWorkBudget) QueryOption {
+	return func(c *queryConfig) {
+		if b == nil {
+			return
+		}
+		c.opts = append(c.opts, sfvm.WithWorkBudget(b))
+	}
+}
+
+// QueryWithProcessCallback 为 SyntaxFlow 查询设置进度回调（导出名为 syntaxflow.withProcess）
+// 参数:
+//   - cb: 进度回调函数，参数为 (progress 浮点进度, message 进度消息)
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withProcess(func(progress, message) { println(message) })
+// println(opt)
+// ```
+func QueryWithProcessCallback(cb func(float64, string)) QueryOption {
+	return func(c *queryConfig) {
+		c.SetSyntaxFlowProcessCallback(cb)
+	}
+}
+
+func QueryWithSourceResultCallback(callback func(*SyntaxFlowResult)) QueryOption {
+	return func(c *queryConfig) {
+		c.sourceResultCallback = callback
+	}
+}
+
+func QueryWithSSAConfig(c *ssaconfig.Config) QueryOption {
+	return func(q *queryConfig) {
+		if c == nil {
+			return
+		}
+		cloned := *c
+		if c.SyntaxFlow != nil {
+			syntaxFlow := *c.SyntaxFlow
+			cloned.SyntaxFlow = &syntaxFlow
+		}
+		if c.BaseInfo != nil {
+			baseInfo := *c.BaseInfo
+			cloned.BaseInfo = &baseInfo
+		}
+		q.Config = &cloned
+	}
+}
+
+func QueryWithFailFast(b ...bool) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithFailFast(b...))
+	}
+}
+
+// QueryWithUseCache 设置 SyntaxFlow 查询是否使用缓存（导出名为 syntaxflow.withCache）
+// 参数:
+//   - b: 是否使用缓存，缺省为 true
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withCache(true)
+// println(opt)
+// ```
+func QueryWithUseCache(b ...bool) QueryOption {
+	return func(c *queryConfig) {
+		if len(b) > 0 {
+			c.useCache = b[0]
+		} else {
+			c.useCache = true
+		}
+	}
+}
+
+// QueryWithEnableDebug 设置 SyntaxFlow 查询是否开启调试输出（导出名为 syntaxflow.withExecDebug）
+// 参数:
+//   - b: 是否开启调试，缺省为 true
+//
+// 返回值:
+//   - 查询可选项
+//
+// Example:
+// ```
+// opt = syntaxflow.withExecDebug(true)
+// println(opt)
+// ```
+func QueryWithEnableDebug(b ...bool) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithEnableDebug(b...))
+	}
+}
+
+func QueryWithStrictMatch(b ...bool) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithStrictMatch(b...))
+	}
+}
+
+func QueryWithResultCaptured(capture sfvm.ResultCapturedCallback) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithResultCaptured(capture))
+	}
+}
+func QueryWithSyntaxFlowResult(expected string, handler func(*Value) error) QueryOption {
+	return func(c *queryConfig) {
+		c.opts = append(c.opts, sfvm.WithResultCaptured(func(name string, results sfvm.Values) error {
+			if name != expected {
+				return nil
+			}
+			return results.Recursive(func(operator sfvm.ValueOperator) error {
+				result, ok := operator.(*Value)
+				if !ok {
+					return nil
+				}
+				err := handler(result)
+				if err != nil {
+					return err
+				}
+				return nil
+			})
+		}))
+	}
+}
+
+func (p *Program) SyntaxFlowChain(i string, opts ...QueryOption) Values {
+	res := p.SyntaxFlow(i, opts...)
+	return res.GetAllValuesChain()
+
+}
+func (p *Program) SyntaxFlow(rule string, opts ...QueryOption) *SyntaxFlowResult {
+	res, err := p.SyntaxFlowWithError(rule, opts...)
+	if err != nil {
+		log.Errorf("SyntaxFlow: %v", err)
+		return nil
+	}
+	return res
+}
+func (p *Program) SyntaxFlowWithError(rule string, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	opts = append(opts, QueryWithProgram(p), QueryWithRuleContent(rule))
+	return QuerySyntaxflow(opts...)
+}
+
+func (ps Programs) SyntaxFlowWithError(i string, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	opts = append(opts, QueryWithPrograms(ps), QueryWithRuleContent(i))
+	return QuerySyntaxflow(opts...)
+}
+
+// func SyntaxFlowWithVMContext(p sfvm.ValueOperator, sfCode string, sfResult *sfvm.SFFrameResult, sfConfig *sfvm.Config) (*SyntaxFlowResult, error) {
+// 	opts := []QueryOption{
+// 		QueryWithValue(p),
+// 		QueryWithRuleContent(sfCode),
+// 		QueryWithSFConfig(sfConfig),
+// 		QueryWithInitVar(sfResult.SymbolTable),
+// 	}
+// 	return QuerySyntaxflow(opts...)
+// }
+// func SyntaxFlowWithVMContext(p sfvm.ValueOperator, sfCode string, sfResult *sfvm.SFFrameResult, sfConfig *sfvm.Config) (*SyntaxFlowResult, error) {
+// 	opts := []QueryOption{
+// 		QueryWithValue(p),
+// 		QueryWithRuleContent(sfCode),
+// 		QueryWithSFConfig(sfConfig),
+// 		QueryWithInitVar(sfResult.SymbolTable),
+// 	}
+// 	return QuerySyntaxflow(opts...)
+// }
+
+func (p *Program) SyntaxFlowRuleName(ruleName string, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	opts = append(opts, QueryWithProgram(p), QueryWithRuleName(ruleName))
+	return QuerySyntaxflow(opts...)
+}
+
+func (ps Programs) SyntaxFlowRuleName(ruleName string, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	opts = append(opts, QueryWithPrograms(ps), QueryWithRuleName(ruleName))
+	return QuerySyntaxflow(opts...)
+}
+
+// SyntaxFlowRule runs one rule against the program, whichever mode the rule
+// declares: QuerySyntaxflow compiles the frame and dispatches it by the mode
+// it carries -- an SSA rule feeds on the program, a source rule runs on the
+// program's source snapshot, and a struct rule runs over the program's
+// application/library units. Everything else (runtime, task, callbacks,
+// budget) travels through opts unchanged.
+func (p *Program) SyntaxFlowRule(rule *schema.SyntaxFlowRule, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	opts = append(opts, QueryWithProgram(p), QueryWithRule(rule))
+	return QuerySyntaxflow(opts...)
+}
+
+func (ps Programs) SyntaxFlowRule(rule *schema.SyntaxFlowRule, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	if rule.IsSourceMode() {
+		return nil, utils.Errorf(
+			"SSA program target cannot execute source rule %s; source rules require a raw source target",
+			ruleGetRuleName(rule),
+		)
+	}
+	if rule.IsStructMode() {
+		return nil, utils.Errorf(
+			"SSA program target cannot execute struct rule %s; struct rules require QueryWithStruct",
+			ruleGetRuleName(rule),
+		)
+	}
+	opts = append(opts, QueryWithPrograms(ps), QueryWithRule(rule))
+	return QuerySyntaxflow(opts...)
+}
+
+func ruleGetRuleName(rule *schema.SyntaxFlowRule) string {
+	if rule == nil {
+		return ""
+	}
+	return rule.RuleName
+}
+
+func (p *ProgramOverLay) SyntaxFlowRule(rule *schema.SyntaxFlowRule, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	opts = append(opts,
+		QueryWithValue(p), QueryWithRule(rule),
+		QueryWithSFOption(
+			sfvm.WithRuntimeOption(WithProgramOverlay(p)),
+		),
+	)
+	// Explicitly set config.program to top program for saving risks.
+	if top := p.topProgram(); top != nil {
+		opts = append(opts, QueryWithProgram(top))
+	}
+	log.Infof("overlay SF dual-source scan: programs=%d exclude=%d diffs=%d",
+		p.ProgramCount(), len(p.ExcludeFile), len(p.Diff))
+	return QuerySyntaxflow(opts...)
+}
+
+func (p *ProgramOverLay) SyntaxFlowWithError(i string, opts ...QueryOption) (*SyntaxFlowResult, error) {
+	opts = append(opts,
+		QueryWithValue(p), QueryWithRuleContent(i),
+		QueryWithSFOption(
+			sfvm.WithRuntimeOption(WithProgramOverlay(p)),
+		),
+	)
+	if top := p.topProgram(); top != nil {
+		opts = append(opts, QueryWithProgram(top))
+	}
+	return QuerySyntaxflow(opts...)
+}

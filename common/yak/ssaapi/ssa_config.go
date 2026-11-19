@@ -1,0 +1,437 @@
+package ssaapi
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/schema"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/utils/diagnostics"
+	fi "github.com/yaklang/yaklang/common/utils/filesys/filesys_interface"
+	"github.com/yaklang/yaklang/common/utils/memedit"
+	"github.com/yaklang/yaklang/common/yak/ssa"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+)
+
+type ProcessFunc func(msg string, process float64)
+
+type Config struct {
+	*ssaconfig.Config // config
+
+	// language
+	LanguageBuilder ssa.Builder
+
+	// other compile ssaconfig.Options
+	feedCode        bool
+	ignoreSyntaxErr bool
+
+	// input, code or project path
+	originEditor *memedit.MemEditor
+	// file system
+	fs          fi.FileSystem
+	programPath string
+	includePath []string
+
+	databaseKind ssa.ProgramCacheKind
+	// process
+	process ProcessFunc
+
+	// for build
+	externLib               map[string]map[string]any
+	externValue             map[string]any
+	defineFunc              map[string]any
+	externMethod            ssa.MethodBuilder
+	externBuildValueHandler map[string]func(b *ssa.FunctionBuilder, id string, v any) (value ssa.Value)
+
+	// other build ssaconfig.Options
+	DatabaseProgramCacheHitter func(any)
+	EnableCache                bool
+	// for hash
+	externInfo string
+	// process ctx
+	ctx context.Context
+
+	// excludeMatcher merges user-configured exclude patterns with the built-in
+	// default compile excludes (unless disabled via WithDisableDefaultCompileExcludes);
+	// built in DefaultConfig and applied by ScanProjectFiles.
+	excludeMatcher ExcludeFunc
+
+	logLevel string
+
+	// diagnostics configuration
+	diagnosticsEnabled  bool
+	diagnosticsRecorder *diagnostics.Recorder
+	structScan          *structScanState
+	// onRisk is called with each risk this compile's struct rules produce.
+	// Empty means the compile is outside a scan and keeps its previous behavior.
+	onRisk []func(*schema.SSARisk, ...func(*gorm.DB) error)
+	// onRiskValue is onRisk plus the live value that produced the finding.
+	onRiskValue []func(*schema.SSARisk, *Value, ...func(*gorm.DB) error)
+	// file performance recorder
+	filePerformanceRecorder *diagnostics.Recorder
+
+	// incremental compilation information
+	// isIncremental 和 baseProgramName 已移至 ssaconfig.SSACompileConfig
+	// 通过 GetEnableIncrementalCompile() 和 GetBaseProgramName() 方法访问
+	fileHashMap map[string]int // 文件哈希映射（运行时计算，不在 ssaconfig 中）
+	// baseFS 已移除：现在从 baseProgramName 自动构建文件系统，不再需要显式提供
+
+	// disableArchiveExpansion forbids archive expansion (jar/zip/war/...)
+	// in this compile's language preprocessing (swapLanguageFs). Set for
+	// every compile participating in an incremental sequence (the base
+	// full compile and each diff): expanded archive entries would flood the
+	// diff as thousands of additions/deletions and degrade the increment
+	// back into a full recompile. Non-incremental compiles keep the user's
+	// jar_recursive_parse setting.
+	disableArchiveExpansion bool
+}
+
+func (c *Config) CalcHash() string {
+	// YaklangInspectInformation不能和StaticAnalyzeError共用缓存，否则会导致cli.check()之后的代码无法静态分析
+	stopOnCliCheck := false
+	if c.Config != nil && c.Config.SSACompile != nil {
+		stopOnCliCheck = c.Config.SSACompile.StopOnCliCheck
+	}
+	return utils.CalcSha1(c.originEditor.GetSourceCode(), c.GetLanguage(), c.ignoreSyntaxErr, c.externInfo, stopOnCliCheck)
+}
+
+var WithConfigInfo = ssaconfig.WithCodeSourceMap
+
+type ExcludeFunc = ssaconfig.CompileExcludeFunc
+
+// newExcludeFunc is a test helper over ssaconfig.BuildCompileExcludeFunc.
+func newExcludeFunc(patterns []string, basePath string, includeDefaults bool) ExcludeFunc {
+	return ssaconfig.BuildCompileExcludeFunc(patterns, basePath, includeDefaults)
+}
+
+// CompileExcludeFunc returns a matcher that merges user patterns with built-in compile excludes.
+func CompileExcludeFunc(extraPatterns []string, basePath string) ExcludeFunc {
+	return ssaconfig.BuildCompileExcludeFunc(extraPatterns, basePath, true)
+}
+
+func (c *Config) Processf(process float64, format string, arg ...any) {
+	msg := fmt.Sprintf(format, arg...)
+	if c.process != nil {
+		c.process(msg, process)
+	} else {
+		log.Debug(msg, process)
+	}
+}
+
+var WithLogLevel = ssaconfig.SetOption("ssa_compile/log_level", func(c *Config, v string) {
+	c.logLevel = v
+	log.SetLevel(v)
+})
+
+var WithCacheTTL = ssaconfig.WithCompileIrCacheTTL
+
+// WithUserExcludePatterns sets the user-configured exclude patterns. These are
+// distinct from the built-in default compile excludes (see
+// WithDisableDefaultCompileExcludes): user patterns always apply, and the two
+// lists are merged by BuildCompileExcludeFunc.
+var WithUserExcludePatterns = ssaconfig.WithCompileExcludeFiles
+
+// WithExcludeFunc and WithExcludeFile are kept for backward compatibility;
+// internally they forward to the user exclude patterns option.
+var (
+	WithExcludeFunc = ssaconfig.WithCompileExcludeFiles
+	WithExcludeFile = ssaconfig.WithCompileExcludeFiles
+)
+
+// WithDisableDefaultCompileExcludes 禁用内置默认编译排除项（测试 fixtures、
+// 构建产物、依赖归档等），仅保留用户显式提供的排除模式。恢复内置排除项
+// 引入之前的全量扫描行为，供嵌入方和测试使用。
+var WithDisableDefaultCompileExcludes = ssaconfig.WithCompileDisableDefaultExcludes
+
+var withProcessOption = ssaconfig.SetOption("ssa_compile/process", func(c *Config, v ProcessFunc) {
+	c.process = v
+})
+
+// WithProcess 设置编译进度回调（导出名为 ssa.withProcess）
+// 编译过程中会以 (进度消息, 进度比例) 回调该函数，常用于展示编译进度
+//
+// 参数:
+//   - v: 进度回调函数，参数为 (msg 进度消息, process 进度比例 0~1)
+//
+// 返回值:
+//   - 编译配置可选项，可传入 ssa.Parse
+//
+// Example:
+// ```
+// called = false
+// prog = ssa.Parse(`a = 1; b = a + 1; println(b)`, ssa.withProcess((msg, process) => { called = true }))~
+// println(called)   // OUT: true
+// assert prog != nil, "parse with withProcess option should succeed"
+// assert called == true, "process callback should be invoked during compilation"
+// ```
+func WithProcess(v ProcessFunc) ssaconfig.Option {
+	return withProcessOption(v)
+}
+
+var WithReCompile = ssaconfig.WithCompileReCompile
+
+var WithStrictMode = ssaconfig.WithCompileStrictMode
+
+var WithFileSystem = ssaconfig.SetOption("ssa_compile/file_system", func(c *Config, fs fi.FileSystem) {
+	if fs == nil {
+		return
+	}
+	c.fs = getUnifiedSeparatorFs(fs)
+})
+
+var WithRawLanguage = ssaconfig.WithProjectRawLanguage
+var WithLanguage = ssaconfig.WithProjectLanguage
+
+// WithFileSystemEntry 设置编译入口文件（导出名为 ssa.withEntryFile）
+// 参数:
+//   - v: 一个或多个入口文件路径，支持逗号分隔
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withEntryFile("src/main/java/App.java")
+// println(opt)
+// ```
+func WithFileSystemEntry(v ...string) ssaconfig.Option {
+	return ssaconfig.WithCompileEntryFiles(v...)
+}
+
+var WithProgramPath = ssaconfig.SetOption("ssa_compile/program_path", func(c *Config, v string) {
+	c.programPath = v
+})
+
+var WithIncludePath = ssaconfig.SetOption("ssa_compile/include_path", func(c *Config, v []string) {
+	c.includePath = append(c.includePath, v...)
+})
+
+var withExternLib = ssaconfig.SetOption("ssa_compile/extern_lib", func(
+	c *Config, a struct {
+		name  string
+		table map[string]any
+	}) {
+	c.externLib[a.name] = a.table
+})
+
+// WithExternLib 为 SSA 编译注入外部库（导出名为 ssa.withExternLib）
+// 用于让分析器识别自定义的库函数与符号
+// 参数:
+//   - name: 库名
+//   - table: 库的符号表（名称到值的映射）
+//
+// 返回值:
+//   - 编译配置可选项
+//
+// Example:
+// ```
+// opt = ssa.withExternLib("mylib", {"foo": func() { return 1 }})
+// println(opt)
+// ```
+func WithExternLib(name string, table map[string]any) ssaconfig.Option {
+	return func(c *ssaconfig.Config) error {
+		withExternLib(struct {
+			name  string
+			table map[string]any
+		}{
+			name:  name,
+			table: table,
+		})(c)
+		return nil
+	}
+}
+
+var withExternValueOption = ssaconfig.SetOption("ssa_compile/extern_value", func(c *Config, table map[string]any) {
+	for name, value := range table {
+		c.externValue[name] = value
+	}
+})
+
+// WithExternValue 为 SSA 编译注入外部值符号（导出名为 ssa.withExternValue）
+// 让分析器把这些名称识别为已知的外部符号，避免被当作未定义变量
+//
+// 参数:
+//   - table: 外部值的符号表（名称到值的映射）
+//
+// 返回值:
+//   - 编译配置可选项，可传入 ssa.Parse
+//
+// Example:
+// ```
+// prog = ssa.Parse(`x = EXTERN_VAL`, ssa.withExternValue({"EXTERN_VAL": 123}))~
+// println(prog != nil)   // OUT: true
+// assert prog != nil, "parse with withExternValue option should succeed"
+// ```
+func WithExternValue(table map[string]any) ssaconfig.Option {
+	return withExternValueOption(table)
+}
+
+var WithExternMethod = ssaconfig.SetOption("ssa_compile/extern_method", func(c *Config, b ssa.MethodBuilder) {
+	c.externMethod = b
+})
+
+func WithExternBuildValueHandler(id string, callback func(b *ssa.FunctionBuilder, id string, v any) ssa.Value) ssaconfig.Option {
+	return withExternBuildValueHandler(struct {
+		id       string
+		callback func(b *ssa.FunctionBuilder, id string, v any) ssa.Value
+	}{
+		id:       id,
+		callback: callback,
+	})
+}
+
+var withExternBuildValueHandler = ssaconfig.SetOption("ssa_compile/extern_build_value_handler", func(
+	c *Config, a struct {
+		id       string
+		callback func(b *ssa.FunctionBuilder, id string, v any) ssa.Value
+	}) {
+	if c.externBuildValueHandler == nil {
+		c.externBuildValueHandler = make(map[string]func(b *ssa.FunctionBuilder, id string, v any) ssa.Value)
+	}
+	c.externBuildValueHandler[a.id] = a.callback
+})
+
+var WithPeepholeSize = ssaconfig.WithCompilePeepholeSize
+
+var WithIgnoreSyntaxError = ssaconfig.SetOption("ssa_compile/ignore_syntax_error", func(c *Config, v bool) {
+	c.ignoreSyntaxErr = v
+})
+
+var WithExternInfo = ssaconfig.SetOption("ssa_compile/extern_info", func(c *Config, v string) {
+	c.externInfo = v
+})
+
+var WithDefineFunc = ssaconfig.SetOption("ssa_compile/define_func", func(c *Config, table map[string]any) {
+	for name, t := range table {
+		c.defineFunc[name] = t
+	}
+})
+
+var WithFeedCode = ssaconfig.SetOption("ssa_compile/feed_code", func(c *Config, v bool) {
+	c.feedCode = v
+})
+
+var WithProgramDescription = ssaconfig.WithProgramDescription
+
+var WithProgramName = ssaconfig.WithProgramNames
+
+var WithSetProgramName = ssaconfig.WithSetProgramName
+
+var WithMemory = ssaconfig.WithCompileMemoryCompile
+
+var WithConcurrency = ssaconfig.WithCompileConcurrency
+
+var WithFilePerformanceLog = ssaconfig.WithCompileFilePerformanceLog
+
+var WithDatabaseProgramCacheHitter = ssaconfig.SetOption("ssa_compile/database_program_cache_hitter", func(c *Config, h func(i any)) {
+	c.DatabaseProgramCacheHitter = h
+})
+
+var withEnableCache = ssaconfig.SetOption("ssa_compile/enable_cache", func(c *Config, v bool) {
+	c.EnableCache = v
+})
+
+func WithEnableCache(b ...bool) ssaconfig.Option {
+	enable := true // default true
+	if len(b) > 0 {
+		enable = b[0]
+	}
+	return withEnableCache(enable)
+}
+
+var WithEditor = ssaconfig.SetOption("ssa_compile/editor", func(c *Config, v *memedit.MemEditor) {
+	c.originEditor = v
+})
+
+var WithContext = ssaconfig.WithContext
+
+var WithEnableIncrementalCompile = ssaconfig.WithEnableIncrementalCompile
+
+var WithBaseProgramName = ssaconfig.WithBaseProgramName
+
+// WithFileHashMap 设置文件哈希映射（用于差量编译）
+var WithFileHashMap = ssaconfig.SetOption("ssa_compile/file_hash_map", func(c *Config, v map[string]int) {
+	c.fileHashMap = v
+})
+
+func DefaultConfig(opts ...ssaconfig.Option) (*Config, error) {
+	sc, err := ssaconfig.New(ssaconfig.ModeSSACompile, opts...)
+	if err != nil {
+		return nil, err
+	}
+	c := &Config{
+		LanguageBuilder:            nil,
+		programPath:                ".",
+		externLib:                  make(map[string]map[string]any),
+		externValue:                make(map[string]any),
+		defineFunc:                 make(map[string]any),
+		DatabaseProgramCacheHitter: func(any) {},
+		ctx:                        sc.GetContext(),
+		logLevel:                   "error",
+		Config:                     sc,
+	}
+	var userExclude []string
+	if sc.SSACompile != nil {
+		userExclude = sc.SSACompile.ExcludeFiles
+	}
+	c.excludeMatcher = ssaconfig.BuildCompileExcludeFunc(userExclude, sc.GetCodeSourceLocalFile(), !sc.GetCompileDisableDefaultExcludes())
+	ssaconfig.ApplyExtraOptions(c, c.Config)
+
+	// 只有当 c.fs 为 nil 时，才从配置中解析文件系统
+	// 这样可以避免覆盖通过 WithFileSystem 显式设置的文件系统
+	if c.fs == nil {
+		if fs, err := c.parseFSFromInfo(); err != nil {
+			return nil, err
+		} else if fs != nil {
+			c.fs = getUnifiedSeparatorFs(fs)
+		}
+	}
+	switch c.databaseKind {
+	case ssa.ProgramCacheKind(0):
+		c.databaseKind = ssa.ProgramCacheMemory
+		if c.GetProgramName() != "" {
+			// if set program name, use db write
+			c.databaseKind = ssa.ProgramCacheDBWrite
+		}
+		if c.GetCompileMemory() {
+			// if set enable memory, use memory force
+			c.databaseKind = ssa.ProgramCacheMemory
+		}
+	}
+
+	// memory/write mode no need check source code
+	if c.fs == nil && c.originEditor == nil {
+		return nil, utils.Errorf("Compile Proram should set file system or origin editor ")
+	}
+
+	if c.GetLanguage() != "" {
+		if create, ok := LanguageBuilderCreater[c.GetLanguage()]; ok {
+			c.LanguageBuilder = create()
+		}
+	}
+	return c, nil
+}
+
+// GetEnableIncrementalCompile 获取是否启用增量编译
+func (c *Config) GetEnableIncrementalCompile() bool {
+	if c.Config != nil && c.Config.SSACompile != nil {
+		return c.Config.SSACompile.EnableIncrementalCompile
+	}
+	return false
+}
+
+// GetBaseProgramName 获取基础程序名称（用于增量编译）
+func (c *Config) GetBaseProgramName() string {
+	if c.Config != nil && c.Config.SSACompile != nil {
+		return c.Config.SSACompile.BaseProgramName
+	}
+	return ""
+}
+
+func WithLocalFs(path string) ssaconfig.Option {
+	return WithConfigInfo(map[string]any{
+		"kind":       "local",
+		"local_file": path,
+	})
+}

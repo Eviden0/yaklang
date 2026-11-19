@@ -1,0 +1,227 @@
+package ssadb
+
+import (
+	"github.com/yaklang/gorm"
+	"github.com/yaklang/yaklang/common/utils"
+	"github.com/yaklang/yaklang/common/yak/ssaapi/ssaconfig"
+)
+
+type ProgramKind string
+
+const (
+	Application ProgramKind = "application"
+	Library                 = "library"
+)
+
+type IrProgram struct {
+	gorm.Model
+
+	ProgramName string `json:"program_name" gorm:"unique_index"`
+	// ProjectName string `json:"project_name" gorm:"index"`
+	ProjectID uint64 `json:"project_id" gorm:"index,not null,default:0"`
+
+	Description string `json:"description" gorm:"type:text"`
+
+	Version       string `json:"package_version" gorm:"index"`
+	EngineVersion string `json:"engine_version" gorm:"type:varchar(255)"`
+
+	// Language: yak, java, php, js, etc
+	// if the program contains many language,
+	// use comma to separate them.
+	// e.g. "yak,java,php"
+	Language ssaconfig.Language `json:"language" gorm:"index"`
+
+	// application / library
+	ProgramKind ProgramKind `json:"program_kind" gorm:"index"`
+
+	// up-stream program is the program that this program depends on
+	UpStream StringSlice `json:"up_stream_programs" gorm:"type:text"`
+	// down-stream program is the program that depends on this program
+	DownStream StringSlice `json:"down_stream_programs" gorm:"type:text"`
+
+	// this  program  contain this file
+	FileList  StringMap `json:"file_list" gorm:"type:text"`
+	LineCount int       `json:"line_count" gorm:"default:0"`
+
+	// program extra file: *.properties, *.xml, *.json, etc
+	ExtraFile StringMap `json:"extra_file" gorm:"type:text"`
+
+	// compile argument
+	ConfigInput  string `json:"config_input" gorm:"type:text"`
+	PeepholeSize int    `json:"peephole_size"`
+
+	// incremental compilation information
+	// BaseProgramName: if this is a diff program (incremental compilation), this is the name of the base (full) program
+	// If BaseProgramName is empty but IsOverlay is true, this is the first program in an incremental compilation series
+	BaseProgramName string `json:"base_program_name" gorm:"index"`
+	// FileHashMap: file path -> hash status (relative to base program)
+	// -1: deleted (exists in base but not in this program)
+	// 0: modified (exists in both base and this program, but content differs)
+	// 1: new (only exists in this program, or for Layer1, all files are new)
+	FileHashMap StringMap `json:"file_hash_map" gorm:"type:text"`
+
+	// overlay information
+	// IsOverlay: if this is an overlay program (contains multiple layers)
+	IsOverlay bool `json:"is_overlay" gorm:"index"`
+	// OverlayLayers: program names of all layers in order (from bottom to top)
+	// e.g., ["base-program", "diff-program-1", "diff-program-2"]
+	OverlayLayers StringSlice `json:"overlay_layers" gorm:"type:text"`
+}
+
+func (*IrProgram) TableName() string {
+	return TableIrPrograms
+}
+
+// IsIncrementalKind reports whether this row belongs to an incremental
+// compilation series (overlay chain head, diff layer, or base layer).
+func (i *IrProgram) IsIncrementalKind() bool {
+	return i.IsOverlay || i.BaseProgramName != "" || len(i.FileHashMap) > 0
+}
+
+// IsBaseProgramKind reports whether this row is the first (base) layer of an
+// incremental series: incremental, but built on no earlier program.
+func (i *IrProgram) IsBaseProgramKind() bool {
+	return i.IsIncrementalKind() && i.BaseProgramName == ""
+}
+
+// HasSavedOverlayLayers reports whether this row carries a complete overlay
+// recipe: the chain-head flag plus enough layer names (>= 2) to reassemble
+// the merged view. The base layer of a series records only its own name —
+// a one-layer chain needs no assembly.
+func (i *IrProgram) HasSavedOverlayLayers() bool {
+	return i.IsOverlay && len(i.OverlayLayers) >= 2
+}
+
+func CreateProgramWithError(name, version string, kind ProgramKind) (*IrProgram, error) {
+	db := GetDB().Model(&IrProgram{})
+	out := &IrProgram{
+		ProgramName: name,
+		Version:     version,
+		ProgramKind: kind,
+	}
+	if err := db.Save(out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func CreateProgram(name, version string, kind ProgramKind) *IrProgram {
+	out, err := CreateProgramWithError(name, version, kind)
+	if err != nil {
+		log.Errorf("create program failed: name=%s kind=%s version=%s err=%v", name, kind, version, err)
+		return nil
+	}
+	return out
+}
+
+func GetLibrary(name, version string) (*IrProgram, error) {
+	var p IrProgram
+	db := GetDB().Model(&IrProgram{})
+	if name == "" {
+		return nil, utils.Errorf("program name is empty")
+	}
+	db = db.Where("program_name = ?", name)
+	db = db.Where("program_kind = ?", "library")
+	db = db.Where("version = ?", version)
+	if err := db.First(&p).Error; err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func GetApplicationProgram(name string) (*IrProgram, error) {
+	return GetProgram(name, Application)
+}
+
+// GetApplicationPrograms fetches the Application rows for names in a single
+// query; missing names are simply absent from the result (callers treat
+// absent layers as skippable, same as a per-name GetProgram error).
+func GetApplicationPrograms(names []string) map[string]*IrProgram {
+	ret := make(map[string]*IrProgram, len(names))
+	clean := make([]string, 0, len(names))
+	for _, name := range names {
+		if name != "" {
+			clean = append(clean, name)
+		}
+	}
+	if len(clean) == 0 {
+		return ret
+	}
+	var progs []*IrProgram
+	err := GetDB().Model(&IrProgram{}).
+		Where("program_name IN (?)", clean).
+		Where("program_kind = ?", Application).
+		Find(&progs).Error
+	if err != nil {
+		log.Errorf("get application programs failed: %v", err)
+		return ret
+	}
+	for _, p := range progs {
+		ret[p.ProgramName] = p
+	}
+	return ret
+}
+
+func GetProgram(name string, kind ProgramKind) (*IrProgram, error) {
+	var p IrProgram
+	db := GetDB().Model(&IrProgram{})
+	if name == "" {
+		return nil, utils.Errorf("program name is empty")
+	}
+	db = db.Where("program_name = ?", name)
+	if kind != "" {
+		db = db.Where("program_kind = ?", kind)
+	}
+	if err := db.First(&p).Error; err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func UpdateProgramWithError(prog *IrProgram) error {
+	if prog == nil {
+		return utils.Errorf("update program failed: program is nil")
+	}
+	db := GetDB()
+	return db.Model(&IrProgram{}).
+		Omit("id").
+		Where("id = ?", prog.ID).
+		Where("program_name = ?", prog.ProgramName).
+		Where("program_kind = ?", prog.ProgramKind).
+		Update(prog).Error
+}
+
+func UpdateProgram(prog *IrProgram) {
+	if err := UpdateProgramWithError(prog); err != nil {
+		if prog == nil {
+			log.Errorf("update program failed: %v", err)
+			return
+		}
+		log.Errorf("update program failed: id=%d name=%s kind=%s err=%v", prog.ID, prog.ProgramName, prog.ProgramKind, err)
+	}
+}
+
+func GetDBInProgram(program string) *gorm.DB {
+	return GetDB().Where("program_name = ?", program)
+}
+
+func AllProgramNames(db *gorm.DB) []string {
+	var programs []string
+	db.Model(&IrProgram{}).Select("DISTINCT(program_name)").Pluck("program_name", &programs)
+	return programs
+}
+
+func AllPrograms(db *gorm.DB) []*IrProgram {
+	var prorams []*IrProgram
+	db.Model(&IrProgram{}).Order("created_at DESC").Find(&prorams)
+	return prorams
+}
+
+func GetProgramByProjectID(projectID uint64) (*IrProgram, error) {
+	var p IrProgram
+	db := GetDB().Model(&IrProgram{})
+	if err := db.Where("project_id = ?", projectID).First(&p).Error; err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
